@@ -4,6 +4,26 @@ import { z } from 'zod';
 const id = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/);
 const port = z.number().int().min(1).max(65535);
 const text = z.string().max(4096);
+const domain = z
+  .string()
+  .min(1)
+  .max(253)
+  .regex(
+    /^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/,
+  );
+export const reverseProxySchema = z.object({
+  id,
+  domain,
+  provider: z.enum(['manual', 'letsencrypt', 'litessl']),
+  email: z.string().email().max(254).optional(),
+  httpPort: port,
+  httpsPort: port,
+  certPath: text,
+  keyPath: text,
+  configPath: text,
+  webRoot: text,
+  createdAt: z.number().int(),
+});
 export const proxySchema = z.object({
   id,
   name: z.string().min(1).max(100),
@@ -45,6 +65,7 @@ export const serverSchema = z.object({
   token: text.optional(),
   fingerprint: text.optional(),
   deployment: deploymentSchema.optional(),
+  reverseProxies: z.array(reverseProxySchema).max(100).default([]),
   configMode: z.enum(['form', 'raw']).default('form'),
   rawConfig: z.string().max(1048576).default(''),
   rawFormat: z.enum(['toml', 'ini', 'yaml', 'json']).default('toml'),
@@ -70,6 +91,7 @@ export const installSchema = z.object({
 });
 export type Server = z.infer<typeof serverSchema>;
 export type Deployment = z.infer<typeof deploymentSchema>;
+export type ReverseProxy = z.infer<typeof reverseProxySchema>;
 export type Instance = z.infer<typeof instanceSchema>;
 export type ProxyRule = z.infer<typeof proxySchema>;
 export type Settings = z.infer<typeof settingsSchema>;

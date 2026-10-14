@@ -13,6 +13,8 @@ import { Store, type CryptoProvider } from '../src/main/store';
 import { redact } from '../src/shared/errors';
 import { execute } from '../src/main/processes';
 import { Remote, quote, remotePath } from '../src/main/remote';
+import { nginxProxyConfig } from '../src/main/nginx';
+import { reverseProxySchema } from '../src/shared/types';
 
 const server = serverSchema.parse({
   id: 'server1',
@@ -113,6 +115,48 @@ describe('FRP 配置与输入边界', () => {
     expect(frpAdapter.supportsForm('v0.52.0')).toBe(true);
     expect(serverSchema.safeParse({ ...server, id: '../x' }).success).toBe(false);
     expect(serverSchema.safeParse({ ...server, sshPort: 65536 }).success).toBe(false);
+  });
+});
+
+describe('Nginx 域名反向代理配置', () => {
+  it('生成 80 到 HTTP 入口、443 TLS 到 HTTPS 入口的隔离站点', () => {
+    const site = reverseProxySchema.parse({
+      id: 'site1',
+      domain: 'demo.example.com',
+      provider: 'manual',
+      httpPort: 8080,
+      httpsPort: 8443,
+      certPath: '/etc/nginx/ssl/demo/fullchain.pem',
+      keyPath: '/etc/nginx/ssl/demo/privkey.pem',
+      configPath: '/etc/nginx/conf.d/site1.conf',
+      webRoot: '/var/www/intranet-acme/site1',
+      createdAt: Date.now(),
+    });
+    const config = nginxProxyConfig(site, true);
+    expect(config).toContain('listen 80;');
+    expect(config).toContain('proxy_pass http://127.0.0.1:8080;');
+    expect(config).toContain('listen 443 ssl;');
+    expect(config).toContain('proxy_pass https://127.0.0.1:8443;');
+    expect(config).toContain('proxy_ssl_name $host;');
+    expect(config).toContain('ssl_certificate_key /etc/nginx/ssl/demo/privkey.pem;');
+  });
+  it('为 ACME HTTP-01 提供独立验证目录', () => {
+    const site = reverseProxySchema.parse({
+      id: 'site1',
+      domain: 'demo.example.com',
+      provider: 'letsencrypt',
+      httpPort: 8080,
+      httpsPort: 8443,
+      certPath: '/etc/nginx/cert.pem',
+      keyPath: '/etc/nginx/key.pem',
+      configPath: '/etc/nginx/conf.d/site1.conf',
+      webRoot: '/var/www/intranet-acme/site1',
+      createdAt: Date.now(),
+    });
+    expect(nginxProxyConfig(site, false)).toContain('location ^~ /.well-known/acme-challenge/');
+    expect(
+      reverseProxySchema.safeParse({ ...site, domain: 'demo.example.com; include /tmp/x' }).success,
+    ).toBe(false);
   });
 });
 

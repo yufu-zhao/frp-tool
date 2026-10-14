@@ -125,6 +125,7 @@ export class Store {
       rawConfig: '',
       fingerprint: previous?.fingerprint,
       deployment: previous?.deployment,
+      reverseProxies: previous?.reverseProxies ?? [],
     };
     this.data.servers = [...this.data.servers.filter((s) => s.id !== item.id), item];
     await this.persist();

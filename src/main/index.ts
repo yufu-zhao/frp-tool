@@ -198,6 +198,45 @@ else {
           )
             return remote.clearLogs(id);
         },
+        'server:reverse-proxy:add': async (p) => {
+          const value = z
+            .object({
+              serverId: idSchema,
+              siteId: idSchema,
+              domain: z.string().min(1).max(253),
+              provider: z.enum(['manual', 'letsencrypt', 'litessl']),
+              email: z.string().email().max(254).optional(),
+              httpPort: z.number().int().min(1).max(65535),
+              httpsPort: z.number().int().min(1).max(65535),
+              certLocalPath: z.string().max(4096).optional(),
+              keyLocalPath: z.string().max(4096).optional(),
+              eabKid: z.string().max(2048).optional(),
+              eabHmac: z.string().max(2048).optional(),
+            })
+            .parse(p);
+          if (
+            value.provider !== 'manual' &&
+            !(await yes(
+              '申请并部署 TLS 证书？',
+              value.provider === 'litessl'
+                ? '将使用 LiteSSL ACME 服务申请证书，并在服务器安装官方 acme.sh 客户端及自动续期任务。需要域名已解析到此服务器，公网 80 端口可访问，并提供 LiteSSL EAB 凭据。'
+                : '将使用 Let’s Encrypt 申请证书，并在服务器安装官方 acme.sh 客户端及自动续期任务。需要域名已解析到此服务器，公网 80 端口可访问。',
+            ))
+          )
+            return;
+          const { serverId, siteId, ...site } = value;
+          return remote.addReverseProxy(serverId, { id: siteId, ...site });
+        },
+        'server:reverse-proxy:remove': async (p) => {
+          const value = z.object({ id: idSchema, siteId: idSchema }).parse(p);
+          if (
+            await yes(
+              '移除此 Nginx 站点？',
+              '仅移除本工具创建的 Nginx 配置并重载 Nginx；证书文件和 ACME 自动续期任务会保留。',
+            )
+          )
+            return remote.removeReverseProxy(value.id, value.siteId);
+        },
         'server:backups': (p) => remote.backups(pickId(p)),
         'server:restore': async (p) => {
           const value = z.object({ id: idSchema, path: z.string() }).parse(p);

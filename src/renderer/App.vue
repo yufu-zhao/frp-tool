@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import type {
   State,
   Server,
@@ -11,6 +11,7 @@ import type {
   Runtime,
   Deployment,
   InstallRequest,
+  ReverseProxy,
 } from '../shared/types';
 import logoUrl from '../../assets/brand/logo.svg';
 import { accessAddress } from '../shared/address';
@@ -64,11 +65,33 @@ const adoption = reactive<Deployment>({
   version: '',
   versionKey: '',
 });
+const reverseProxyDraft = reactive({
+  domain: '',
+  provider: 'manual' as ReverseProxy['provider'],
+  email: '',
+  httpPort: 8080,
+  httpsPort: 8443,
+  certLocalPath: '',
+  keyLocalPath: '',
+  eabKid: '',
+  eabHmac: '',
+});
 let timer: ReturnType<typeof setInterval>;
 let unsubscribe: () => void;
 const uid = () => crypto.randomUUID();
 const server = computed(() => state.value.servers.find((s) => s.id === selectedServer.value));
 const instance = computed(() => state.value.instances.find((s) => s.id === selectedInstance.value));
+watch(
+  selectedServer,
+  (id) => {
+    const selected = state.value.servers.find((value) => value.id === id);
+    if (selected) {
+      reverseProxyDraft.httpPort = selected.httpPort;
+      reverseProxyDraft.httpsPort = selected.httpsPort;
+    }
+  },
+  { immediate: true },
+);
 const linuxVersions = computed(() =>
   state.value.versions.filter(
     (v) => v.platform === 'linux' && (!hostInfo.value || v.arch === hostInfo.value.arch),
@@ -158,6 +181,7 @@ function newServer() {
     frpPort: 7000,
     httpPort: 8080,
     httpsPort: 8443,
+    reverseProxies: [],
     configMode: 'form',
     rawConfig: '',
     rawFormat: 'toml',
@@ -365,6 +389,31 @@ async function readRemoteConfig() {
     serverDraft.value!.configMode = 'raw';
     serverDraft.value!.rawConfig = data;
     message.value = '已读取远程配置。请断开 SSH 后保存本机编辑，再连接并应用。';
+  }
+}
+async function addReverseProxy() {
+  if (!server.value) return;
+  const payload = {
+    serverId: server.value.id,
+    siteId: uid(),
+    domain: reverseProxyDraft.domain.trim().replace(/\.$/, '').toLowerCase(),
+    provider: reverseProxyDraft.provider,
+    email: reverseProxyDraft.email || undefined,
+    httpPort: reverseProxyDraft.httpPort,
+    httpsPort: reverseProxyDraft.httpsPort,
+    certLocalPath: reverseProxyDraft.certLocalPath.trim() || undefined,
+    keyLocalPath: reverseProxyDraft.keyLocalPath.trim() || undefined,
+    eabKid: reverseProxyDraft.eabKid.trim() || undefined,
+    eabHmac: reverseProxyDraft.eabHmac.trim() || undefined,
+  };
+  const result = await act('server:reverse-proxy:add', payload);
+  if (result) {
+    reverseProxyDraft.domain = '';
+    reverseProxyDraft.email = '';
+    reverseProxyDraft.certLocalPath = '';
+    reverseProxyDraft.keyLocalPath = '';
+    reverseProxyDraft.eabKid = '';
+    reverseProxyDraft.eabHmac = '';
   }
 }
 async function generateToken() {
@@ -751,6 +800,137 @@ onUnmounted(() => {
                 </button>
               </div></template
             >
+            <template v-if="server.deployment">
+              <hr />
+              <h3>Nginx 域名反向代理与 SSL</h3>
+              <p class="muted">
+                由 Nginx 接收公网 80/443，再分别代理到 FRP 的 HTTP/HTTPS 入口。HTTPS 在 Nginx
+                终止后通过 HTTPS 转发到 FRP 8443；请确保客户端 HTTPS 规则域名与此处一致。
+              </p>
+              <div v-if="server.reverseProxies.length" class="item-list compact-list">
+                <div v-for="site in server.reverseProxies" :key="site.id" class="item">
+                  <strong>{{ site.domain }}</strong>
+                  <small>
+                    HTTP :80 → 127.0.0.1:{{ site.httpPort }} · HTTPS :443 → 127.0.0.1:{{
+                      site.httpsPort
+                    }}
+                  </small>
+                  <small>
+                    {{
+                      site.provider === 'manual'
+                        ? '手动证书'
+                        : site.provider === 'litessl'
+                          ? 'LiteSSL 自动续期'
+                          : 'Let’s Encrypt 自动续期'
+                    }}
+                  </small>
+                  <button
+                    class="danger-link"
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="act('server:reverse-proxy:remove', { id: server.id, siteId: site.id })"
+                  >
+                    移除 Nginx 站点
+                  </button>
+                </div>
+              </div>
+              <form class="form-grid" @submit.prevent="addReverseProxy">
+                <label
+                  >域名<input
+                    v-model="reverseProxyDraft.domain"
+                    required
+                    placeholder="demo.example.com"
+                /></label>
+                <label
+                  >证书来源<select v-model="reverseProxyDraft.provider">
+                    <option value="manual">手动证书</option>
+                    <option value="letsencrypt">Let’s Encrypt 自动申请</option>
+                    <option value="litessl">LiteSSL 自动申请</option>
+                  </select></label
+                >
+                <label
+                  >FRP HTTP 入口端口<input
+                    v-model.number="reverseProxyDraft.httpPort"
+                    type="number"
+                    min="1"
+                    max="65535"
+                    required
+                /></label>
+                <label
+                  >FRP HTTPS 入口端口<input
+                    v-model.number="reverseProxyDraft.httpsPort"
+                    type="number"
+                    min="1"
+                    max="65535"
+                    required
+                /></label>
+                <template v-if="reverseProxyDraft.provider === 'manual'">
+                  <label class="full"
+                    >本机证书链文件
+                    <div class="inline-fields">
+                      <input
+                        v-model="reverseProxyDraft.certLocalPath"
+                        required
+                        placeholder="选择 PEM 格式证书链"
+                      />
+                      <button
+                        type="button"
+                        @click="choose('certificate', (p) => (reverseProxyDraft.certLocalPath = p))"
+                      >
+                        选择文件
+                      </button>
+                    </div></label
+                  >
+                  <label class="full"
+                    >本机未加密私钥文件
+                    <div class="inline-fields">
+                      <input
+                        v-model="reverseProxyDraft.keyLocalPath"
+                        required
+                        placeholder="选择 PEM 格式私钥"
+                      />
+                      <button
+                        type="button"
+                        @click="choose('key', (p) => (reverseProxyDraft.keyLocalPath = p))"
+                      >
+                        选择文件
+                      </button>
+                    </div></label
+                  >
+                </template>
+                <template v-else>
+                  <label
+                    >证书通知邮箱<input v-model="reverseProxyDraft.email" type="email" required
+                  /></label>
+                  <template v-if="reverseProxyDraft.provider === 'litessl'">
+                    <label
+                      >LiteSSL EAB KID<input
+                        v-model="reverseProxyDraft.eabKid"
+                        required
+                        autocomplete="off"
+                    /></label>
+                    <label class="full"
+                      >LiteSSL EAB HMAC 密钥<input
+                        v-model="reverseProxyDraft.eabHmac"
+                        type="password"
+                        required
+                        autocomplete="new-password"
+                    /></label>
+                  </template>
+                </template>
+                <div class="full hint">
+                  自动签发要求域名已解析到此服务器、外网可访问 80 端口，并且服务器有 curl 或
+                  wget。LiteSSL 还需在其 ACME 账户中创建 EAB 凭据。删除站点会保留证书和续期任务。
+                </div>
+                <div class="full actions">
+                  <button
+                    class="primary"
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                  >
+                    添加并配置 Nginx
+                  </button>
+                </div>
+              </form>
+            </template>
             <div class="hint">
               SSH 连接与 FRP 服务状态相互独立。请放行 FRP
               连接及代理入口端口；本工具不会自动修改防火墙。

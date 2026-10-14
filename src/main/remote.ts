@@ -4,8 +4,15 @@ import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { Store } from './store';
 import { AppError, redact } from '../shared/errors';
-import type { Server, Deployment, HostInfo } from '../shared/types';
+import {
+  reverseProxySchema,
+  type Server,
+  type Deployment,
+  type HostInfo,
+  type ReverseProxy,
+} from '../shared/types';
 import { serverConfig, frpAdapter } from './frp';
+import { nginxProxyConfig } from './nginx';
 
 // 所有远程命令参数都按 POSIX shell 单引号规则转义。
 export const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -562,6 +569,217 @@ export class Remote {
         `if test -L ${quote(log)}; then echo '日志路径是符号链接，已拒绝清理'; exit 1; elif test -e ${quote(log)} && ! test -f ${quote(log)}; then echo '日志路径不是普通文件，已拒绝清理'; exit 1; elif test -f ${quote(log)}; then ${privilege}truncate -s 0 -- ${quote(log)} && echo '服务端日志已清理'; else echo '日志文件不存在，当前没有可清理内容'; fi`,
       );
       return `${result}；服务不会停止。`;
+    });
+  }
+  private nginxPrivilege(id: string) {
+    // Nginx 管理需要提权；rootUsers 在 SSH 建连时通过 id -u 记录。
+    return this.rootUsers.has(id) ? '' : 'sudo -n ';
+  }
+  private nginxReload(id: string) {
+    const privilege = this.nginxPrivilege(id);
+    return `${privilege}systemctl reload nginx 2>/dev/null || ${privilege}nginx -s reload`;
+  }
+  private async writeNginxConfig(
+    id: string,
+    site: ReverseProxy,
+    withHttps: boolean,
+    allowExisting = false,
+  ) {
+    const privilege = this.nginxPrivilege(id);
+    const info = await this.detect(id);
+    const stage = `${info.home}/.local/share/intranet-frp/${id}/nginx/${site.id}.conf`;
+    const content = nginxProxyConfig(site, withHttps);
+    const folder = path.posix.dirname(stage);
+    await this.exec(id, `mkdir -p -- ${quote(folder)} && chmod 700 -- ${quote(folder)}`);
+    await this.write(id, stage, content);
+    try {
+      const prior = await this.exec(
+        id,
+        `if ${privilege}test -L ${quote(site.configPath)}; then echo symlink; elif ${privilege}test -f ${quote(site.configPath)}; then echo yes; else echo no; fi`,
+      );
+      if (prior === 'symlink' || (prior === 'yes' && !allowExisting))
+        throw new AppError('Nginx 目标配置文件已存在或是符号链接，未覆盖。');
+      const backup = `${site.configPath}.bak-${Date.now()}`;
+      await this.exec(
+        id,
+        `${privilege}mkdir -p -- ${quote(path.posix.dirname(site.configPath))} && ${prior === 'yes' ? `${privilege}cp -p -- ${quote(site.configPath)} ${quote(backup)} && ` : ''}${privilege}install -m 644 -- ${quote(stage)} ${quote(site.configPath)} && if ! ${privilege}nginx -t; then ${prior === 'yes' ? `${privilege}cp -p -- ${quote(backup)} ${quote(site.configPath)}` : `${privilege}rm -f -- ${quote(site.configPath)}`}; exit 1; fi && if ! (${this.nginxReload(id)}); then ${prior === 'yes' ? `${privilege}cp -p -- ${quote(backup)} ${quote(site.configPath)}` : `${privilege}rm -f -- ${quote(site.configPath)}`}; ${privilege}nginx -t && (${this.nginxReload(id)}); exit 1; fi`,
+      );
+    } catch (error) {
+      throw new AppError(`Nginx 配置未应用，原配置已尝试恢复：${String(error)}`);
+    } finally {
+      await this.exec(id, `rm -f -- ${quote(stage)}`).catch(() => {});
+    }
+  }
+  async addReverseProxy(
+    id: string,
+    input: Pick<ReverseProxy, 'id' | 'domain' | 'provider' | 'email' | 'httpPort' | 'httpsPort'> & {
+      certLocalPath?: string;
+      keyLocalPath?: string;
+      eabKid?: string;
+      eabHmac?: string;
+    },
+  ) {
+    return this.locked(id, async () => {
+      const server = this.store.server(id);
+      const existing = server.reverseProxies.find((site) => site.domain === input.domain);
+      if (existing) throw new AppError('此域名已由本工具配置，请使用更新或删除操作。');
+      if (server.reverseProxies.some((site) => site.id === input.id))
+        throw new AppError('站点标识重复，请重试。');
+      if (input.httpPort === input.httpsPort)
+        throw new AppError('FRP HTTP 与 HTTPS 入口端口不能相同。');
+      const info = await this.detect(id);
+      if (!info.root && !info.sudo)
+        throw new AppError('管理 Nginx 配置需要 root 或免交互 sudo 权限。');
+      const privilege = this.nginxPrivilege(id);
+      const includesConfD = await this.exec(
+        id,
+        `command -v nginx >/dev/null 2>&1 && test -d /etc/nginx/conf.d && ${privilege}nginx -T 2>&1 | grep -F 'include /etc/nginx/conf.d/*.conf' >/dev/null`,
+      ).then(
+        () => true,
+        () => false,
+      );
+      if (!includesConfD)
+        throw new AppError(
+          '未检测到可用的 Nginx /etc/nginx/conf.d/*.conf 加载入口，请先确认现有 Nginx 配置方式。',
+        );
+      const domainCheck = await this.exec(
+        id,
+        `${privilege}nginx -T 2>&1 | awk -v domain=${quote(input.domain)} '$1 == "server_name" { for (i = 2; i <= NF; i++) { gsub(/[;,]/, "", $i); if ($i == domain || ($i ~ /^\\*\\./ && domain ~ ("\\." substr($i, 3) "$"))) found = 1 } } END { if (found) print "conflict"; else print "available" }'`,
+      );
+      if (domainCheck === 'conflict')
+        throw new AppError('此域名已存在于 Nginx 配置中，请先检查现有站点，避免覆盖。');
+      const base = remotePath(`${info.home}/.local/share/intranet-frp/${id}/nginx`);
+      const site: ReverseProxy = {
+        id: input.id,
+        domain: input.domain,
+        provider: input.provider,
+        email: input.email,
+        httpPort: input.httpPort,
+        httpsPort: input.httpsPort,
+        certPath: `/etc/nginx/ssl/intranet-frp/${id}/${input.id}/fullchain.pem`,
+        keyPath: `/etc/nginx/ssl/intranet-frp/${id}/${input.id}/privkey.pem`,
+        configPath: `/etc/nginx/conf.d/intranet-frp-${id}-${input.id}.conf`,
+        webRoot: `/var/www/intranet-frp-acme/${id}/${input.id}`,
+        createdAt: Date.now(),
+      };
+      reverseProxySchema.parse(site);
+      await this.exec(
+        id,
+        `${privilege}test ! -e ${quote(site.certPath)} && ${privilege}test ! -L ${quote(site.certPath)} && ${privilege}test ! -e ${quote(site.keyPath)} && ${privilege}test ! -L ${quote(site.keyPath)} || { echo '目标证书路径已存在，未覆盖'; exit 1; }`,
+      );
+      if (input.provider === 'manual') {
+        if (!input.certLocalPath || !input.keyLocalPath)
+          throw new AppError('请选择本机上的证书链文件和私钥文件。');
+        const certText = await readFile(input.certLocalPath, 'utf8');
+        const keyText = await readFile(input.keyLocalPath, 'utf8');
+        if (
+          Buffer.byteLength(certText) > 1048576 ||
+          Buffer.byteLength(keyText) > 1048576 ||
+          !certText.includes('-----BEGIN CERTIFICATE-----') ||
+          !keyText.includes('PRIVATE KEY-----') ||
+          /ENCRYPTED|Proc-Type:\s*4,ENCRYPTED/i.test(keyText)
+        )
+          throw new AppError(
+            '证书或私钥格式不正确、超过 1MB，或私钥带有口令；请提供未加密的 PEM 证书链和私钥。',
+          );
+        const certStage = `${base}/${input.id}-fullchain.pem`;
+        const keyStage = `${base}/${input.id}-privkey.pem`;
+        await this.exec(id, `mkdir -p -- ${quote(base)} && chmod 700 -- ${quote(base)}`);
+        try {
+          await this.write(id, certStage, certText);
+          await this.write(id, keyStage, keyText);
+          await this.exec(
+            id,
+            `${privilege}mkdir -p -- ${quote(path.posix.dirname(site.certPath))} && ${privilege}chmod 700 -- ${quote(path.posix.dirname(site.certPath))} && ${privilege}install -m 644 -- ${quote(certStage)} ${quote(site.certPath)} && ${privilege}install -m 600 -- ${quote(keyStage)} ${quote(site.keyPath)} && ${privilege}openssl x509 -in ${quote(site.certPath)} -checkhost ${quote(site.domain)} -noout >/dev/null && ${privilege}openssl pkey -in ${quote(site.keyPath)} -noout >/dev/null && test "$(${privilege}openssl x509 -in ${quote(site.certPath)} -pubkey -noout | ${privilege}openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$(${privilege}openssl pkey -in ${quote(site.keyPath)} -pubout -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)" || { echo '证书无效、域名不匹配，或证书与私钥不匹配'; ${privilege}rm -f -- ${quote(site.certPath)} ${quote(site.keyPath)}; exit 1; }`,
+          );
+        } finally {
+          await this.exec(id, `rm -f -- ${quote(certStage)} ${quote(keyStage)}`).catch(() => {});
+        }
+      } else {
+        if (!input.email) throw new AppError('自动签发需要填写通知邮箱。');
+        if (input.provider === 'litessl' && (!input.eabKid || !input.eabHmac))
+          throw new AppError('LiteSSL 需要填写从证书服务平台获取的 EAB KID 和 HMAC 凭据。');
+        if (!info.root && !info.sudo)
+          throw new AppError('自动签发及 Nginx 重载需要 root 或免交互 sudo 权限。');
+        this.store.putSecret(`server:${id}:proxy:${input.id}:eabKid`, input.eabKid);
+        this.store.putSecret(`server:${id}:proxy:${input.id}:eabHmac`, input.eabHmac);
+        await this.exec(
+          id,
+          `${privilege}mkdir -p -- ${quote(site.webRoot)} ${quote(path.posix.dirname(site.certPath))} && ${privilege}chmod 755 -- ${quote(path.posix.dirname(site.webRoot))} ${quote(site.webRoot)} && ${privilege}chmod 700 -- ${quote(path.posix.dirname(site.certPath))}`,
+        );
+      }
+      await this.exec(id, `mkdir -p -- ${quote(base)} && chmod 700 -- ${quote(base)}`);
+      // 自动签发前先加载 HTTP 站点，使 ACME HTTP-01 challenge 可被 Nginx 访问。
+      try {
+        await this.writeNginxConfig(id, site, input.provider === 'manual');
+      } catch (error) {
+        this.store.dropSecrets(`server:${id}:proxy:${input.id}:`);
+        if (input.provider === 'manual')
+          await this.exec(
+            id,
+            `${privilege}rm -f -- ${quote(site.certPath)} ${quote(site.keyPath)}`,
+          ).catch(() => {});
+        throw error;
+      }
+      if (input.provider !== 'manual') {
+        const acme = '/root/.acme.sh/acme.sh';
+        const installer = `${base}/acme.sh`;
+        const provider =
+          input.provider === 'letsencrypt'
+            ? 'https://acme-v02.api.letsencrypt.org/directory'
+            : 'https://acme.litessl.com/acme/v2/directory';
+        const kid = this.store.secret(`server:${id}:proxy:${input.id}:eabKid`);
+        const hmac = this.store.secret(`server:${id}:proxy:${input.id}:eabHmac`);
+        try {
+          await this.exec(
+            id,
+            `if ! ${privilege}test -x ${quote(acme)}; then if command -v curl >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh -o ${quote(installer)}; elif command -v wget >/dev/null 2>&1; then wget -qO ${quote(installer)} https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh; else echo '需要 curl 或 wget 下载官方 ACME 客户端'; exit 1; fi; sh -n ${quote(installer)} && ${privilege}sh ${quote(installer)} --install -m ${quote(input.email!)}; fi`,
+          );
+          if (input.provider === 'litessl')
+            await this.exec(
+              id,
+              `${privilege}${quote(acme)} --register-account --server ${quote(provider)} --accountemail ${quote(input.email!)} --eab-kid ${quote(kid)} --eab-hmac-key ${quote(hmac)}`,
+              120000,
+            );
+          await this.exec(
+            id,
+            `${privilege}${quote(acme)} --issue --server ${quote(provider)} --accountemail ${quote(input.email!)} -d ${quote(site.domain)} -w ${quote(site.webRoot)} --keylength ec-256 && ${privilege}${quote(acme)} --install-cert -d ${quote(site.domain)} --key-file ${quote(site.keyPath)} --fullchain-file ${quote(site.certPath)} --reloadcmd ${quote('nginx -t && (systemctl reload nginx || nginx -s reload)')}`,
+            180000,
+          );
+          await this.writeNginxConfig(id, site, true, true);
+          // EAB 凭据已由 ACME 客户端登记在服务器端，应用本机不再保留副本。
+          this.store.dropSecrets(`server:${id}:proxy:${input.id}:`);
+        } catch (error) {
+          await this.removeNginxConfig(id, site).catch(() => {});
+          this.store.dropSecrets(`server:${id}:proxy:${input.id}:`);
+          throw new AppError(`证书申请或 Nginx 配置失败：${String(error)}`);
+        }
+      }
+      server.reverseProxies.push(site);
+      await this.store.persist();
+      this.changed();
+      return site;
+    });
+  }
+  private async removeNginxConfig(id: string, site: ReverseProxy) {
+    const privilege = this.nginxPrivilege(id);
+    const removed = `${site.configPath}.removed-${Date.now()}`;
+    await this.exec(
+      id,
+      `if test -e ${quote(site.configPath)}; then ${privilege}mv -- ${quote(site.configPath)} ${quote(removed)}; fi && if ! ${privilege}nginx -t; then if test -e ${quote(removed)}; then ${privilege}mv -- ${quote(removed)} ${quote(site.configPath)}; fi; exit 1; fi && if ! (${this.nginxReload(id)}); then if test -e ${quote(removed)}; then ${privilege}mv -- ${quote(removed)} ${quote(site.configPath)}; fi; ${privilege}nginx -t && (${this.nginxReload(id)}); exit 1; fi`,
+    );
+  }
+  async removeReverseProxy(id: string, siteId: string) {
+    return this.locked(id, async () => {
+      const server = this.store.server(id);
+      const site = server.reverseProxies.find((value) => value.id === siteId);
+      if (!site) throw new AppError('找不到此反向代理站点。');
+      await this.removeNginxConfig(id, site);
+      server.reverseProxies = server.reverseProxies.filter((value) => value.id !== siteId);
+      await this.store.persist();
+      this.store.dropSecrets(`server:${id}:proxy:${siteId}:`);
+      this.changed();
+      return 'Nginx 站点配置已移除，证书及 ACME 自动续期任务保留在服务器。';
     });
   }
   async readConfig(id: string) {

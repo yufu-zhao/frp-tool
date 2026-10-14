@@ -71,15 +71,17 @@
     "nativeModuleCount": 0
   },
   "currentSourceChanges": {
-    "release": "0.1.3",
+    "release": "0.2.0",
     "typecheck": "passed",
     "productionBuild": "passed",
-    "regressionTests": "31 passed",
+    "regressionTests": "33 passed",
+    "nginxConfigTests": "passed",
+    "nginxServerIntegration": "not-run: no production domain/fixture was provided",
     "macOS_x64_packages": [
       "DMG",
       "ZIP"
     ],
-    "runtimeSmoke": "not-run"
+    "desktopUiSmoke": "passed: server editing, multiple rules, offline install entry, settings, tray, clean exit"
   },
   "icons": {
     "windows": "ICO",
