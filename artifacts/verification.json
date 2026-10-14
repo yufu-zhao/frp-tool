@@ -1,0 +1,94 @@
+{
+  "remote": {
+    "startedAt": "2026-10-14T03:41:21.200Z",
+    "catalog": "API 模拟 429 后自动回退 GitHub 官方 Releases 网页，取得 10 个可下载版本",
+    "ssh": "connected",
+    "start": "active",
+    "client": {
+      "status": "connected",
+      "message": "FRP 已连接，代理状态见各规则",
+      "proxies": {
+        "tcp": "已注册",
+        "http": "已注册",
+        "https": "已注册",
+        "terminate": "已注册",
+        "udp": "已注册"
+      }
+    },
+    "tcp": "intranet-smoke-ok",
+    "http": "intranet-smoke-ok",
+    "https": "intranet-tls-ok",
+    "httpsTerminate": "intranet-smoke-ok",
+    "udp": "udp-smoke-ok",
+    "publicTCP": "公网入口未直连通过，请检查安全组；服务器侧真实隧道流量已验证",
+    "clientStopped": "stopped",
+    "serverStopped": "inactive",
+    "apply": "配置备份与替换通过",
+    "versionReplace": "程序备份与替换通过",
+    "restore": "程序和配置备份恢复通过",
+    "restart": "active",
+    "adopt": true,
+    "detachKeptBinary": "preserved",
+    "uninstalled": "测试服务已停止并移除，备份保留",
+    "result": "passed",
+    "finishedAt": "2026-10-14T03:41:53.500Z"
+  },
+  "ordinaryUser": {
+    "startedAt": "2026-10-14T03:45:15.654Z",
+    "failedDeployRolledBack": "cleaned",
+    "userServiceStart": "active",
+    "start": "running",
+    "disconnectKeptService": "running",
+    "logs": true,
+    "wrongPidBlocked": true,
+    "stop": "stopped",
+    "restart": "running",
+    "pidRecoveredOnAdopt": "running",
+    "uninstalled": true,
+    "result": "passed",
+    "finishedAt": "2026-10-14T03:45:51.674Z"
+  },
+  "local": {
+    "startedAt": "2026-10-14T03:35:04.954Z",
+    "multiInstance": true,
+    "versionMismatch": true,
+    "portConflict": true,
+    "badAuth": true,
+    "disconnect": true,
+    "reconnect": true,
+    "shutdown": true,
+    "result": "passed",
+    "finishedAt": "2026-10-14T03:35:07.683Z"
+  },
+  "packagedDesktop": {
+    "platform": "macOS x64",
+    "ui": "passed",
+    "sshReadOnly": "passed",
+    "quitWithSshConnected": "passed",
+    "apiRateLimitFallback": "github-web, 10 releases with assets",
+    "electronDownload": "passed",
+    "nativeModuleCount": 0
+  },
+  "icons": {
+    "windows": "ICO",
+    "macOS": "ICNS",
+    "linux": "PNG sizes 16-1024",
+    "tray": "macOS template plus light and dark PNG at 1x/2x",
+    "preview": "artifacts/logo-preview.png"
+  },
+  "packages": {
+    "macOS_x64": [
+      "DMG",
+      "ZIP"
+    ],
+    "Windows_x64": [
+      "NSIS",
+      "portable"
+    ],
+    "Linux_x64": [
+      "AppImage",
+      "tar.gz"
+    ],
+    "desktopExecutionOutsideMac": "not-tested"
+  }
+}
