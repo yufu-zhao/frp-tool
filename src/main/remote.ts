@@ -352,8 +352,16 @@ export class Remote {
         if (d.mode !== 'process') {
           const unitPath = `${folder}/${d.service}`;
           const escapeUnit = (p: string) => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-          const unit = `[Unit]\nDescription=Intranet FRP Server\nAfter=network.target\n\n[Service]\nType=simple\n${d.mode === 'system' ? `User=${await this.exec(id, 'id -un')}\n` : ''}ExecStart="${escapeUnit(d.binary)}" -c "${escapeUnit(d.config)}"\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=${d.mode === 'system' ? 'multi-user.target' : 'default.target'}\n`;
-          await this.write(id, unitPath, unit);
+          const serviceUser = d.mode === 'system' ? await this.exec(id, 'id -un') : '';
+          const makeUnit = (fileLogs: boolean) =>
+            `[Unit]\nDescription=Intranet FRP Server\nAfter=network.target\n\n[Service]\nType=simple\n${d.mode === 'system' ? `User=${serviceUser}\n` : ''}ExecStart="${escapeUnit(d.binary)}" -c "${escapeUnit(d.config)}"\n${fileLogs ? `StandardOutput=append:${escapeUnit(d.log).replace(/ /g, '\\x20')}\nStandardError=append:${escapeUnit(d.log).replace(/ /g, '\\x20')}\n` : ''}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=${d.mode === 'system' ? 'multi-user.target' : 'default.target'}\n`;
+          await this.write(id, unitPath, makeUnit(true));
+          const logMode = await this.exec(
+            id,
+            `if command -v systemd-analyze >/dev/null 2>&1 && systemd-analyze verify ${quote(unitPath)} >/dev/null 2>&1; then echo file; else echo journal; fi`,
+          );
+          d.logMode = logMode === 'file' ? 'file' : 'journal';
+          if (d.logMode !== 'file') await this.write(id, unitPath, makeUnit(false));
           const units =
             d.mode === 'system' ? '/etc/systemd/system' : `${info.home}/.config/systemd/user`;
           const targetUnit = `${units}/${d.service}`;
@@ -377,7 +385,7 @@ export class Remote {
               ? '普通后台进程模式，不保证开机启动；低于 1024 的端口可能需要额外权限。'
               : d.mode === 'user'
                 ? '用户 systemd 服务，注销后运行取决于服务器 linger 配置。'
-                : 'systemd 服务已安装，可通过启用开机启动单独设置。',
+                : `systemd 服务已安装，日志写入${d.logMode === 'file' ? '可单独清理的文件' : '系统 journal（不能单独清理此服务日志）'}；可通过启用开机启动单独设置。`,
         };
       } catch (error) {
         server.deployment = undefined;
@@ -532,13 +540,29 @@ export class Remote {
   async logs(id: string) {
     const d = this.deployment(id);
     const out =
-      d.mode === 'process'
+      d.mode === 'process' || d.logMode === 'file'
         ? await this.exec(id, `tail -n 300 -- ${quote(d.log)}`)
         : await this.exec(
             id,
             `${d.mode === 'system' ? `${this.rootUsers.has(id) ? '' : 'sudo -n '}journalctl` : 'journalctl --user'} -u ${quote(d.service)} -n 300 --no-pager`,
           );
     return redact(out, this.store.allSecrets());
+  }
+  async clearLogs(id: string) {
+    return this.locked(id, async () => {
+      const d = this.deployment(id);
+      if (d.mode !== 'process' && d.logMode !== 'file')
+        throw new AppError(
+          '此 systemd 服务的日志保存在系统 journal 中，无法安全地只清理该服务而不影响其他服务。工具管理的新部署会使用独立日志文件；接管部署请先将服务输出配置到日志文件。',
+        );
+      const log = remotePath(d.log);
+      const privilege = d.mode === 'system' && !this.rootUsers.has(id) ? 'sudo -n ' : '';
+      const result = await this.exec(
+        id,
+        `if test -L ${quote(log)}; then echo '日志路径是符号链接，已拒绝清理'; exit 1; elif test -e ${quote(log)} && ! test -f ${quote(log)}; then echo '日志路径不是普通文件，已拒绝清理'; exit 1; elif test -f ${quote(log)}; then ${privilege}truncate -s 0 -- ${quote(log)} && echo '服务端日志已清理'; else echo '日志文件不存在，当前没有可清理内容'; fi`,
+      );
+      return `${result}；服务不会停止。`;
+    });
   }
   async readConfig(id: string) {
     const sftp = await this.sftp(id);

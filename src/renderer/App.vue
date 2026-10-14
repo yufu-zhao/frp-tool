@@ -38,6 +38,8 @@ const selectedServer = ref('');
 const selectedInstance = ref('');
 const modal = ref('');
 const logText = ref('');
+const logKind = ref<'server' | 'instance'>('instance');
+const logTarget = ref('');
 const catalog = ref<Catalog>();
 const targetPlatform = ref<InstallRequest['platform']>('darwin');
 const targetArch = ref<InstallRequest['arch']>('arm64');
@@ -342,16 +344,19 @@ async function detectServer() {
     versionChoice.value = linuxVersions.value[0]?.key ?? '';
   }
 }
-async function loadLogs(kind: string) {
-  const data = await act(
-    `${kind}:logs`,
-    kind === 'server' ? selectedServer.value : selectedInstance.value,
-  );
+async function loadLogs(kind: 'server' | 'instance') {
+  logKind.value = kind;
+  logTarget.value = kind === 'server' ? selectedServer.value : selectedInstance.value;
+  const data = await act(`${kind}:logs`, logTarget.value);
   if (typeof data === 'string') {
     logText.value = data;
     message.value = '';
     modal.value = 'logs';
   }
+}
+async function clearLogs() {
+  const result = await act(`${logKind.value}:logs:clear`, logTarget.value);
+  if (typeof result === 'string') logText.value = '';
 }
 async function readRemoteConfig() {
   const data = await act('server:read-config', selectedServer.value);
@@ -891,9 +896,17 @@ onUnmounted(() => {
               ><small>{{ v.source }} · {{ formatTime(v.installedAt) }}</small>
             </div>
             <span class="badge" :class="v.verified ? 'connected' : 'running'">{{
-              v.verified ? 'SHA256 已核对' : '无发布校验值'
+              v.verified ? 'SHA256 已核对' : '尚未核对发布 SHA256'
             }}</span
-            ><button class="danger-link" :disabled="busy" @click="act('version:delete', v.key)">
+            ><button
+              v-if="!v.verified"
+              class="secondary"
+              :disabled="busy"
+              @click="act('version:verify', v.key, '已与 FRP 官方 SHA256 核对。')"
+            >
+              核对官方 SHA256
+            </button>
+            <button class="danger-link" :disabled="busy" @click="act('version:delete', v.key)">
               删除
             </button>
           </div>
@@ -1384,6 +1397,7 @@ onUnmounted(() => {
         <template v-if="modal === 'logs'">
           <pre class="log-view">{{ logText || '暂无日志。' }}</pre>
           <div class="modal-actions">
+            <button class="danger-link" @click="clearLogs">清理日志</button>
             <button @click="act('clipboard', logText, '日志已复制。')">复制脱敏日志</button
             ><button @click="modal = ''">关闭</button>
           </div></template

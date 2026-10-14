@@ -22,6 +22,7 @@ export const deploymentSchema = z.object({
   log: text,
   pidFile: text,
   mode: z.enum(['system', 'user', 'process']),
+  logMode: z.enum(['file', 'journal']).optional(),
   service: z.string().regex(/^[a-zA-Z0-9_.@-]+$/),
   managed: z.boolean(),
   versionKey: z.string(),

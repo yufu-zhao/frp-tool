@@ -69,6 +69,13 @@ describe('FRP 配置与输入边界', () => {
     expect(config.proxies[0].remotePort).toBe(18080);
     expect((TOML.parse(serverConfig(server, 'secret-token')) as any).bindPort).toBe(7000);
   });
+  it('服务端端口配置使用不带分组下划线的十进制数字', () => {
+    const config = serverConfig(server, 'secret-token');
+    expect(config).toContain('bindPort = 7000');
+    expect(config).toContain('vhostHTTPPort = 8080');
+    expect(config).toContain('vhostHTTPSPort = 8443');
+    expect(config).not.toMatch(/(?:bindPort|vhostHTTPPort|vhostHTTPSPort) = [\d]+_[\d]+/);
+  });
   it('支持 HTTPS 证书终止和 IPv6 本地地址', () => {
     const https = {
       ...rule,

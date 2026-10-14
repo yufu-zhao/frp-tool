@@ -188,6 +188,16 @@ else {
           return remote.control(value.id, value.action);
         },
         'server:logs': (p) => remote.logs(pickId(p)),
+        'server:logs:clear': async (p) => {
+          const id = pickId(p);
+          if (
+            await yes(
+              '清理服务端日志？',
+              '只清空此部署的日志文件，不停止服务；systemd journal 日志无法按单个服务安全清理。',
+            )
+          )
+            return remote.clearLogs(id);
+        },
         'server:backups': (p) => remote.backups(pickId(p)),
         'server:restore': async (p) => {
           const value = z.object({ id: idSchema, path: z.string() }).parse(p);
@@ -266,6 +276,16 @@ else {
           await processes.start(id);
         },
         'instance:logs': (p) => processes.log(pickId(p)),
+        'instance:logs:clear': async (p) => {
+          const id = pickId(p);
+          if (
+            await yes(
+              '清理客户端日志？',
+              '只清除此实例在应用中保留的日志，不停止客户端；运行时产生的新日志会继续记录。',
+            )
+          )
+            return processes.clearLogs(id);
+        },
         'instance:preview': (p) => processes.preview(instanceSchema.parse(p)),
         'version:catalog': (p) =>
           versions.catalog(
@@ -277,16 +297,21 @@ else {
               .parse(p ?? 1),
           ),
         'version:install': async (p) => {
-          const request = installSchema.parse(p);
+          const request = await versions.resolveReleaseDigest(installSchema.parse(p));
           if (
             !request.digest &&
             !(await yes(
               '安装未经发布校验的程序？',
-              '未提供发布方 SHA256 校验值。请确认下载或导入来源可信；本机安装时会执行程序检查实际版本。',
+              '未能取得发布方 SHA256，本次无法与官方摘要核对。请确认下载或导入来源可信；本机安装时仍会执行程序检查实际版本。',
             ))
           )
             return;
           const installed = await versions.install(request);
+          changed();
+          return installed;
+        },
+        'version:verify': async (p) => {
+          const installed = await versions.verifyInstalledRelease(z.string().parse(p));
           changed();
           return installed;
         },

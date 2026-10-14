@@ -68,11 +68,16 @@ export function serverConfig(server: Server, token: string): string {
   if (!token) throw new AppError('服务端需要认证令牌，请先在服务器配置中填写。');
   if (new Set([server.frpPort, server.httpPort, server.httpsPort]).size !== 3)
     throw new AppError('FRP 连接、HTTP、HTTPS 入口端口不能重复。');
-  return TOML.stringify({
+  const config = TOML.stringify({
     bindPort: server.frpPort,
     vhostHTTPPort: server.httpPort,
     vhostHTTPSPort: server.httpsPort,
     auth: { method: 'token', token },
     log: { to: 'console', level: 'info', disablePrintColor: true },
   });
+  // TOML 库会为较大的整数添加分组下划线；端口字段输出为普通十进制数字，兼容更多读取器。
+  return config.replace(
+    /^(bindPort|vhostHTTPPort|vhostHTTPSPort) = ([\d_]+)$/gm,
+    (_line, key: string, value: string) => `${key} = ${value.replace(/_/g, '')}`,
+  );
 }

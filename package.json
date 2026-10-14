@@ -1,6 +1,6 @@
 {
   "name": "intranet-frp-desktop",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "private": true,
   "description": "跨平台 FRP 服务器与本机穿透管理工具",
   "main": "dist/main/index.js",

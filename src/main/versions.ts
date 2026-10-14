@@ -96,6 +96,26 @@ export function releaseAssets(html: string, tag: string): Asset[] {
   }
   return [...found.values()];
 }
+// 只从对应版本区块的语义时间标签读取发布日期，避免误读提交时间。
+export function releasePublishedAt(html: string, tag: string): string {
+  const marker = `data-release-anchor="release-${tag}"`;
+  const start = html.indexOf(marker);
+  if (start < 0) return '';
+  const next = html.indexOf('data-release-anchor="release-v', start + marker.length);
+  const section = html.slice(start, next < 0 ? undefined : next);
+  const value = section.match(/<relative-time\b[^>]*\bdatetime=["']([^"']+)["']/i)?.[1];
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+}
+// 校验清单中的文件名必须与目标安装包完全一致，避免错配摘要。
+export function checksumForAsset(contents: string, assetName: string): string | undefined {
+  for (const line of contents.split(/\r?\n/)) {
+    const match = line.trim().match(/^([a-f\d]{64})\s+\*?(.+?)\s*$/i);
+    if (match?.[2] === assetName) return match[1].toLowerCase();
+  }
+  return undefined;
+}
 export function versionKey(request: Pick<InstallRequest, 'version' | 'platform' | 'arch'>) {
   return `${request.version.replace(/^v/, '')}_${request.platform}_${request.arch}`;
 }
@@ -265,7 +285,7 @@ export class Versions {
     if (!tags.length) throw new AppError('官方发布页面未包含可识别版本，未生成猜测版本。');
     const releases: Release[] = tags.map((tag) => ({
       version: tag.replace(/^v/, ''),
-      publishedAt: '',
+      publishedAt: releasePublishedAt(html, tag),
       assets: releaseAssets(html, tag),
     }));
     const missing = releases
@@ -335,6 +355,57 @@ export class Versions {
       result.warning = `${result.warning ?? ''} 版本列表已获取，但本地缓存未能保存。`;
     }
     return result;
+  }
+  async resolveReleaseDigest(request: InstallRequest): Promise<InstallRequest> {
+    if (request.digest || !request.url) return request;
+    try {
+      const source = new URL(request.url);
+      const expectedName = `frp_${request.version.replace(/^v/, '')}_${request.platform}_${request.arch}.${request.platform === 'windows' ? 'zip' : 'tar.gz'}`;
+      const match = source.pathname.match(
+        /^\/fatedier\/frp\/releases\/download\/(v?\d+\.\d+\.\d+)\/([^/]+)$/,
+      );
+      if (
+        source.origin !== 'https://github.com' ||
+        !match ||
+        match[1].replace(/^v/, '') !== request.version.replace(/^v/, '') ||
+        match[2] !== expectedName
+      )
+        return request;
+      const checksumUrl = new URL(
+        `/fatedier/frp/releases/download/${match[1]}/frp_sha256_checksums.txt`,
+        source.origin,
+      );
+      const response = await this.fetcher(checksumUrl.toString(), {
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok || Number(response.headers.get('content-length') ?? 0) > 262144)
+        return request;
+      const contents = await response.text();
+      if (contents.length > 262144) return request;
+      const digest = checksumForAsset(contents, expectedName);
+      return digest ? { ...request, digest } : request;
+    } catch {
+      // 官方校验清单不可用时，安装流程会提示用户并要求确认来源。
+      return request;
+    }
+  }
+  async verifyInstalledRelease(key: string): Promise<InstalledVersion> {
+    const installed = this.store.data.versions.find((item) => item.key === key);
+    if (!installed) throw new AppError('找不到该本机版本。');
+    if (installed.verified) return installed;
+    const request = await this.resolveReleaseDigest({
+      version: installed.version,
+      platform: installed.platform,
+      arch: installed.arch,
+      url: installed.source,
+    });
+    if (!request.digest)
+      throw new AppError('该安装来源没有可读取的 FRP 官方 SHA256 清单，请重新从官方发布页安装。');
+    if (request.digest !== installed.digest)
+      throw new AppError('本机安装包摘要与 FRP 官方清单不一致，请删除并重新下载安装。');
+    installed.verified = true;
+    await this.store.persist();
+    return installed;
   }
   async install(request: InstallRequest): Promise<InstalledVersion> {
     const key = versionKey(request);

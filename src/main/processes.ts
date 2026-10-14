@@ -51,6 +51,12 @@ export class Processes {
   log(id: string) {
     return (this.logs.get(id) ?? []).join('\n');
   }
+  clearLogs(id: string) {
+    this.store.instance(id);
+    this.logs.delete(id);
+    this.changed();
+    return '客户端日志已清理；运行中的实例会继续生成新日志。';
+  }
   running(id: string) {
     return this.children.has(id) || this.busy.has(id);
   }
