@@ -32,11 +32,11 @@ npm start
 npm run dist
 ```
 
-跨架构构建可在 `npm run build` 后执行 `npx electron-builder --mac --arm64 --publish never` 或 `npx electron-builder --linux --arm64 --publish never`；Windows 首批目标为 x64。
+跨架构构建可执行 `npm run dist -- --mac --arm64 --publish never` 或 `npm run dist -- --linux --arm64 --publish never` 或 `npm run dist -- --win --x64 --publish never`；Windows 首批目标为 x64。每次打包的输出按版本与目标平台隔离，例如 `release/0.2.1/mac/`、`release/0.2.1/win/` 或 `release/0.2.1/linux/`；不指定平台时使用当前构建机平台。一次只打包一个平台。
 
-仅生成应用目录：`npm run pack`。输出位于 `release/`。Windows 为 NSIS/便携包，macOS 为 DMG/ZIP，Linux 为 AppImage/tar.gz。正式发行仍需配置相应的签名、公证凭据；开发包未签名。DEB 构建需要真实项目主页及维护邮箱，本次默认使用无需这些字段的 Linux 通用包；填写元数据后可单独执行 `electron-builder --linux deb`。
+仅生成应用目录：`npm run pack`。产物位于对应版本和平台子目录。Windows 为 NSIS/便携包，macOS 为 DMG/ZIP，Linux 为 AppImage/tar.gz。正式发行仍需配置相应的签名、公证凭据；开发包未签名。DEB 构建需要真实项目主页及维护邮箱，本次默认使用无需这些字段的 Linux 通用包；填写元数据后可执行 `npm run dist -- --linux deb`。
 
-当前构建机的 Mac 应用位于 `release/mac/穿透工作台.app`。
+当前构建机生成的 Mac 应用位于 `release/{版本}/mac/` 下。
 
 ## 第一次分享
 

@@ -74,12 +74,12 @@ function resolveHttp01Assignments(instances: Instance[], servers: Server[], doma
     const matches = instances.flatMap((instance) =>
       instance.mode === 'form'
         ? instance.proxies
-          .filter(
-            (rule) =>
-              (rule.type === 'http' || rule.type === 'https') &&
-              rule.domains.some((candidate) => candidate.toLowerCase() === domain),
-          )
-          .map((rule) => ({ instance, rule }))
+            .filter(
+              (rule) =>
+                (rule.type === 'http' || rule.type === 'https') &&
+                rule.domains.some((candidate) => candidate.toLowerCase() === domain),
+            )
+            .map((rule) => ({ instance, rule }))
         : [],
     );
     if (matches.length !== 1)

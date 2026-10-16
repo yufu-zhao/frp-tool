@@ -1,6 +1,6 @@
 {
   "name": "intranet-frp-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "跨平台 FRP 服务器与本机穿透管理工具",
   "main": "dist/main/index.js",
@@ -10,8 +10,8 @@
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest run",
     "start": "electron .",
-    "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && electron-builder",
+    "pack": "npm run build && node scripts/package.mjs --dir",
+    "dist": "npm run build && node scripts/package.mjs",
     "test:desktop": "npm run build && node scripts/electron-smoke.mjs",
     "test:remote": "tsup scripts/remote-smoke.ts --format cjs --out-dir dist/smoke --clean --config false && node dist/smoke/remote-smoke.js",
     "format": "prettier --write src tests scripts *.config.ts package.json tsconfig.json README.md VERIFICATION.md .prettierrc.json .github/workflows/ci.yml",

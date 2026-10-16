@@ -24,4 +24,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: 桌面安装包-${{ matrix.os }}
-          path: release/*
+          path: release/**

@@ -42,7 +42,7 @@ export class Processes {
   constructor(
     private store: Store,
     private changed: () => void,
-  ) { }
+  ) {}
   status(id: string): Runtime {
     return this.runtimes.get(id) ?? { status: 'stopped', message: '未启动', proxies: {} };
   }
@@ -72,11 +72,11 @@ export class Processes {
     return instance.mode === 'raw'
       ? instance.rawConfig
       : clientConfig(
-        instance,
-        server,
-        this.store.secret(`server:${server.id}:token`),
-        this.certificatePaths(),
-      );
+          instance,
+          server,
+          this.store.secret(`server:${server.id}:token`),
+          this.certificatePaths(),
+        );
   }
   private certificatePaths() {
     return Object.fromEntries(
@@ -104,12 +104,12 @@ export class Processes {
         instance.mode === 'raw'
           ? this.store.secret(`instance:${id}:rawConfig`)
           : clientConfig(
-            instance,
-            server,
-            this.store.secret(`server:${server.id}:token`),
-            this.certificatePaths(),
-            httpChallenge,
-          );
+              instance,
+              server,
+              this.store.secret(`server:${server.id}:token`),
+              this.certificatePaths(),
+              httpChallenge,
+            );
       if (!config.trim()) throw new AppError('配置内容为空。');
       const folder = path.join(this.store.root, 'runtime', id);
       await mkdir(folder, { recursive: true, mode: 0o700 });
@@ -192,7 +192,7 @@ export class Processes {
         // 延迟清理并检查新进程，避免快速重启时误删新配置文件。
         const cleanup = setTimeout(() => {
           if (!this.children.has(id))
-            void rm(folder, { recursive: true, force: true }).catch(() => { });
+            void rm(folder, { recursive: true, force: true }).catch(() => {});
         }, 1000);
         cleanup.unref();
         this.changed();
@@ -306,7 +306,7 @@ export class Processes {
         remove: (token) => tokens.delete(token),
       });
     } finally {
-      for (const instanceId of started) await this.stop(instanceId).catch(() => { });
+      for (const instanceId of started) await this.stop(instanceId).catch(() => {});
       for (const [instanceId, running] of wasRunning) {
         if (running && !this.closing)
           await this.start(instanceId).catch((error) => {
