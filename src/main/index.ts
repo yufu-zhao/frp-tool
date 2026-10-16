@@ -657,8 +657,8 @@ else {
           };
         }
       });
-      window = new BrowserWindow({
-        width: 3280,
+      const opt: Electron.BrowserWindowConstructorOptions = {
+        width: 1280,
         height: 850,
         minWidth: 980,
         minHeight: 650,
@@ -671,7 +671,10 @@ else {
           nodeIntegration: false,
           sandbox: true,
         },
-      });
+      }
+      if (process.env.NODE_ENV === 'development')
+        opt.width = 3280;
+      window = new BrowserWindow(opt);
       // 打包时 preload 输出重命名见构建脚本，开发时使用同一文件名。
       window.on('closed', () => {
         window = undefined;
