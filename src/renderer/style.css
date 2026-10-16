@@ -333,6 +333,8 @@ h2 span {
   gap: 9px;
   border: 1px solid #e0e5ee;
   min-width: 0;
+  position: relative;
+  overflow: hidden;
 }
 .item.selected {
   background: #f7faff;
@@ -723,17 +725,71 @@ select,
 textarea {
   border: 1px solid #dce3ee;
   border-radius: 6px;
-  padding: 10px 11px;
+  padding: 6px 12px;
   background: #fcfdff;
   color: #34445c;
   width: 100%;
   outline: none;
+}
+input,
+select {
+  height: 38px;
+  line-height: 1.5;
 }
 input:focus,
 select:focus,
 textarea:focus {
   border-color: #7199e8;
   box-shadow: 0 0 0 3px #3e73df10;
+}
+select {
+  /* 隐藏默认箭头 */
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+
+  /* 自定义箭头 */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23333' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px;
+
+  /* 留出箭头空间，避免文字被遮挡 */
+  padding-right: 30px;
+}
+input[type='checkbox'] {
+  width: 14px;
+}
+.inline-check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+}
+.label {
+  font-size: 12px;
+  color: #67778d;
+}
+.address-list {
+  background: #f5f7fa;
+  border-radius: 7px;
+}
+.proxy-card .address {
+  position: relative;
+}
+.proxy-card .address:not(:last-child)::after {
+  /* border-bottom: 1px solid #e5eaf2; */
+  content: '';
+  border-bottom: 1px solid #e5eaf2;
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 0px;
+}
+.btn-md {
+  font-size: 14px;
+}
+.btn-sm {
+  font-size: 12px;
 }
 label .inline-fields {
   margin: 0;

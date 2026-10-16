@@ -272,8 +272,8 @@ function ruleDomainsText(rule: ProxyRule) {
 function setRuleDomains(rule: ProxyRule, event: Event) {
   rule.domains = (event.target as HTMLTextAreaElement).value
     .split(/[\n,，;；]+/)
-    .map((domain) => domain.trim().toLowerCase().replace(/\.$/, ''))
-    .filter(Boolean);
+    .map((domain) => domain.trim().toLowerCase());
+  // .filter(Boolean);
 }
 function addresses(rule: ProxyRule, target: Instance) {
   const targetServer = state.value.servers.find((item) => item.id === target.serverId);
@@ -583,6 +583,7 @@ async function connectServer() {
     versionChoice.value = linuxVersions.value[0]?.key ?? '';
   }
 }
+
 function selectServer(id: string) {
   selectedServer.value = id;
   hostInfo.value = undefined;
@@ -892,8 +893,9 @@ onUnmounted(() => {
                   <option value="">选择 Linux 安装包</option>
                   <option v-for="v in linuxVersions" :key="v.key" :value="v.key">
                     {{ versionLabel(v) }}
-                  </option></select
-                ><button
+                  </option>
+                </select>
+                <button
                   class="primary"
                   :disabled="
                     busy ||
@@ -905,15 +907,15 @@ onUnmounted(() => {
                 >
                   安装服务端
                 </button>
+                <button
+                  class="secondary"
+                  :disabled="busy || runtime.ssh[server.id] !== 'connected' || !hostInfo?.supported"
+                  @click="modal = 'adopt'"
+                >
+                  接管已有部署
+                </button>
               </div>
-              <button
-                class="secondary"
-                :disabled="busy || runtime.ssh[server.id] !== 'connected' || !hostInfo?.supported"
-                @click="modal = 'adopt'"
-              >
-                接管已有部署
-              </button></template
-            >
+            </template>
             <template v-else
               ><div class="deployment-meta">
                 <span class="badge connected">FRP {{ server.deployment.version }}</span
@@ -1115,15 +1117,17 @@ onUnmounted(() => {
                   }}</span>
                 </div>
                 <p class="muted">本地 {{ rule.localIP }}:{{ rule.localPort }}</p>
-                <div v-for="url in addresses(rule, instance)" :key="url" class="address">
-                  <code>{{ url }}</code
-                  ><button @click="act('clipboard', url, '访问地址已复制。')">复制</button
-                  ><button
-                    v-if="rule.type === 'http' || rule.type === 'https'"
-                    @click="act('link:open', url)"
-                  >
-                    打开
-                  </button>
+                <div class="address-list">
+                  <div v-for="url in addresses(rule, instance)" :key="url" class="address">
+                    <code>{{ url }}</code
+                    ><button @click="act('clipboard', url, '访问地址已复制。')">复制</button
+                    ><button
+                      v-if="rule.type === 'http' || rule.type === 'https'"
+                      @click="act('link:open', url)"
+                    >
+                      打开
+                    </button>
+                  </div>
                 </div>
                 <small v-if="rule.type === 'tcp'"
                   >如本地服务是 HTTP，可使用 http://{{ address(rule, instance) }} 访问。</small
@@ -1193,6 +1197,7 @@ onUnmounted(() => {
                     enabled: ($event.target as HTMLInputElement).checked,
                   })
                 "
+                style="font-size: 12px"
               />
               到期前续期
             </label>
@@ -1519,7 +1524,11 @@ onUnmounted(() => {
                     v-model="serverDraft.keyPath"
                     placeholder="支持直接输入绝对路径"
                     required
-                  /><button type="button" @click="choose('key', (p) => (serverDraft!.keyPath = p))">
+                  /><button
+                    type="button"
+                    class="btn-md"
+                    @click="choose('key', (p) => (serverDraft!.keyPath = p))"
+                  >
                     选择文件
                   </button>
                 </div></label
@@ -1562,23 +1571,33 @@ onUnmounted(() => {
                   type="password"
                   placeholder="新服务器需要填写；编辑时留空保留"
                   autocomplete="new-password"
-                /><button type="button" @click="generateToken">生成随机令牌</button>
+                /><button type="button" class="btn-md" @click="generateToken">生成随机令牌</button>
               </div></label
-            ><label class="full"
-              >服务端配置模式<select v-model="serverDraft.configMode">
+            >
+            <label class="full">
+              服务端配置模式
+              <select v-model="serverDraft.configMode">
                 <option value="form">常用表单</option>
                 <option value="raw">高级原始配置</option>
-              </select></label
-            ><template v-if="serverDraft.configMode === 'raw'"
-              ><div class="full notice warning">
+              </select>
+            </label>
+            <template v-if="serverDraft.configMode === 'raw'">
+              <div class="full notice warning">
                 原始配置是唯一配置来源。切回表单将忽略原始内容，请确认没有需保留的高级字段。连接参数与令牌必须自行保持一致。
               </div>
-              <label
-                >配置格式<select v-model="serverDraft.rawFormat">
-                  <option v-for="f in ['toml', 'ini', 'yaml', 'json']" :key="f">{{ f }}</option>
-                </select></label
-              ><button type="button" @click="importConfig('server')">导入配置文件</button
-              ><textarea
+              <label class="full">
+                配置格式
+                <div class="inline-fields">
+                  <select v-model="serverDraft.rawFormat">
+                    <option v-for="f in ['toml', 'ini', 'yaml', 'json']" :key="f">{{ f }}</option>
+                  </select>
+                  <button type="button" class="btn-md" @click="importConfig('server')">
+                    导入配置文件
+                  </button>
+                </div>
+              </label>
+
+              <textarea
                 v-model="serverDraft.rawConfig"
                 class="full code-editor"
                 rows="12"
@@ -1636,16 +1655,19 @@ onUnmounted(() => {
                     type="number"
                     min="1"
                     max="65535"
-                    required /></label
-                ><label v-else
-                  >公网域名（每行一个，也可用逗号分隔）<textarea
+                    required
+                /></label>
+                <label v-else>
+                  公网域名（每行一个，也可用逗号分隔）
+                  <textarea
                     :value="ruleDomainsText(rule)"
                     required
                     rows="2"
                     placeholder="demo.example.com&#10;www.demo.example.com"
                     @input="setRuleDomains(rule, $event)"
-                  /></label
-                ><template v-if="rule.type === 'https'"
+                  />
+                </label>
+                <template v-if="rule.type === 'https'"
                   ><label
                     >HTTPS 方式<select v-model="rule.tlsMode">
                       <option value="passthrough">转发本地 HTTPS</option>
@@ -1709,8 +1731,8 @@ onUnmounted(() => {
             ></textarea>
           </template>
           <div class="modal-actions">
-            <button type="button" :disabled="busy" @click="modal = ''">取消</button
-            ><button class="primary" :disabled="busy">保存实例</button>
+            <button type="button" :disabled="busy" @click="modal = ''">取消</button>
+            <button class="primary" :disabled="busy">保存实例</button>
           </div>
         </form>
         <form v-if="modal === 'manual'" @submit.prevent="installManual">

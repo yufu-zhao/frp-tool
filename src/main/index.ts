@@ -10,6 +10,7 @@ import {
   nativeImage,
   clipboard,
   shell,
+  globalShortcut,
 } from 'electron';
 import path from 'node:path';
 import os from 'node:os';
@@ -74,12 +75,12 @@ function resolveHttp01Assignments(instances: Instance[], servers: Server[], doma
     const matches = instances.flatMap((instance) =>
       instance.mode === 'form'
         ? instance.proxies
-            .filter(
-              (rule) =>
-                (rule.type === 'http' || rule.type === 'https') &&
-                rule.domains.some((candidate) => candidate.toLowerCase() === domain),
-            )
-            .map((rule) => ({ instance, rule }))
+          .filter(
+            (rule) =>
+              (rule.type === 'http' || rule.type === 'https') &&
+              rule.domains.some((candidate) => candidate.toLowerCase() === domain),
+          )
+          .map((rule) => ({ instance, rule }))
         : [],
     );
     if (matches.length !== 1)
@@ -116,6 +117,10 @@ else {
   void app
     .whenReady()
     .then(async () => {
+      if (process.env.NODE_ENV === 'development')
+        globalShortcut.register('CommandOrControl+Shift+I', () => {
+          window?.webContents.openDevTools();
+        });
       store = new Store(process.env.INTRANET_TEST_DATA || app.getPath('userData'), {
         available: () =>
           safeStorage.isEncryptionAvailable() &&
@@ -372,8 +377,10 @@ else {
           if (processes.running(item.id)) throw new AppError('请先停止实例再修改配置。');
           if (item.mode === 'form') {
             for (const rule of item.proxies)
-              if (rule.type === 'http' || rule.type === 'https')
-                rule.domains = normalizeDomains(rule.domains);
+              if (rule.type === 'http' || rule.type === 'https') {
+                console.log(rule.domains.filter(Boolean));
+                rule.domains = normalizeDomains(rule.domains.filter(Boolean));
+              }
             validateRules(item.proxies);
             const coveredDomains = (domains: string[]) =>
               new Set(domains.map((domain) => domain.toLowerCase().replace(/\.$/, '')));
@@ -651,7 +658,7 @@ else {
         }
       });
       window = new BrowserWindow({
-        width: 1280,
+        width: 3280,
         height: 850,
         minWidth: 980,
         minHeight: 650,
