@@ -7,5 +7,5 @@ export default defineConfig({
   base: './',
   root: 'src/renderer',
   build: { outDir: '../../dist/renderer', emptyOutDir: true },
-  server: { host: '127.0.0.1', port: 5173, strictPort: true },
+  server: { host: '127.0.0.1', port: 1854, strictPort: true, allowedHosts: true },
 } as Parameters<typeof defineConfig>[0]);

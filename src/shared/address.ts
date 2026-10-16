@@ -4,7 +4,8 @@ import type { ProxyRule, Server } from './types';
 export function accessAddress(rule: ProxyRule, server: Server): string {
   if (rule.type === 'http' || rule.type === 'https') {
     const p = rule.type === 'http' ? server.httpPort : server.httpsPort;
-    return `${rule.type}://${rule.domain}${p === (rule.type === 'http' ? 80 : 443) ? '' : `:${p}`}`;
+    const domain = rule.domains[0] ?? '';
+    return `${rule.type}://${domain}${p === (rule.type === 'http' ? 80 : 443) ? '' : `:${p}`}`;
   }
   const host = server.publicHost.includes(':') ? `[${server.publicHost}]` : server.publicHost;
   return `${host}:${rule.remotePort}`;

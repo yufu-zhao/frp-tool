@@ -16,6 +16,7 @@ export const frpAdapter = {
 export function validateRules(rules: ProxyRule[]) {
   const names = new Set<string>();
   const ports = new Set<string>();
+  const domains = new Set<string>();
   for (const rule of rules) {
     if (names.has(rule.name)) throw new AppError(`代理名称重复：${rule.name}`);
     names.add(rule.name);
@@ -24,43 +25,83 @@ export function validateRules(rules: ProxyRule[]) {
       const key = `${rule.type}:${rule.remotePort}`;
       if (ports.has(key)) throw new AppError(`公网端口重复：${key}`);
       ports.add(key);
-    } else if (!rule.domain || /[\s/:]/.test(rule.domain))
-      throw new AppError(`${rule.name} 请填写不含协议和端口的域名。`);
-    if (rule.type === 'https' && rule.tlsMode === 'terminate' && (!rule.certPath || !rule.keyPath))
+    } else {
+      if (!rule.domains.length) throw new AppError(`${rule.name} 请至少填写一个域名。`);
+      for (const domain of rule.domains) {
+        const normalized = domain.trim().toLowerCase().replace(/\.$/, '');
+        if (
+          !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(
+            normalized,
+          )
+        )
+          throw new AppError(`${rule.name} 请填写不含协议和端口的域名。`);
+        if (domains.has(normalized)) throw new AppError(`HTTP/HTTPS 域名重复：${normalized}`);
+        domains.add(normalized);
+      }
+    }
+    if (
+      rule.type === 'https' &&
+      rule.tlsMode === 'terminate' &&
+      !rule.certificateId &&
+      (!rule.certPath || !rule.keyPath)
+    )
       throw new AppError(`${rule.name} HTTPS 转换需要证书及私钥路径。`);
   }
 }
-export function clientConfig(instance: Instance, server: Server, token: string): string {
+export function clientConfig(
+  instance: Instance,
+  server: Server,
+  token: string,
+  certificates: Record<string, { certPath: string; keyPath: string }> = {},
+  httpChallenge?: { domains: string[]; localPort: number },
+): string {
   validateRules(instance.proxies);
   if (!instance.proxies.length) throw new AppError('请至少添加一个代理规则。');
+  const proxies: Array<Record<string, unknown>> = instance.proxies.map((rule) => {
+    const common = { name: `${instance.id}_${rule.name}`, type: rule.type };
+    const certificate = rule.certificateId ? certificates[rule.certificateId] : undefined;
+    if (rule.type === 'https' && rule.tlsMode === 'terminate' && rule.certificateId && !certificate)
+      throw new AppError(`${rule.name} 关联的 SSL 证书不存在，请重新选择证书。`);
+    const customDomains = rule.domains.map((domain) =>
+      domain.trim().toLowerCase().replace(/\.$/, ''),
+    );
+    if (rule.type === 'https' && rule.tlsMode === 'terminate')
+      return {
+        ...common,
+        customDomains,
+        plugin: {
+          type: 'https2http',
+          localAddr: `${rule.localIP.includes(':') ? `[${rule.localIP}]` : rule.localIP}:${rule.localPort}`,
+          crtPath: certificate?.certPath ?? rule.certPath,
+          keyPath: certificate?.keyPath ?? rule.keyPath,
+        },
+      };
+    return {
+      ...common,
+      localIP: rule.localIP,
+      localPort: rule.localPort,
+      ...(rule.type === 'tcp' || rule.type === 'udp'
+        ? { remotePort: rule.remotePort }
+        : { customDomains }),
+    };
+  });
+  if (httpChallenge) {
+    proxies.push({
+      name: `${instance.id}_acme_http01`,
+      type: 'http',
+      localIP: '127.0.0.1',
+      localPort: httpChallenge.localPort,
+      customDomains: httpChallenge.domains,
+      locations: ['/.well-known/acme-challenge/'],
+    });
+  }
   const config = {
     serverAddr: server.publicHost,
     serverPort: server.frpPort,
     auth: { method: 'token', token },
     loginFailExit: false,
     log: { to: 'console', level: 'info', disablePrintColor: true },
-    proxies: instance.proxies.map((rule) => {
-      const common = { name: `${instance.id}_${rule.name}`, type: rule.type };
-      if (rule.type === 'https' && rule.tlsMode === 'terminate')
-        return {
-          ...common,
-          customDomains: [rule.domain],
-          plugin: {
-            type: 'https2http',
-            localAddr: `${rule.localIP.includes(':') ? `[${rule.localIP}]` : rule.localIP}:${rule.localPort}`,
-            crtPath: rule.certPath,
-            keyPath: rule.keyPath,
-          },
-        };
-      return {
-        ...common,
-        localIP: rule.localIP,
-        localPort: rule.localPort,
-        ...(rule.type === 'tcp' || rule.type === 'udp'
-          ? { remotePort: rule.remotePort }
-          : { customDomains: [rule.domain] }),
-      };
-    }),
+    proxies,
   };
   return TOML.stringify(config as TOML.JsonMap);
 }

@@ -1,20 +1,56 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, readFile, writeFile, mkdir, readdir, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, mkdir, readdir, rm, symlink, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import * as tar from 'tar';
 import TOML from '@iarna/toml';
-import { serverSchema, instanceSchema, type ProxyRule } from '../src/shared/types';
+import { serverSchema, instanceSchema, proxySchema, type ProxyRule } from '../src/shared/types';
 import { clientConfig, serverConfig, frpAdapter, validateRules } from '../src/main/frp';
 import { accessAddress } from '../src/shared/address';
 import { normalizeReleases, chooseAsset, Versions, extractBinaries } from '../src/main/versions';
 import { Store, type CryptoProvider } from '../src/main/store';
 import { redact } from '../src/shared/errors';
-import { execute } from '../src/main/processes';
-import { Remote, quote, remotePath } from '../src/main/remote';
-import { nginxProxyConfig } from '../src/main/nginx';
-import { reverseProxySchema } from '../src/shared/types';
+import { execute, Processes } from '../src/main/processes';
+import {
+  Remote,
+  quote,
+  remotePath,
+  supportsSystemdAppend,
+  parseSystemdState,
+} from '../src/main/remote';
+import {
+  Certificates,
+  normalizeDomains,
+  validateCertificateMaterial,
+} from '../src/main/certificates';
+import { hostInfoCommand, parseHostInfo } from '../src/main/host-info';
+import {
+  deploymentManager,
+  openrcScript,
+  selectServiceMode,
+  sysvScript,
+} from '../src/main/service-manager';
+
+const hostInfoOutput = `platform=Linux
+kernel=5.14.0
+arch=x86_64
+home=/home/user
+distribution=CentOS Linux 7 (Core)
+version=7
+cpuModel=Intel Xeon
+cpuCores=4
+memoryTotalKB=8192
+memoryAvailableKB=4096
+disk=1048576:500000
+serviceManager=systemd
+userSystemd=no
+root=yes
+sudo=no
+__PORTS_BEGIN__
+LISTEN 0 128 *:7000
+__PORTS_END__`;
 
 const server = serverSchema.parse({
   id: 'server1',
@@ -33,7 +69,7 @@ const rule: ProxyRule = {
   localIP: '127.0.0.1',
   localPort: 3000,
   remotePort: 18080,
-  domain: '',
+  domains: [],
   tlsMode: 'passthrough',
   certPath: '',
   keyPath: '',
@@ -64,6 +100,77 @@ afterEach(async () => {
 });
 
 describe('FRP 配置与输入边界', () => {
+  it('按 systemd 版本选择兼容的服务日志方式', () => {
+    expect(supportsSystemdAppend('systemd 219 (219)')).toBe(false);
+    expect(supportsSystemdAppend('systemd 239')).toBe(false);
+    expect(supportsSystemdAppend('systemd 240')).toBe(true);
+    expect(supportsSystemdAppend('未知版本')).toBe(false);
+  });
+  it('解析发行版、资源容量和端口信息，缺项不阻断连接', () => {
+    const info = parseHostInfo(hostInfoOutput);
+    expect(info.supported).toBe(true);
+    expect(info.distribution).toContain('CentOS Linux 7');
+    expect(info.arch).toBe('amd64');
+    expect(info.cpuCores).toBe(4);
+    expect(info.memoryAvailableKB).toBe(4096);
+    expect(info.diskAvailableKB).toBe(500000);
+    expect(info.ports).toContain(':7000');
+    const partial = parseHostInfo('platform=Linux\narch=aarch64\nserviceManager=unknown');
+    expect(partial.arch).toBe('arm64');
+    expect(partial.cpuModel).toBe('');
+    expect(partial.memoryTotalKB).toBeNull();
+    expect(partial.warning).toContain('CPU 型号');
+  });
+  it('按实际服务管理器和权限自动选择运行方式', () => {
+    const info = parseHostInfo(hostInfoOutput);
+    expect(selectServiceMode(info)).toEqual({ manager: 'systemd', mode: 'system' });
+    expect(selectServiceMode({ ...info, root: false, sudo: false, userSystemd: true })).toEqual({
+      manager: 'systemd',
+      mode: 'user',
+    });
+    expect(selectServiceMode({ ...info, serviceManager: 'openrc', systemd: false })).toEqual({
+      manager: 'openrc',
+      mode: 'system',
+    });
+    expect(
+      selectServiceMode({
+        ...info,
+        serviceManager: 'sysv',
+        systemd: false,
+        root: false,
+        sudo: true,
+      }),
+    ).toEqual({ manager: 'sysv', mode: 'system' });
+    expect(
+      selectServiceMode({
+        ...info,
+        serviceManager: 'unknown',
+        systemd: false,
+        root: false,
+        sudo: false,
+      }),
+    ).toEqual({ manager: 'process', mode: 'process' });
+    expect(deploymentManager({ mode: 'process' } as any)).toBe('process');
+  });
+  it('生成安全的 OpenRC 与 SysV 服务脚本', () => {
+    const deployment = {
+      binary: "/home/o'neil/frps",
+      config: '/home/o neil/frps.toml',
+      log: '/home/o neil/frps.log',
+      pidFile: '/home/o neil/frps.pid',
+      mode: 'system' as const,
+      manager: 'sysv' as const,
+      service: 'intranet-frps-test',
+      managed: true,
+      version: '0.71.0',
+      versionKey: '',
+    };
+    expect(openrcScript({ ...deployment, manager: 'openrc' })).toContain('command_background=true');
+    const script = sysvScript(deployment);
+    expect(script).toContain("BIN='/home/o'\"'\"'neil/frps'");
+    expect(script).toContain('grep -Fx');
+    expect(script).toContain('restart) stop_service && start_service');
+  });
   it('生成可解析 TOML，包含认证令牌和代理隔离名称', () => {
     const config = TOML.parse(clientConfig(instance, server, 'secret-token')) as any;
     expect(config.auth.token).toBe('secret-token');
@@ -82,7 +189,7 @@ describe('FRP 配置与输入边界', () => {
     const https = {
       ...rule,
       type: 'https' as const,
-      domain: 'demo.example.com',
+      domains: ['demo.example.com'],
       localIP: '::1',
       tlsMode: 'terminate' as const,
       certPath: '/cert.pem',
@@ -92,21 +199,307 @@ describe('FRP 配置与输入边界', () => {
     expect(config.proxies[0].plugin.localAddr).toBe('[::1]:3000');
     expect(config.proxies[0].plugin.type).toBe('https2http');
   });
+  it('兼容旧单域名并生成多域名 HTTP/HTTPS 规则', () => {
+    expect(proxySchema.parse({ ...rule, domain: 'legacy.example.com' }).domains).toEqual([
+      'legacy.example.com',
+    ]);
+    const domains = ['one.example.com', 'two.example.com'];
+    const httpsRule = { ...rule, id: 'https', name: '多域名网站', type: 'https' as const, domains };
+    const config = TOML.parse(
+      clientConfig({ ...instance, proxies: [httpsRule] }, server, 't'),
+    ) as any;
+    expect(config.proxies[0].customDomains).toEqual(domains);
+    expect(() =>
+      validateRules([
+        httpsRule,
+        { ...httpsRule, id: 'another', name: '重复域名', domains: ['two.example.com'] },
+      ]),
+    ).toThrow('域名重复');
+  });
+  it('客户端配置从证书库解析路径并输出多 SAN 域名', () => {
+    const httpsRule = {
+      ...rule,
+      type: 'https' as const,
+      domains: ['one.example.com', 'two.example.com'],
+      tlsMode: 'terminate' as const,
+      certificateId: 'cert1',
+    };
+    const config = TOML.parse(
+      clientConfig({ ...instance, proxies: [httpsRule] }, server, 't', {
+        cert1: { certPath: '/secure/cert.pem', keyPath: '/secure/key.pem' },
+      }),
+    ) as any;
+    expect(config.proxies[0].customDomains).toEqual(httpsRule.domains);
+    expect(config.proxies[0].plugin.crtPath).toBe('/secure/cert.pem');
+    expect(config.proxies[0].plugin.keyPath).toBe('/secure/key.pem');
+    expect(() => clientConfig({ ...instance, proxies: [httpsRule] }, server, 't')).toThrow(
+      '证书不存在',
+    );
+  });
+  it('验证证书名称、签发私钥匹配和 SAN 覆盖', async () => {
+    const certPem = await readFile(
+      new URL('./fixtures/certificates-test-cert.pem', import.meta.url),
+      'utf8',
+    );
+    const keyPem = await readFile(
+      new URL('./fixtures/certificates-test-key.pem', import.meta.url),
+      'utf8',
+    );
+    expect(normalizeDomains(['One.Example.Test.', 'two.example.test'])).toEqual([
+      'one.example.test',
+      'two.example.test',
+    ]);
+    expect(() => validateCertificateMaterial(certPem, keyPem, ['one.example.test'])).not.toThrow();
+    expect(() => validateCertificateMaterial(certPem, keyPem, ['missing.example.test'])).toThrow(
+      '不包含域名',
+    );
+    expect(() => normalizeDomains(['*.example.test'])).toThrow('域名格式无效');
+  });
+  it('通过模拟 ACME 适配器完成 LiteSSL DNS-01 SAN 签发与 EAB 绑定', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    const certPem = await readFile(
+      new URL('./fixtures/certificates-test-cert.pem', import.meta.url),
+      'utf8',
+    );
+    const keyPem = await readFile(
+      new URL('./fixtures/certificates-test-key.pem', import.meta.url),
+      'utf8',
+    );
+    const prompts: Array<{ domain: string; record: string; value: string }> = [];
+    let clientOptions: any;
+    let challengeOptions: any;
+    const fakeAcme = {
+      directory: { letsencrypt: { production: 'https://letsencrypt.test/directory' } },
+      crypto: {
+        createPrivateEcdsaKey: async () => Buffer.from('account-key'),
+        createCsr: async () => [Buffer.from(keyPem), Buffer.from('csr')],
+      },
+      Client: class {
+        constructor(options: unknown) {
+          clientOptions = options;
+        }
+        async auto(options: any) {
+          challengeOptions = options;
+          for (const domain of ['one.example.test', 'two.example.test']) {
+            const authorization = { identifier: { value: domain } };
+            const challenge = { type: 'dns-01', token: `token-${domain}` };
+            await options.challengeCreateFn(authorization, challenge, `dns-value-${domain}`);
+            await options.challengeRemoveFn(authorization, challenge, `dns-value-${domain}`);
+          }
+          return certPem;
+        }
+      },
+    };
+    const certificates = new Certificates(
+      store,
+      () => {},
+      async (records) => {
+        prompts.push(...records);
+        return true;
+      },
+      async (_assignments, operation) => operation({ port: 0, set() {}, remove() {} }),
+      () => false,
+      fakeAcme as any,
+    );
+    const record = await certificates.issue({
+      name: 'LiteSSL SAN',
+      domains: ['one.example.test', 'two.example.test'],
+      provider: 'litessl',
+      email: 'owner@example.test',
+      challenge: 'dns-01',
+      termsAgreed: true,
+      eabKid: 'test-kid',
+      eabHmac: 'test-hmac',
+    });
+    expect(clientOptions.directoryUrl).toBe('https://acme.litessl.com/acme/v2/directory');
+    expect(clientOptions.externalAccountBinding).toEqual({ kid: 'test-kid', hmacKey: 'test-hmac' });
+    expect(challengeOptions.challengePriority).toEqual(['dns-01']);
+    expect(prompts.map((item) => item.record)).toEqual([
+      '_acme-challenge.one.example.test',
+      '_acme-challenge.two.example.test',
+    ]);
+    expect(record.domains).toEqual(['one.example.test', 'two.example.test']);
+    expect(record.provider).toBe('litessl');
+    expect(record.email).toBe('owner@example.test');
+  });
+  it('取消等待 DNS TXT 确认的签发任务并记录等待阶段', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    const certPem = await readFile(
+      new URL('./fixtures/certificates-test-cert.pem', import.meta.url),
+      'utf8',
+    );
+    const keyPem = await readFile(
+      new URL('./fixtures/certificates-test-key.pem', import.meta.url),
+      'utf8',
+    );
+    const controller = new AbortController();
+    const stages: string[] = [];
+    let reachedDnsPrompt!: () => void;
+    const dnsPromptStarted = new Promise<void>((resolve) => {
+      reachedDnsPrompt = resolve;
+    });
+    const fakeAcme = {
+      directory: { letsencrypt: { production: 'https://letsencrypt.test/directory' } },
+      crypto: {
+        createPrivateEcdsaKey: async () => Buffer.from('account-key'),
+        createCsr: async () => [Buffer.from(keyPem), Buffer.from('csr')],
+      },
+      Client: class {
+        constructor(_options: unknown) {}
+        async auto(options: any) {
+          await options.challengeCreateFn(
+            { identifier: { value: 'one.example.test' } },
+            { type: 'dns-01', token: 'token-one' },
+            'dns-value-one',
+          );
+          return certPem;
+        }
+      },
+    };
+    const certificates = new Certificates(
+      store,
+      () => {},
+      async () => new Promise<boolean>(() => {}),
+      async (_assignments, operation) => operation({ port: 0, set() {}, remove() {} }),
+      () => false,
+      fakeAcme as any,
+    );
+    const issue = certificates.issue(
+      {
+        name: '可取消任务',
+        domains: ['one.example.test'],
+        provider: 'letsencrypt',
+        email: 'owner@example.test',
+        challenge: 'dns-01',
+        termsAgreed: true,
+      },
+      [],
+      undefined,
+      {
+        taskId: 'test-cancel-task',
+        signal: controller.signal,
+        onProgress: (progress) => {
+          stages.push(progress.status);
+          if (progress.status === 'waiting-user') reachedDnsPrompt();
+        },
+        promptDnsChallenge: async () => new Promise<boolean>(() => {}),
+      },
+    );
+    await dnsPromptStarted;
+    controller.abort();
+    await expect(issue).rejects.toThrow('用户已取消证书签发');
+    expect(stages).toContain('waiting-user');
+  });
+  it('HTTP-01 临时 FRP 规则限定域名和验证路径，恢复原实例配置', async () => {
+    const temporary = TOML.parse(
+      clientConfig(
+        instance,
+        { ...server, httpPort: 80 },
+        't',
+        {},
+        { domains: ['one.example.test'], localPort: 43210 },
+      ),
+    ) as any;
+    expect(temporary.proxies.at(-1).customDomains).toEqual(['one.example.test']);
+    expect(temporary.proxies.at(-1).locations).toEqual(['/.well-known/acme-challenge/']);
+    const store = new Store(root, noCrypto);
+    await store.load();
+    store.data.servers = [{ ...server, httpPort: 80 }];
+    store.data.instances = [instance];
+    const processes = new Processes(store, () => {});
+    const starts: unknown[] = [];
+    vi.spyOn(processes, 'running').mockReturnValue(false);
+    vi.spyOn(processes, 'start').mockImplementation(async (id, challenge) => {
+      starts.push({ id, challenge });
+    });
+    vi.spyOn(processes, 'status').mockReturnValue({
+      status: 'connected',
+      message: '',
+      proxies: {},
+    });
+    const value = await processes.withHttp01Challenge(
+      [{ instanceId: instance.id, domains: ['one.example.test'] }],
+      async (responder) => {
+        responder.set('challenge-token', 'expected-key-authorization');
+        const response = await fetch(
+          `http://127.0.0.1:${responder.port}/.well-known/acme-challenge/challenge-token`,
+        );
+        return response.text();
+      },
+    );
+    expect(value).toBe('expected-key-authorization');
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toEqual({
+      id: instance.id,
+      challenge: { domains: ['one.example.test'], localPort: expect.any(Number) },
+    });
+  });
+  it('将手动证书复制到受限权限的本机证书库并拒绝删除仍被引用的证书', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    const certificates = new Certificates(
+      store,
+      () => {},
+      async () => true,
+      async (_assignments, operation) => operation({ port: 0, set() {}, remove() {} }),
+      () => false,
+    );
+    const record = await certificates.importManual({
+      name: '测试 SAN',
+      domains: ['one.example.test', 'two.example.test'],
+      certificatePath: fileURLToPath(
+        new URL('./fixtures/certificates-test-cert.pem', import.meta.url),
+      ),
+      privateKeyPath: fileURLToPath(
+        new URL('./fixtures/certificates-test-key.pem', import.meta.url),
+      ),
+    });
+    const certStats = await stat(record.certPath);
+    const keyStats = await stat(record.keyPath);
+    const directoryStats = await stat(path.dirname(record.certPath));
+    expect(certStats.mode & 0o777).toBe(0o600);
+    expect(keyStats.mode & 0o777).toBe(0o600);
+    expect(directoryStats.mode & 0o777).toBe(0o700);
+    const targets = [
+      { instanceId: instance.id, ruleId: 'https1' },
+      { instanceId: instance.id, ruleId: 'https2' },
+    ];
+    store.data.instances.push({
+      ...instance,
+      proxies: targets.map((target, index) => ({
+        ...rule,
+        id: target.ruleId,
+        name: `https-${index + 1}`,
+        type: 'https',
+        tlsMode: 'terminate',
+        domains: [record.domains[index]],
+      })),
+    });
+    await certificates.associate(record.id, targets);
+    expect(
+      store.instance(instance.id).proxies.every((item) => item.certificateId === record.id),
+    ).toBe(true);
+    await expect(certificates.remove(record.id)).rejects.toThrow('仍被 HTTPS 规则引用');
+  });
   it('拒绝重复代理、公网端口、无域名或不完整证书', () => {
     expect(() => validateRules([rule, rule])).toThrow('名称重复');
     expect(() => validateRules([rule, { ...rule, name: '第二个' }])).toThrow('端口重复');
-    expect(() => validateRules([{ ...rule, type: 'http', domain: 'https://x' }])).toThrow('域名');
+    expect(() => validateRules([{ ...rule, type: 'http', domains: ['https://x'] }])).toThrow(
+      '域名',
+    );
     expect(() =>
-      validateRules([{ ...rule, type: 'https', domain: 'x', tlsMode: 'terminate' }]),
+      validateRules([{ ...rule, type: 'https', domains: ['x.example.com'], tlsMode: 'terminate' }]),
     ).toThrow('证书');
     expect(() => serverConfig({ ...server, httpPort: 7000 }, 't')).toThrow('端口不能重复');
   });
   it('正确显示 IPv6、默认 HTTP 端口和非默认 HTTPS 端口', () => {
     expect(accessAddress(rule, { ...server, publicHost: '::1' })).toBe('[::1]:18080');
     expect(
-      accessAddress({ ...rule, type: 'http', domain: 'x.com' }, { ...server, httpPort: 80 }),
+      accessAddress({ ...rule, type: 'http', domains: ['x.com'] }, { ...server, httpPort: 80 }),
     ).toBe('http://x.com');
-    expect(accessAddress({ ...rule, type: 'https', domain: 'x.com' }, server)).toBe(
+    expect(accessAddress({ ...rule, type: 'https', domains: ['x.com'] }, server)).toBe(
       'https://x.com:8443',
     );
   });
@@ -115,48 +508,6 @@ describe('FRP 配置与输入边界', () => {
     expect(frpAdapter.supportsForm('v0.52.0')).toBe(true);
     expect(serverSchema.safeParse({ ...server, id: '../x' }).success).toBe(false);
     expect(serverSchema.safeParse({ ...server, sshPort: 65536 }).success).toBe(false);
-  });
-});
-
-describe('Nginx 域名反向代理配置', () => {
-  it('生成 80 到 HTTP 入口、443 TLS 到 HTTPS 入口的隔离站点', () => {
-    const site = reverseProxySchema.parse({
-      id: 'site1',
-      domain: 'demo.example.com',
-      provider: 'manual',
-      httpPort: 8080,
-      httpsPort: 8443,
-      certPath: '/etc/nginx/ssl/demo/fullchain.pem',
-      keyPath: '/etc/nginx/ssl/demo/privkey.pem',
-      configPath: '/etc/nginx/conf.d/site1.conf',
-      webRoot: '/var/www/intranet-acme/site1',
-      createdAt: Date.now(),
-    });
-    const config = nginxProxyConfig(site, true);
-    expect(config).toContain('listen 80;');
-    expect(config).toContain('proxy_pass http://127.0.0.1:8080;');
-    expect(config).toContain('listen 443 ssl;');
-    expect(config).toContain('proxy_pass https://127.0.0.1:8443;');
-    expect(config).toContain('proxy_ssl_name $host;');
-    expect(config).toContain('ssl_certificate_key /etc/nginx/ssl/demo/privkey.pem;');
-  });
-  it('为 ACME HTTP-01 提供独立验证目录', () => {
-    const site = reverseProxySchema.parse({
-      id: 'site1',
-      domain: 'demo.example.com',
-      provider: 'letsencrypt',
-      httpPort: 8080,
-      httpsPort: 8443,
-      certPath: '/etc/nginx/cert.pem',
-      keyPath: '/etc/nginx/key.pem',
-      configPath: '/etc/nginx/conf.d/site1.conf',
-      webRoot: '/var/www/intranet-acme/site1',
-      createdAt: Date.now(),
-    });
-    expect(nginxProxyConfig(site, false)).toContain('location ^~ /.well-known/acme-challenge/');
-    expect(
-      reverseProxySchema.safeParse({ ...site, domain: 'demo.example.com; include /tmp/x' }).success,
-    ).toBe(false);
   });
 });
 
@@ -351,6 +702,23 @@ describe('存储、命令与日志保护', () => {
     await expect(new Store(root, noCrypto).load()).rejects.toThrow('不会覆盖');
     expect(await readFile(path.join(root, 'state.json'), 'utf8')).toBe('{bad');
   });
+  it('启动时清除本机旧站点记录和 EAB 密钥，不处理服务器文件', async () => {
+    const legacy = {
+      schema: 1,
+      servers: [{ ...server, reverseProxies: [{ id: 'site1', domain: 'old.example.com' }] }],
+      instances: [],
+      versions: [],
+      settings: { proxyUrl: '' },
+      secrets: { 'server:server1:proxy:site1:eabKid': 'encrypted-value' },
+    };
+    await writeFile(path.join(root, 'state.json'), JSON.stringify(legacy));
+    const store = new Store(root, noCrypto);
+    await store.load();
+    expect(store.server('server1')).not.toHaveProperty('reverseProxies');
+    expect(store.data.secrets).not.toHaveProperty('server:server1:proxy:site1:eabKid');
+    const persisted = JSON.parse(await readFile(path.join(root, 'state.json'), 'utf8'));
+    expect(persisted.servers[0]).not.toHaveProperty('reverseProxies');
+  });
   it('日志隐藏已知凭据、密码字段和私钥', () => {
     const output = redact(
       'token = abc password=def known123 -----BEGIN OPENSSH PRIVATE KEY-----\ndata\n-----END OPENSSH PRIVATE KEY-----',
@@ -381,6 +749,7 @@ describe('存储、命令与日志保护', () => {
       .spyOn(remote, 'exec')
       .mockResolvedValueOnce('0.71.0')
       .mockResolvedValueOnce('')
+      .mockResolvedValueOnce(hostInfoOutput)
       .mockResolvedValueOnce('{ path=/usr/sbin/nginx ; argv[]=/usr/sbin/nginx ; }');
     await expect(
       remote.adopt(server.id, {
@@ -397,7 +766,279 @@ describe('存储、命令与日志保护', () => {
     ).rejects.toThrow('不一致');
     expect(store.server(server.id).deployment).toBeUndefined();
     expect(exec.mock.calls.some((call) => call[1].includes('systemctl stop'))).toBe(false);
+    expect(exec.mock.calls.some((call) => call[1].includes('--value'))).toBe(false);
   });
+  it('系统日志文件缺失时回退到 systemd journal', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    store.server(server.id).deployment = {
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      log: '/opt/frps.log',
+      pidFile: '/opt/frps.pid',
+      mode: 'system',
+      service: 'frps.service',
+      managed: true,
+      version: '0.71.0',
+      versionKey: '',
+      logMode: 'file',
+    };
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const exec = vi.spyOn(remote, 'exec').mockResolvedValue('journal output');
+    await expect(remote.logs(server.id)).resolves.toContain('journal output');
+    expect(exec.mock.calls[0][1]).toContain('if test -r');
+    expect(exec.mock.calls[0][1]).toContain('journalctl -u');
+  });
+  it('兼容旧版 systemd 的 ExecStart 输出并完成 FRP 接管校验', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const exec = vi.spyOn(remote, 'exec').mockResolvedValueOnce('0.71.0').mockResolvedValueOnce('');
+    exec
+      .mockResolvedValueOnce(hostInfoOutput)
+      .mockResolvedValueOnce(
+        'ExecStart={ path=/opt/frps ; argv[]=/opt/frps -c /opt/frps.toml ; ignore_errors=no ; }',
+      );
+    await remote.adopt(server.id, {
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      log: '/opt/frps.log',
+      pidFile: '/opt/frps.pid',
+      mode: 'system',
+      service: 'frps.service',
+      managed: false,
+      version: '',
+      versionKey: '',
+    });
+    expect(store.server(server.id).deployment?.service).toBe('frps.service');
+    const inspectCommand = exec.mock.calls[3][1];
+    expect(inspectCommand).toContain('systemctl show');
+    expect(inspectCommand).not.toContain('--value');
+  });
+  it.each([
+    ['openrc', "rc-service 'intranet-test' 'start'"],
+    ['sysv', "'/etc/init.d/intranet-test' 'start'"],
+  ] as const)('根据部署记录使用 %s 控制服务', async (manager, expectedCommand) => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    store.server(server.id).deployment = {
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      log: '/opt/frps.log',
+      pidFile: '/opt/frps.pid',
+      mode: 'system',
+      manager,
+      servicePath: `/etc/init.d/intranet-test`,
+      service: 'intranet-test',
+      managed: true,
+      version: '0.71.0',
+      versionKey: '',
+    };
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const exec = vi.spyOn(remote, 'exec').mockImplementation(async (_id, command) => {
+      if (command.startsWith('cat --')) return 'BIN=/opt/frps CONFIG=/opt/frps.toml';
+      if (command.includes('code=$?')) return 'active';
+      return '';
+    });
+    await expect(remote.control(server.id, 'start')).resolves.toBe('active');
+    expect(exec.mock.calls.some((call) => call[1].includes(expectedCommand))).toBe(true);
+  });
+  it('远端卸载失败时保留本机部署记录', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    store.server(server.id).deployment = {
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      log: '/opt/frps.log',
+      pidFile: '/opt/frps.pid',
+      mode: 'system',
+      manager: 'openrc',
+      servicePath: '/etc/init.d/intranet-test',
+      service: 'intranet-test',
+      managed: false,
+      version: '0.71.0',
+      versionKey: '',
+    };
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    vi.spyOn(remote, 'control').mockResolvedValue('inactive');
+    vi.spyOn(remote, 'exec').mockRejectedValue(new Error('权限不足'));
+
+    await expect(remote.uninstall(server.id)).rejects.toThrow('权限不足');
+    expect(store.server(server.id).deployment?.manager).toBe('openrc');
+  });
+  it('OpenRC 远端卸载移除服务注册和指定文件，保留备份', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    store.server(server.id).deployment = {
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      log: '/opt/frps.log',
+      pidFile: '/opt/frps.pid',
+      mode: 'system',
+      manager: 'openrc',
+      servicePath: '/etc/init.d/intranet-test',
+      service: 'intranet-test',
+      managed: true,
+      version: '0.71.0',
+      versionKey: '',
+    };
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    vi.spyOn(remote, 'control').mockResolvedValue('inactive');
+    const exec = vi.spyOn(remote, 'exec').mockResolvedValue('');
+
+    await expect(remote.uninstall(server.id)).resolves.toContain('历史备份保留');
+    expect(exec.mock.calls.some((call) => call[1].includes("rc-update del 'intranet-test'"))).toBe(
+      true,
+    );
+    expect(exec.mock.calls.some((call) => call[1].includes("'/etc/init.d/intranet-test'"))).toBe(
+      true,
+    );
+    expect(exec.mock.calls.some((call) => call[1].includes("'/opt/intranet-test.init'"))).toBe(
+      true,
+    );
+    expect(exec.mock.calls.some((call) => call[1].includes("'/opt/frps.bak'"))).toBe(false);
+    expect(store.server(server.id).deployment).toBeUndefined();
+  });
+  it.each([
+    ['active', 'active'],
+    ['inactive', 'inactive'],
+  ])('识别 systemd 服务状态 %s', async (output, expected) => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    store.server(server.id).deployment = {
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      log: '/opt/frps.log',
+      pidFile: '/opt/frps.pid',
+      mode: 'system',
+      service: 'frps.service',
+      managed: false,
+      version: '0.71.0',
+      versionKey: '',
+    };
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    vi.spyOn(remote, 'exec').mockResolvedValue(
+      `ActiveState=${output}\nSubState=running\nResult=success`,
+    );
+    await expect(remote.status(server.id)).resolves.toBe(expected);
+  });
+  it('systemd 状态属性缺失时回退旧版 is-active，并解析 ActiveState', async () => {
+    expect(parseSystemdState('ActiveState=inactive\nSubState=dead\nResult=success')).toBe(
+      'inactive',
+    );
+    expect(parseSystemdState('unknown')).toBeUndefined();
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    store.server(server.id).deployment = {
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      log: '/opt/frps.log',
+      pidFile: '/opt/frps.pid',
+      mode: 'system',
+      service: 'frps.service',
+      managed: false,
+      version: '0.71.0',
+      versionKey: '',
+    };
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const exec = vi
+      .spyOn(remote, 'exec')
+      .mockResolvedValueOnce('Unknown properties')
+      .mockResolvedValueOnce('inactive');
+    await expect(remote.status(server.id)).resolves.toBe('inactive');
+    expect(exec.mock.calls[0][1]).toContain('-p ActiveState');
+    expect(exec.mock.calls[1][1]).toContain('is-active');
+  });
+  it('systemd 状态未知时仍回报已成功执行的停止命令', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    store.server(server.id).deployment = {
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      log: '/opt/frps.log',
+      pidFile: '/opt/frps.pid',
+      mode: 'system',
+      service: 'frps.service',
+      managed: false,
+      version: '0.71.0',
+      versionKey: '',
+    };
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    vi.spyOn(remote, 'exec').mockImplementation(async (_id, command) => {
+      if (command.includes('-p ExecStart'))
+        return 'ExecStart={ path=/opt/frps ; argv[]=/opt/frps -c /opt/frps.toml ; }';
+      if (command.includes('is-active')) return 'unknown';
+      if (command.includes('-p ActiveState')) return 'ActiveState=unknown\nSubState=dead';
+      return '';
+    });
+    await expect(remote.control(server.id, 'stop')).resolves.toContain('状态未确认');
+  });
+  it.each(['systemctl: command not found', 'Failed to connect to bus: No such file or directory'])(
+    '把 systemd 查询错误作为可诊断异常返回：%s',
+    async (output) => {
+      const store = new Store(root, noCrypto);
+      await store.load();
+      await store.saveServer(server);
+      store.server(server.id).deployment = {
+        binary: '/opt/frps',
+        config: '/opt/frps.toml',
+        log: '/opt/frps.log',
+        pidFile: '/opt/frps.pid',
+        mode: 'system',
+        service: 'frps.service',
+        managed: false,
+        version: '0.71.0',
+        versionKey: '',
+      };
+      const remote = new Remote(
+        store,
+        async () => false,
+        () => {},
+      );
+      vi.spyOn(remote, 'exec').mockResolvedValue(output);
+      await expect(remote.status(server.id)).rejects.toThrow(output);
+    },
+  );
   it('本机执行分别处理成功、失败和超时', async () => {
     expect(await execute(process.execPath, ['-e', 'console.log("0.71.0")'])).toBe('0.71.0');
     await expect(

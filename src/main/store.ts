@@ -4,10 +4,12 @@ import {
   serverSchema,
   instanceSchema,
   settingsSchema,
+  certificateSchema,
   type Server,
   type Instance,
   type InstalledVersion,
   type Settings,
+  type CertificateRecord,
 } from '../shared/types';
 import { AppError } from '../shared/errors';
 
@@ -22,6 +24,7 @@ interface DiskState {
   instances: Instance[];
   versions: InstalledVersion[];
   settings: Settings;
+  certificates: CertificateRecord[];
   secrets: Record<string, string>;
 }
 
@@ -33,6 +36,7 @@ export class Store {
     instances: [],
     versions: [],
     settings: { proxyUrl: '' },
+    certificates: [],
     secrets: {},
   };
   private writes: Promise<void> = Promise.resolve();
@@ -55,9 +59,16 @@ export class Store {
         !Array.isArray(raw.versions)
       )
         throw new Error('数据结构不正确');
+      const legacySiteServers = raw.servers
+        .filter((item: unknown) => !!item && typeof item === 'object' && 'reverseProxies' in item)
+        .map((item: { id?: unknown }) => item.id)
+        .filter((id: unknown): id is string => typeof id === 'string');
       raw.servers = raw.servers.map((item: unknown) => serverSchema.parse(item));
       raw.instances = raw.instances.map((item: unknown) => instanceSchema.parse(item));
       raw.settings = settingsSchema.parse(raw.settings);
+      raw.certificates = Array.isArray(raw.certificates)
+        ? raw.certificates.map((item: unknown) => certificateSchema.parse(item))
+        : [];
       if (
         !raw.secrets ||
         typeof raw.secrets !== 'object' ||
@@ -66,6 +77,12 @@ export class Store {
       )
         throw new Error('凭据结构不正确');
       this.data = raw;
+      // 清理本机旧版站点记录和其 EAB 密钥；服务器上的配置文件不触碰。
+      const legacyProxySecrets = Object.keys(this.data.secrets).filter((key) =>
+        /^server:[^:]+:proxy:/.test(key),
+      );
+      for (const key of legacyProxySecrets) delete this.data.secrets[key];
+      if (legacySiteServers.length || legacyProxySecrets.length) await this.persist();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
         throw new AppError(
@@ -125,7 +142,6 @@ export class Store {
       rawConfig: '',
       fingerprint: previous?.fingerprint,
       deployment: previous?.deployment,
-      reverseProxies: previous?.reverseProxies ?? [],
     };
     this.data.servers = [...this.data.servers.filter((s) => s.id !== item.id), item];
     await this.persist();
@@ -137,6 +153,14 @@ export class Store {
     this.data.instances = [
       ...this.data.instances.filter((s) => s.id !== item.id),
       { ...item, rawConfig: '' },
+    ];
+    await this.persist();
+  }
+  async saveCertificate(item: CertificateRecord) {
+    const parsed = certificateSchema.parse(item);
+    this.data.certificates = [
+      ...this.data.certificates.filter((certificate) => certificate.id !== parsed.id),
+      parsed,
     ];
     await this.persist();
   }
@@ -152,6 +176,7 @@ export class Store {
         rawConfig: this.readConfig(`instance:${s.id}:rawConfig`),
       })),
       versions: this.data.versions,
+      certificates: this.data.certificates,
       settings: this.data.settings,
       secureStorage: this.secure,
       platform: process.platform === 'win32' ? 'windows' : process.platform,

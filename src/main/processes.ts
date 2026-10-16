@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createServer, type Server as HttpServer } from 'node:http';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { Store } from './store';
@@ -41,7 +42,7 @@ export class Processes {
   constructor(
     private store: Store,
     private changed: () => void,
-  ) {}
+  ) { }
   status(id: string): Runtime {
     return this.runtimes.get(id) ?? { status: 'stopped', message: '未启动', proxies: {} };
   }
@@ -70,9 +71,22 @@ export class Processes {
     const server = this.store.server(instance.serverId);
     return instance.mode === 'raw'
       ? instance.rawConfig
-      : clientConfig(instance, server, this.store.secret(`server:${server.id}:token`));
+      : clientConfig(
+        instance,
+        server,
+        this.store.secret(`server:${server.id}:token`),
+        this.certificatePaths(),
+      );
   }
-  async start(id: string) {
+  private certificatePaths() {
+    return Object.fromEntries(
+      this.store.data.certificates.map((certificate) => [
+        certificate.id,
+        { certPath: certificate.certPath, keyPath: certificate.keyPath },
+      ]),
+    );
+  }
+  async start(id: string, httpChallenge?: { domains: string[]; localPort: number }) {
     if (this.closing) throw new AppError('应用正在退出，不能启动新实例。');
     if (this.running(id)) throw new AppError('实例正在运行或正在启动。');
     this.busy.add(id);
@@ -89,7 +103,13 @@ export class Processes {
       const config =
         instance.mode === 'raw'
           ? this.store.secret(`instance:${id}:rawConfig`)
-          : clientConfig(instance, server, this.store.secret(`server:${server.id}:token`));
+          : clientConfig(
+            instance,
+            server,
+            this.store.secret(`server:${server.id}:token`),
+            this.certificatePaths(),
+            httpChallenge,
+          );
       if (!config.trim()) throw new AppError('配置内容为空。');
       const folder = path.join(this.store.root, 'runtime', id);
       await mkdir(folder, { recursive: true, mode: 0o700 });
@@ -169,7 +189,12 @@ export class Processes {
         runtime.status = code === 0 || code === null ? 'stopped' : 'error';
         runtime.message = `进程已退出（${code ?? '终止'}）`;
         for (const p of instance.proxies) runtime.proxies[p.id] = '已停止';
-        void rm(folder, { recursive: true, force: true }).catch(() => {});
+        // 延迟清理并检查新进程，避免快速重启时误删新配置文件。
+        const cleanup = setTimeout(() => {
+          if (!this.children.has(id))
+            void rm(folder, { recursive: true, force: true }).catch(() => { });
+        }, 1000);
+        cleanup.unref();
         this.changed();
       });
       this.changed();
@@ -200,6 +225,99 @@ export class Processes {
       });
       child.kill('SIGTERM');
     });
+  }
+  async withHttp01Challenge<T>(
+    assignments: Array<{ instanceId: string; domains: string[] }>,
+    operation: (responder: {
+      port: number;
+      set(token: string, value: string): void;
+      remove(token: string): void;
+    }) => Promise<T>,
+  ): Promise<T> {
+    const merged = new Map<string, Set<string>>();
+    for (const assignment of assignments) {
+      const domains = merged.get(assignment.instanceId) ?? new Set<string>();
+      for (const domain of assignment.domains) domains.add(domain.toLowerCase());
+      merged.set(assignment.instanceId, domains);
+    }
+    const normalized = [...merged].map(([instanceId, domains]) => ({
+      instanceId,
+      domains: [...domains],
+    }));
+    if (!normalized.length) throw new AppError('HTTP-01 缺少可转发到客户端实例的域名。');
+    const tokens = new Map<string, string>();
+    const server: HttpServer = createServer((request, response) => {
+      const token = decodeURIComponent((request.url ?? '').split('/').at(-1) ?? '');
+      const value = tokens.get(token);
+      if (!request.url?.startsWith('/.well-known/acme-challenge/') || !value) {
+        response.writeHead(404).end('not found');
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end(value);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        server.removeListener('error', reject);
+        resolve();
+      });
+    });
+    const port = (server.address() as { port: number }).port;
+    const wasRunning = new Map(
+      normalized.map(({ instanceId }) => [instanceId, this.running(instanceId)]),
+    );
+    const started: string[] = [];
+    try {
+      for (const { instanceId } of normalized)
+        if (wasRunning.get(instanceId)) await this.stop(instanceId);
+      for (const assignment of normalized) {
+        const instance = this.store.instance(assignment.instanceId);
+        if (instance.mode !== 'form')
+          throw new AppError(
+            `实例「${instance.name}」使用高级原始配置，无法临时添加 HTTP-01 验证规则。`,
+          );
+        const serverInfo = this.store.server(instance.serverId);
+        if (serverInfo.httpPort !== 80)
+          throw new AppError(
+            `服务器「${serverInfo.name}」的 FRP HTTP 入口不是公网 80 端口，无法进行 HTTP-01 验证。`,
+          );
+        await this.start(assignment.instanceId, { domains: assignment.domains, localPort: port });
+        started.push(assignment.instanceId);
+      }
+      for (const instanceId of started) {
+        const deadline = Date.now() + 30000;
+        while (Date.now() < deadline) {
+          const status = this.status(instanceId);
+          if (status.status === 'connected') break;
+          if (status.status === 'error' || status.status === 'stopped')
+            throw new AppError(
+              `实例「${this.store.instance(instanceId).name}」未能连接 FRP，HTTP-01 验证已取消。`,
+            );
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        if (this.status(instanceId).status !== 'connected')
+          throw new AppError(
+            `实例「${this.store.instance(instanceId).name}」连接 FRP 超时，HTTP-01 验证已取消。`,
+          );
+      }
+      return await operation({
+        port,
+        set: (token, value) => tokens.set(token, value),
+        remove: (token) => tokens.delete(token),
+      });
+    } finally {
+      for (const instanceId of started) await this.stop(instanceId).catch(() => { });
+      for (const [instanceId, running] of wasRunning) {
+        if (running && !this.closing)
+          await this.start(instanceId).catch((error) => {
+            this.append(
+              instanceId,
+              `HTTP-01 验证后恢复实例失败：${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
+      }
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   }
   async shutdown() {
     this.closing = true;

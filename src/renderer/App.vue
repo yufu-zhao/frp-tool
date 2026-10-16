@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 import type {
   State,
   Server,
@@ -11,7 +11,7 @@ import type {
   Runtime,
   Deployment,
   InstallRequest,
-  ReverseProxy,
+  CertificateIssueProgress,
 } from '../shared/types';
 import logoUrl from '../../assets/brand/logo.svg';
 import { accessAddress } from '../shared/address';
@@ -20,6 +20,7 @@ const api = window.desktop;
 const state = ref<State>({
   servers: [],
   instances: [],
+  certificates: [],
   versions: [],
   settings: { proxyUrl: '' },
   secureStorage: true,
@@ -30,7 +31,8 @@ const runtime = ref<{
   clients: Record<string, Runtime>;
   ssh: Record<string, string>;
   services: Record<string, string>;
-}>({ clients: {}, ssh: {}, services: {} });
+  serviceErrors: Record<string, string>;
+}>({ clients: {}, ssh: {}, services: {}, serviceErrors: {} });
 const page = ref('servers');
 const busy = ref(false);
 const error = ref('');
@@ -48,49 +50,53 @@ const serverDraft = ref<Server>();
 const instanceDraft = ref<Instance>();
 const versionChoice = ref('');
 const hostInfo = ref<HostInfo>();
-const deployMode = ref('auto');
 const backups = ref<Array<{ kind: 'binary' | 'config'; path: string; time: number }>>([]);
 const proxyUrl = ref('');
 const showGuide = ref(true);
 const abandonRaw = ref(false);
 const manual = reactive({ version: '', url: '', localPath: '', digest: '' });
+const certificateDraft = reactive({
+  name: '',
+  domainsText: '',
+  certificatePath: '',
+  privateKeyPath: '',
+  provider: 'letsencrypt' as 'letsencrypt' | 'litessl',
+  email: '',
+  challenge: 'dns-01' as 'http-01' | 'dns-01',
+  termsAgreed: false,
+  eabKid: '',
+  eabHmac: '',
+});
+const certificateToAssociate = ref('');
+const certificateTargets = ref<string[]>([]);
+const certificateProgress = ref<CertificateIssueProgress>();
+const certificateProgressHistory = ref<CertificateIssueProgress[]>([]);
+const activeCertificateTask = ref('');
 const adoption = reactive<Deployment>({
   binary: '',
   config: '',
   log: '',
   pidFile: '',
   mode: 'process',
-  service: 'frps.service',
+  service: 'frps',
   managed: false,
   version: '',
   versionKey: '',
 });
-const reverseProxyDraft = reactive({
-  domain: '',
-  provider: 'manual' as ReverseProxy['provider'],
-  email: '',
-  httpPort: 8080,
-  httpsPort: 8443,
-  certLocalPath: '',
-  keyLocalPath: '',
-  eabKid: '',
-  eabHmac: '',
-});
 let timer: ReturnType<typeof setInterval>;
 let unsubscribe: () => void;
+let unsubscribeCertificateProgress: () => void;
 const uid = () => crypto.randomUUID();
 const server = computed(() => state.value.servers.find((s) => s.id === selectedServer.value));
 const instance = computed(() => state.value.instances.find((s) => s.id === selectedInstance.value));
-watch(
-  selectedServer,
-  (id) => {
-    const selected = state.value.servers.find((value) => value.id === id);
-    if (selected) {
-      reverseProxyDraft.httpPort = selected.httpPort;
-      reverseProxyDraft.httpsPort = selected.httpsPort;
-    }
-  },
-  { immediate: true },
+const certificateRules = computed(() =>
+  state.value.instances.flatMap((item) =>
+    item.mode === 'form'
+      ? item.proxies
+          .filter((rule) => rule.type === 'https' && rule.tlsMode === 'terminate')
+          .map((rule) => ({ instance: item, rule }))
+      : [],
+  ),
 );
 const linuxVersions = computed(() =>
   state.value.versions.filter(
@@ -105,6 +111,7 @@ const localVersions = computed(() =>
 const navIcons: Record<string, string> = {
   servers: '▤',
   clients: '⇄',
+  certificates: '◇',
   versions: '▦',
   settings: '⚙',
 };
@@ -112,6 +119,10 @@ const modalTitles: Record<string, string> = {
   server: '服务器配置',
   instance: '客户端实例配置',
   manual: '手动安装与离线导入',
+  'certificate-import': '导入 SSL 证书',
+  'certificate-issue': '签发 SSL 证书',
+  'certificate-progress': '证书签发进度',
+  'certificate-associate': '关联 SSL 证书',
   adopt: '接管已有部署',
   logs: '运行日志',
   backups: '部署备份',
@@ -119,12 +130,14 @@ const modalTitles: Record<string, string> = {
 const titles: Record<string, string> = {
   servers: '服务器',
   clients: '客户端实例',
+  certificates: 'SSL 证书',
   versions: '版本库',
   settings: '设置与帮助',
 };
 const descriptions: Record<string, string> = {
   servers: '连接你的 Linux 服务器，部署或接管 FRP 服务。',
   clients: '将本机服务分享出去，多套配置可以同时运行。',
+  certificates: '在本机导入或签发证书，并关联到 HTTPS 客户端规则。',
   versions: '按版本、平台和架构管理程序，联网与离线都能安装。',
   settings: '调整下载网络，了解平台权限和部署注意事项。',
 };
@@ -181,7 +194,6 @@ function newServer() {
     frpPort: 7000,
     httpPort: 8080,
     httpsPort: 8443,
-    reverseProxies: [],
     configMode: 'form',
     rawConfig: '',
     rawFormat: 'toml',
@@ -248,11 +260,207 @@ function addProxy() {
     localIP: '127.0.0.1',
     localPort: 3000,
     remotePort: 18080,
-    domain: '',
+    domains: [],
     tlsMode: 'passthrough',
     certPath: '',
     keyPath: '',
   });
+}
+function ruleDomainsText(rule: ProxyRule) {
+  return rule.domains.join('\n');
+}
+function setRuleDomains(rule: ProxyRule, event: Event) {
+  rule.domains = (event.target as HTMLTextAreaElement).value
+    .split(/[\n,，;；]+/)
+    .map((domain) => domain.trim().toLowerCase().replace(/\.$/, ''))
+    .filter(Boolean);
+}
+function addresses(rule: ProxyRule, target: Instance) {
+  const targetServer = state.value.servers.find((item) => item.id === target.serverId);
+  if (!targetServer) return [];
+  if (rule.type === 'http' || rule.type === 'https')
+    return rule.domains.map((domain) =>
+      accessAddress({ ...rule, domains: [domain] }, targetServer),
+    );
+  return [accessAddress(rule, targetServer)];
+}
+function address(rule: ProxyRule, target: Instance) {
+  return addresses(rule, target)[0] ?? '';
+}
+function setRuleCertificate(rule: ProxyRule, event: Event) {
+  rule.certificateId = (event.target as HTMLSelectElement).value || undefined;
+  rule.certPath = '';
+  rule.keyPath = '';
+}
+function certificateCoversRule(certificateId: string, rule: ProxyRule) {
+  const certificate = state.value.certificates.find((item) => item.id === certificateId);
+  return !!certificate && rule.domains.every((domain) => certificate.domains.includes(domain));
+}
+function startCertificateIssue() {
+  Object.assign(certificateDraft, {
+    name: '',
+    domainsText: 'frc.jinxianruanjian.cn',
+    certificatePath: '',
+    privateKeyPath: '',
+    provider: 'letsencrypt',
+    email: '228762287@qq.com',
+    challenge: 'dns-01',
+    termsAgreed: true,
+    eabKid: '',
+    eabHmac: '',
+  });
+  modal.value = 'certificate-issue';
+}
+function startCertificateImport() {
+  Object.assign(certificateDraft, {
+    name: '',
+    domainsText: '',
+    certificatePath: '',
+    privateKeyPath: '',
+  });
+  modal.value = 'certificate-import';
+}
+async function submitCertificateIssue() {
+  if (busy.value) return;
+  const taskId = uid();
+  activeCertificateTask.value = taskId;
+  certificateProgressHistory.value = [];
+  certificateProgress.value = {
+    taskId,
+    status: 'running',
+    step: '准备签发',
+    message: '正在提交签发任务。',
+    updatedAt: Date.now(),
+  };
+  modal.value = 'certificate-progress';
+  busy.value = true;
+  error.value = '';
+  message.value = '';
+  try {
+    await rpc('certificate:issue', {
+      taskId,
+      name: certificateDraft.name,
+      domains: certificateDraft.domainsText
+        .split(/[\n,，;；]+/)
+        .map((domain) => domain.trim())
+        .filter(Boolean),
+      provider: certificateDraft.provider,
+      email: certificateDraft.email,
+      challenge: certificateDraft.challenge,
+      termsAgreed: certificateDraft.termsAgreed,
+      eabKid: certificateDraft.eabKid || undefined,
+      eabHmac: certificateDraft.eabHmac || undefined,
+    });
+    message.value = '证书已签发并保存。';
+    await refresh();
+  } catch (e) {
+    error.value = (e as Error).message;
+    if (
+      certificateProgress.value &&
+      !['succeeded', 'failed', 'cancelled'].includes(certificateProgress.value.status)
+    )
+      updateCertificateProgress({
+        ...certificateProgress.value,
+        status: 'failed',
+        message: error.value,
+        updatedAt: Date.now(),
+      });
+  } finally {
+    busy.value = false;
+  }
+}
+function updateCertificateProgress(progress: CertificateIssueProgress) {
+  if (progress.taskId !== activeCertificateTask.value) return;
+  certificateProgress.value = progress;
+  const previous = certificateProgressHistory.value.at(-1);
+  if (!previous || previous.step !== progress.step || previous.message !== progress.message)
+    certificateProgressHistory.value.push(progress);
+}
+async function cancelCertificateIssue() {
+  const progress = certificateProgress.value;
+  if (!progress || !activeCertificateTask.value) return;
+  updateCertificateProgress({
+    ...progress,
+    status: 'cancelling',
+    step: '正在取消',
+    message: '正在中止 CA 请求并清理临时验证配置。',
+    updatedAt: Date.now(),
+  });
+  try {
+    await rpc('certificate:cancel', activeCertificateTask.value);
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
+async function continueDnsChallenge() {
+  if (!activeCertificateTask.value) return;
+  try {
+    await rpc('certificate:challenge-response', {
+      id: activeCertificateTask.value,
+      continueIssue: true,
+    });
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
+async function copyDnsRecord(value: string) {
+  try {
+    await rpc('clipboard', value);
+    message.value = 'TXT 值已复制。';
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
+async function submitCertificateImport() {
+  const result = await act(
+    'certificate:import',
+    {
+      name: certificateDraft.name,
+      domains: certificateDraft.domainsText
+        .split(/[\n,，;；]+/)
+        .map((domain) => domain.trim())
+        .filter(Boolean),
+      certificatePath: certificateDraft.certificatePath,
+      privateKeyPath: certificateDraft.privateKeyPath,
+    },
+    '证书已导入。',
+  );
+  if (result) modal.value = '';
+}
+function startCertificateAssociation(certificateId: string) {
+  certificateToAssociate.value = certificateId;
+  const certificate = state.value.certificates.find((item) => item.id === certificateId);
+  certificateTargets.value = certificateRules.value
+    .filter(
+      ({ rule }) =>
+        certificate && rule.domains.every((domain) => certificate.domains.includes(domain)),
+    )
+    .map(({ instance: item, rule }) => `${item.id}::${rule.id}`);
+  modal.value = 'certificate-associate';
+}
+function certificateUsage(certificateId: string) {
+  return state.value.instances.reduce(
+    (count, item) =>
+      count + item.proxies.filter((rule) => rule.certificateId === certificateId).length,
+    0,
+  );
+}
+function certificateName(provider: string) {
+  return provider === 'letsencrypt'
+    ? 'Let’s Encrypt'
+    : provider === 'litessl'
+      ? 'LiteSSL'
+      : '手动证书';
+}
+async function submitCertificateAssociation() {
+  const result = await act('certificate:associate', {
+    certificateId: certificateToAssociate.value,
+    targets: certificateTargets.value.map((value) => {
+      const [instanceId, ruleId] = value.split('::');
+      return { instanceId, ruleId };
+    }),
+  });
+  if (result) modal.value = '';
 }
 async function saveInstance() {
   const i = instanceDraft.value!;
@@ -368,6 +576,45 @@ async function detectServer() {
     versionChoice.value = linuxVersions.value[0]?.key ?? '';
   }
 }
+async function connectServer() {
+  const result = await act('server:connect', server.value?.id, 'SSH 已连接并完成主机信息采集。');
+  if (result && typeof result === 'object' && 'supported' in result) {
+    hostInfo.value = result as HostInfo;
+    versionChoice.value = linuxVersions.value[0]?.key ?? '';
+  }
+}
+function selectServer(id: string) {
+  selectedServer.value = id;
+  hostInfo.value = undefined;
+  versionChoice.value = '';
+  if (runtime.value.ssh[id] === 'connected') void detectServer();
+}
+async function disconnectServer() {
+  if (server.value) {
+    await act('server:disconnect', server.value.id, 'SSH 已断开，远程服务继续运行。');
+    if (!error.value) hostInfo.value = undefined;
+  }
+}
+function capacity(kilobytes: number | null) {
+  return kilobytes === null ? '不可用' : `${(kilobytes / 1024 / 1024).toFixed(1)} GiB`;
+}
+function managerLabel(info: HostInfo) {
+  const privileged = info.root || info.sudo;
+  if (info.serviceManager === 'systemd' && privileged) return 'systemd 系统服务';
+  if (info.serviceManager === 'systemd' && info.userSystemd) return 'systemd 用户服务';
+  if (info.serviceManager === 'openrc' && privileged) return 'OpenRC 服务';
+  if (info.serviceManager === 'sysv' && privileged) return 'SysV 服务';
+  return '后台进程（当前权限或系统条件不支持系统服务）';
+}
+function deploymentLabel(deployment: Deployment) {
+  const manager = deployment.manager ?? (deployment.mode === 'process' ? 'process' : 'systemd');
+  if (manager === 'process') return '后台进程';
+  const names: Record<string, string> = { systemd: 'systemd', openrc: 'OpenRC', sysv: 'SysV' };
+  return `${names[manager] ?? manager}${deployment.mode === 'user' ? ' 用户服务' : ' 系统服务'}`;
+}
+function hostManagerName(manager: HostInfo['serviceManager']) {
+  return { systemd: 'systemd', openrc: 'OpenRC', sysv: 'SysV init', unknown: '未识别' }[manager];
+}
 async function loadLogs(kind: 'server' | 'instance') {
   logKind.value = kind;
   logTarget.value = kind === 'server' ? selectedServer.value : selectedInstance.value;
@@ -389,31 +636,6 @@ async function readRemoteConfig() {
     serverDraft.value!.configMode = 'raw';
     serverDraft.value!.rawConfig = data;
     message.value = '已读取远程配置。请断开 SSH 后保存本机编辑，再连接并应用。';
-  }
-}
-async function addReverseProxy() {
-  if (!server.value) return;
-  const payload = {
-    serverId: server.value.id,
-    siteId: uid(),
-    domain: reverseProxyDraft.domain.trim().replace(/\.$/, '').toLowerCase(),
-    provider: reverseProxyDraft.provider,
-    email: reverseProxyDraft.email || undefined,
-    httpPort: reverseProxyDraft.httpPort,
-    httpsPort: reverseProxyDraft.httpsPort,
-    certLocalPath: reverseProxyDraft.certLocalPath.trim() || undefined,
-    keyLocalPath: reverseProxyDraft.keyLocalPath.trim() || undefined,
-    eabKid: reverseProxyDraft.eabKid.trim() || undefined,
-    eabHmac: reverseProxyDraft.eabHmac.trim() || undefined,
-  };
-  const result = await act('server:reverse-proxy:add', payload);
-  if (result) {
-    reverseProxyDraft.domain = '';
-    reverseProxyDraft.email = '';
-    reverseProxyDraft.certLocalPath = '';
-    reverseProxyDraft.keyLocalPath = '';
-    reverseProxyDraft.eabKid = '';
-    reverseProxyDraft.eabHmac = '';
   }
 }
 async function generateToken() {
@@ -451,10 +673,6 @@ function formatTime(value: string) {
 function instanceServer(i: Instance) {
   return state.value.servers.find((s) => s.id === i.serverId);
 }
-function address(rule: ProxyRule, i: Instance) {
-  const s = instanceServer(i);
-  return s ? accessAddress(rule, s) : '';
-}
 function clientStatus(id: string) {
   return runtime.value.clients[id]?.status ?? 'stopped';
 }
@@ -474,6 +692,7 @@ function statusLabel(value: string) {
   );
 }
 onMounted(async () => {
+  unsubscribeCertificateProgress = api?.onCertificateProgress(updateCertificateProgress);
   try {
     await refresh();
     proxyUrl.value = state.value.settings.proxyUrl;
@@ -493,6 +712,7 @@ onMounted(async () => {
 onUnmounted(() => {
   clearInterval(timer);
   unsubscribe?.();
+  unsubscribeCertificateProgress?.();
 });
 </script>
 
@@ -595,11 +815,7 @@ onUnmounted(() => {
               :key="s.id"
               class="item"
               :class="{ selected: selectedServer === s.id }"
-              @click="
-                selectedServer = s.id;
-                hostInfo = undefined;
-                versionChoice = '';
-              "
+              @click="selectServer(s.id)"
             >
               <strong>{{ s.name }}</strong
               ><small>{{ s.publicHost }}:{{ s.frpPort }}</small
@@ -624,36 +840,43 @@ onUnmounted(() => {
               <button
                 class="primary"
                 :disabled="busy || runtime.ssh[server.id] === 'connected'"
-                @click="act('server:connect', server.id, 'SSH 已连接。')"
+                @click="connectServer"
               >
                 连接 SSH</button
               ><button
                 :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                @click="act('server:disconnect', server.id, 'SSH 已断开，远程服务继续运行。')"
+                @click="disconnectServer"
               >
                 断开</button
               ><button
                 :disabled="busy || runtime.ssh[server.id] !== 'connected'"
                 @click="detectServer"
               >
-                检测环境</button
-              ><button
-                class="danger-link"
-                :disabled="busy"
-                @click="act('server:delete', server.id)"
-              >
-                移除配置
+                刷新主机信息
               </button>
             </div>
             <div v-if="hostInfo" class="info-box">
-              <strong>Linux / {{ hostInfo.arch }}</strong>
+              <strong
+                >{{ hostInfo.distribution }} {{ hostInfo.version }} ·
+                {{ hostInfo.arch || '架构不可用' }}</strong
+              >
               <p>
-                安装用户：{{ hostInfo.root ? 'root' : '普通用户' }} · systemd：{{
-                  hostInfo.systemd ? '可用' : '不可用'
+                内核：{{ hostInfo.kernel || '不可用' }} · CPU：{{
+                  hostInfo.cpuModel || '不可用'
+                }}（{{ hostInfo.cpuCores ?? '不可用' }} 核）<br />
+                内存：{{ capacity(hostInfo.memoryTotalKB) }} 总量 / 可用
+                {{ capacity(hostInfo.memoryAvailableKB) }} · 家目录磁盘：{{
+                  capacity(hostInfo.diskTotalKB)
                 }}
-                · 用户服务：{{ hostInfo.userSystemd ? '可用' : '不可用' }} · sudo：{{
-                  hostInfo.sudo ? '免交互可用' : '不可用'
+                总量 / 可用 {{ capacity(hostInfo.diskAvailableKB) }}<br />
+                服务管理器：{{ hostManagerName(hostInfo.serviceManager) }} · 自动运行方式：{{
+                  managerLabel(hostInfo)
                 }}
+                ·
+                {{ hostInfo.root ? 'root' : hostInfo.sudo ? '可免交互 sudo' : '普通用户' }}
+              </p>
+              <p v-if="!hostInfo.supported || hostInfo.warning" class="muted">
+                {{ !hostInfo.supported ? '当前只支持 Linux 服务器。' : hostInfo.warning }}
               </p>
               <details>
                 <summary>查看端口占用</summary>
@@ -670,24 +893,22 @@ onUnmounted(() => {
                   <option v-for="v in linuxVersions" :key="v.key" :value="v.key">
                     {{ versionLabel(v) }}
                   </option></select
-                ><select v-model="deployMode">
-                  <option value="auto">自动选择运行方式</option>
-                  <option value="system">系统 systemd</option>
-                  <option value="user">用户 systemd</option>
-                  <option value="process">普通后台进程</option></select
                 ><button
                   class="primary"
-                  :disabled="busy || !versionChoice || runtime.ssh[server.id] !== 'connected'"
-                  @click="
-                    act('server:deploy', { id: server.id, key: versionChoice, mode: deployMode })
+                  :disabled="
+                    busy ||
+                    !versionChoice ||
+                    !hostInfo?.supported ||
+                    runtime.ssh[server.id] !== 'connected'
                   "
+                  @click="act('server:deploy', { id: server.id, key: versionChoice })"
                 >
                   安装服务端
                 </button>
               </div>
               <button
                 class="secondary"
-                :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                :disabled="busy || runtime.ssh[server.id] !== 'connected' || !hostInfo?.supported"
                 @click="modal = 'adopt'"
               >
                 接管已有部署
@@ -698,17 +919,16 @@ onUnmounted(() => {
                 <span class="badge connected">FRP {{ server.deployment.version }}</span
                 ><span
                   class="badge"
+                  :title="runtime.serviceErrors?.[server.id] || ''"
                   :class="
                     ['active', 'running'].includes(runtime.services?.[server.id]) ? 'connected' : ''
                   "
                   >服务 {{ serviceLabel(server.id) }}</span
+                ><small v-if="runtime.serviceErrors?.[server.id]" class="muted">
+                  {{ runtime.serviceErrors[server.id] }} </small
                 ><span
-                  >{{
-                    server.deployment.mode === 'process'
-                      ? '后台进程'
-                      : `${server.deployment.mode} systemd`
-                  }}
-                  · {{ server.deployment.managed ? '工具安装' : '接管部署' }}</span
+                  >{{ deploymentLabel(server.deployment) }} ·
+                  {{ server.deployment.managed ? '工具安装' : '接管部署' }}</span
                 >
               </div>
               <div class="path-info">
@@ -751,13 +971,19 @@ onUnmounted(() => {
                 >
                   查看 / 恢复备份</button
                 ><button
-                  v-if="server.deployment.mode !== 'process'"
+                  v-if="
+                    (server.deployment.manager ??
+                      (server.deployment.mode === 'process' ? 'process' : 'systemd')) !== 'process'
+                  "
                   :disabled="busy || runtime.ssh[server.id] !== 'connected'"
                   @click="act('server:control', { id: server.id, action: 'enable' })"
                 >
                   开启开机启动</button
                 ><button
-                  v-if="server.deployment.mode !== 'process'"
+                  v-if="
+                    (server.deployment.manager ??
+                      (server.deployment.mode === 'process' ? 'process' : 'systemd')) !== 'process'
+                  "
                   :disabled="busy || runtime.ssh[server.id] !== 'connected'"
                   @click="act('server:control', { id: server.id, action: 'disable' })"
                 >
@@ -777,160 +1003,18 @@ onUnmounted(() => {
                   停止后切换版本
                 </button>
               </div>
-              <div class="actions">
-                <button
-                  class="danger-link"
-                  :disabled="busy"
-                  @click="act('server:detach', server.id)"
-                >
-                  解除管理</button
-                ><button
-                  class="danger-link"
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="act('server:uninstall', { id: server.id, deleteAdopted: false })"
-                >
-                  {{ server.deployment.managed ? '卸载服务' : '解除管理并保留文件' }}</button
-                ><button
-                  v-if="!server.deployment.managed"
-                  class="danger-link"
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="act('server:uninstall', { id: server.id, deleteAdopted: true })"
-                >
-                  停止并删除接管文件
-                </button>
-              </div></template
-            >
-            <template v-if="server.deployment">
-              <hr />
-              <h3>Nginx 域名反向代理与 SSL</h3>
-              <p class="muted">
-                由 Nginx 接收公网 80/443，再分别代理到 FRP 的 HTTP/HTTPS 入口。HTTPS 在 Nginx
-                终止后通过 HTTPS 转发到 FRP 8443；请确保客户端 HTTPS 规则域名与此处一致。
-              </p>
-              <div v-if="server.reverseProxies.length" class="item-list compact-list">
-                <div v-for="site in server.reverseProxies" :key="site.id" class="item">
-                  <strong>{{ site.domain }}</strong>
-                  <small>
-                    HTTP :80 → 127.0.0.1:{{ site.httpPort }} · HTTPS :443 → 127.0.0.1:{{
-                      site.httpsPort
-                    }}
-                  </small>
-                  <small>
-                    {{
-                      site.provider === 'manual'
-                        ? '手动证书'
-                        : site.provider === 'litessl'
-                          ? 'LiteSSL 自动续期'
-                          : 'Let’s Encrypt 自动续期'
-                    }}
-                  </small>
-                  <button
-                    class="danger-link"
-                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                    @click="act('server:reverse-proxy:remove', { id: server.id, siteId: site.id })"
-                  >
-                    移除 Nginx 站点
-                  </button>
-                </div>
-              </div>
-              <form class="form-grid" @submit.prevent="addReverseProxy">
-                <label
-                  >域名<input
-                    v-model="reverseProxyDraft.domain"
-                    required
-                    placeholder="demo.example.com"
-                /></label>
-                <label
-                  >证书来源<select v-model="reverseProxyDraft.provider">
-                    <option value="manual">手动证书</option>
-                    <option value="letsencrypt">Let’s Encrypt 自动申请</option>
-                    <option value="litessl">LiteSSL 自动申请</option>
-                  </select></label
-                >
-                <label
-                  >FRP HTTP 入口端口<input
-                    v-model.number="reverseProxyDraft.httpPort"
-                    type="number"
-                    min="1"
-                    max="65535"
-                    required
-                /></label>
-                <label
-                  >FRP HTTPS 入口端口<input
-                    v-model.number="reverseProxyDraft.httpsPort"
-                    type="number"
-                    min="1"
-                    max="65535"
-                    required
-                /></label>
-                <template v-if="reverseProxyDraft.provider === 'manual'">
-                  <label class="full"
-                    >本机证书链文件
-                    <div class="inline-fields">
-                      <input
-                        v-model="reverseProxyDraft.certLocalPath"
-                        required
-                        placeholder="选择 PEM 格式证书链"
-                      />
-                      <button
-                        type="button"
-                        @click="choose('certificate', (p) => (reverseProxyDraft.certLocalPath = p))"
-                      >
-                        选择文件
-                      </button>
-                    </div></label
-                  >
-                  <label class="full"
-                    >本机未加密私钥文件
-                    <div class="inline-fields">
-                      <input
-                        v-model="reverseProxyDraft.keyLocalPath"
-                        required
-                        placeholder="选择 PEM 格式私钥"
-                      />
-                      <button
-                        type="button"
-                        @click="choose('key', (p) => (reverseProxyDraft.keyLocalPath = p))"
-                      >
-                        选择文件
-                      </button>
-                    </div></label
-                  >
-                </template>
-                <template v-else>
-                  <label
-                    >证书通知邮箱<input v-model="reverseProxyDraft.email" type="email" required
-                  /></label>
-                  <template v-if="reverseProxyDraft.provider === 'litessl'">
-                    <label
-                      >LiteSSL EAB KID<input
-                        v-model="reverseProxyDraft.eabKid"
-                        required
-                        autocomplete="off"
-                    /></label>
-                    <label class="full"
-                      >LiteSSL EAB HMAC 密钥<input
-                        v-model="reverseProxyDraft.eabHmac"
-                        type="password"
-                        required
-                        autocomplete="new-password"
-                    /></label>
-                  </template>
-                </template>
-                <div class="full hint">
-                  自动签发要求域名已解析到此服务器、外网可访问 80 端口，并且服务器有 curl 或
-                  wget。LiteSSL 还需在其 ACME 账户中创建 EAB 凭据。删除站点会保留证书和续期任务。
-                </div>
-                <div class="full actions">
-                  <button
-                    class="primary"
-                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  >
-                    添加并配置 Nginx
-                  </button>
-                </div>
-              </form>
             </template>
+            <div class="actions">
+              <button
+                class="danger-link"
+                :disabled="busy"
+                @click="
+                  act('server:uninstall', { id: server.id, removeRemote: !!server.deployment })
+                "
+              >
+                卸载
+              </button>
+            </div>
             <div class="hint">
               SSH 连接与 FRP 服务状态相互独立。请放行 FRP
               连接及代理入口端口；本工具不会自动修改防火墙。
@@ -1031,13 +1115,12 @@ onUnmounted(() => {
                   }}</span>
                 </div>
                 <p class="muted">本地 {{ rule.localIP }}:{{ rule.localPort }}</p>
-                <div class="address">
-                  <code>{{ address(rule, instance) }}</code
-                  ><button @click="act('clipboard', address(rule, instance), '访问地址已复制。')">
-                    复制</button
+                <div v-for="url in addresses(rule, instance)" :key="url" class="address">
+                  <code>{{ url }}</code
+                  ><button @click="act('clipboard', url, '访问地址已复制。')">复制</button
                   ><button
                     v-if="rule.type === 'http' || rule.type === 'https'"
-                    @click="act('link:open', address(rule, instance))"
+                    @click="act('link:open', url)"
                   >
                     打开
                   </button>
@@ -1057,6 +1140,86 @@ onUnmounted(() => {
             </div>
           </section>
         </div>
+      </template>
+
+      <template v-if="page === 'certificates'">
+        <div class="section-title">
+          <h2>
+            本机证书库 <span>{{ state.certificates.length }}</span>
+          </h2>
+          <div class="inline-fields">
+            <button class="secondary" :disabled="busy" @click="startCertificateImport">
+              导入手动证书
+            </button>
+            <button class="primary" :disabled="busy" @click="startCertificateIssue">
+              申请 ACME 证书
+            </button>
+          </div>
+        </div>
+        <section class="panel">
+          <div v-if="!state.certificates.length" class="empty compact">
+            <h3>还没有 SSL 证书</h3>
+            <p>导入 PEM 证书与私钥，或为多个域名签发一张 SAN 证书。</p>
+          </div>
+          <div
+            v-for="certificate in state.certificates"
+            :key="certificate.id"
+            class="installed-row"
+          >
+            <div>
+              <strong>{{ certificate.name }}</strong>
+              <small
+                >{{ certificateName(certificate.provider) }} ·
+                {{ certificate.domains.join('、') }}</small
+              >
+              <small
+                >到期时间：{{
+                  certificate.expiresAt ? formatTime(certificate.expiresAt) : '未知'
+                }}
+                · 已关联 {{ certificateUsage(certificate.id) }} 条规则</small
+              >
+              <small v-if="certificate.pendingRestart" class="warning-text"
+                >证书已更新或关联，相关客户端实例需重启后加载。</small
+              >
+            </div>
+            <label v-if="certificate.provider !== 'manual'" class="inline-check">
+              <input
+                type="checkbox"
+                :checked="certificate.autoRenew"
+                :disabled="busy || !state.secureStorage"
+                @change="
+                  act('certificate:auto-renew', {
+                    id: certificate.id,
+                    enabled: ($event.target as HTMLInputElement).checked,
+                  })
+                "
+              />
+              到期前续期
+            </label>
+            <button
+              class="secondary"
+              :disabled="busy"
+              @click="startCertificateAssociation(certificate.id)"
+            >
+              关联 HTTPS 规则
+            </button>
+            <button
+              class="danger-link"
+              :disabled="busy || certificateUsage(certificate.id) > 0"
+              @click="act('certificate:delete', certificate.id)"
+            >
+              删除
+            </button>
+          </div>
+          <p class="hint">
+            私钥保存在本机应用数据目录。ACME
+            证书可开启续期检查，且只在应用运行或托盘驻留时检查。DNS-01 续期时需按提示更新 TXT
+            记录；更新后需重启关联实例加载新证书。
+          </p>
+          <p v-if="!state.secureStorage" class="notice warning">
+            系统安全存储不可用，ACME 账号密钥不能跨会话保存，因此自动续期暂不可用。
+          </p>
+        </section>
       </template>
 
       <template v-if="page === 'versions'">
@@ -1187,12 +1350,12 @@ onUnmounted(() => {
             </p>
           </details>
           <details>
-            <summary>普通用户部署与 sudo</summary>
+            <summary>服务器信息与自动部署</summary>
             <p>
-              默认程序放在登录用户的 ~/.local/share/intranet-frp。具备免交互 sudo 或 root
-              权限时管理系统服务；否则使用用户 systemd 或后台进程。sudo
-              不可用时不会索取或保存提权密码。后台进程不提供开机启动，用户服务注销后的运行取决于
-              linger。
+              SSH 连接后自动读取系统版本、内核、CPU、内存和家目录磁盘信息。应用按实际运行的
+              systemd、OpenRC 或 SysV
+              以及当前权限选择服务管理方式；条件不满足时使用后台进程。应用不会索取或保存交互 sudo
+              密码。
             </p>
           </details>
           <details>
@@ -1217,11 +1380,10 @@ onUnmounted(() => {
             </p>
           </details>
           <details>
-            <summary>临时配置与备份</summary>
+            <summary>卸载服务器</summary>
             <p>
-              本机运行中的 FRP
-              需要读取配置文件，文件使用当前用户权限，停止或退出时清理。服务端配置同样限制权限。服务端配置及版本替换会保留带时间戳的备份；在停止服务后，可通过
-              SSH 将备份复制回原路径再启动。删除配置与卸载远程服务是不同操作。
+              有部署记录时确认框默认选择同时停止并卸载远端服务及其指定程序、配置、日志和 PID
+              文件，历史备份保留；也可只移除本机配置，让远端服务继续运行。有关联客户端实例时需先解除关联。
             </p>
           </details>
         </section>
@@ -1229,12 +1391,95 @@ onUnmounted(() => {
     </main>
 
     <div v-if="modal" class="overlay" @click.self="!busy && (modal = '')">
-      <section class="modal" :class="{ wide: modal === 'instance' || modal === 'logs' }">
+      <section
+        class="modal"
+        :class="{
+          wide:
+            modal === 'instance' ||
+            modal === 'logs' ||
+            modal === 'certificate-associate' ||
+            modal === 'certificate-progress',
+        }"
+      >
         <div class="modal-heading">
           <h2>{{ modalTitles[modal] }}</h2>
           <button :disabled="busy" @click="modal = ''">×</button>
         </div>
         <div v-if="error" class="notice error">{{ error }}</div>
+        <section
+          v-if="modal === 'certificate-progress' && certificateProgress"
+          class="issue-progress"
+        >
+          <div class="issue-current" :class="`issue-${certificateProgress.status}`">
+            <div
+              class="issue-spinner"
+              v-if="['running', 'retrying', 'cancelling'].includes(certificateProgress.status)"
+            ></div>
+            <div>
+              <strong>{{ certificateProgress.step }}</strong>
+              <p>{{ certificateProgress.message }}</p>
+            </div>
+          </div>
+          <div v-if="certificateProgress.dnsRecords?.length" class="dns-record-list">
+            <p>请在 DNS 服务商处添加以下 TXT 记录：</p>
+            <div
+              v-for="record in certificateProgress.dnsRecords"
+              :key="`${record.record}:${record.value}`"
+              class="dns-record"
+            >
+              <small>域名：{{ record.domain }}</small>
+              <code>{{ record.record }}</code>
+              <div class="inline-fields">
+                <code>{{ record.value }}</code>
+                <button type="button" @click="copyDnsRecord(record.value)">复制 TXT 值</button>
+              </div>
+            </div>
+            <button
+              class="primary"
+              :disabled="certificateProgress.status !== 'waiting-user'"
+              @click="continueDnsChallenge"
+            >
+              已添加，继续验证
+            </button>
+          </div>
+          <div class="issue-timeline">
+            <h3>处理过程</h3>
+            <ol>
+              <li
+                v-for="(item, index) in certificateProgressHistory"
+                :key="`${item.updatedAt}-${index}`"
+              >
+                <strong>{{ item.step }}</strong>
+                <small>{{ item.message }}</small>
+              </li>
+            </ol>
+          </div>
+          <p class="hint" v-if="certificateProgress.status === 'cancelling'">
+            正在取消。若 CA 请求已经发出，可能要等当前网络操作返回；HTTP-01
+            临时实例会在退出流程中清理并恢复。
+          </p>
+          <div class="modal-actions">
+            <button
+              v-if="['running', 'retrying', 'waiting-user'].includes(certificateProgress.status)"
+              type="button"
+              class="danger-link"
+              @click="cancelCertificateIssue"
+            >
+              取消签发
+            </button>
+            <button
+              v-else
+              type="button"
+              class="primary"
+              @click="
+                modal = '';
+                activeCertificateTask = '';
+              "
+            >
+              关闭
+            </button>
+          </div>
+        </section>
         <form v-if="modal === 'server' && serverDraft" @submit.prevent="saveServer">
           <div class="form-grid">
             <label
@@ -1393,10 +1638,13 @@ onUnmounted(() => {
                     max="65535"
                     required /></label
                 ><label v-else
-                  >公网域名<input
-                    v-model="rule.domain"
+                  >公网域名（每行一个，也可用逗号分隔）<textarea
+                    :value="ruleDomainsText(rule)"
                     required
-                    placeholder="demo.example.com" /></label
+                    rows="2"
+                    placeholder="demo.example.com&#10;www.demo.example.com"
+                    @input="setRuleDomains(rule, $event)"
+                  /></label
                 ><template v-if="rule.type === 'https'"
                   ><label
                     >HTTPS 方式<select v-model="rule.tlsMode">
@@ -1405,26 +1653,25 @@ onUnmounted(() => {
                     </select></label
                   ><template v-if="rule.tlsMode === 'terminate'"
                     ><label class="full"
-                      >证书路径
-                      <div class="inline-fields">
-                        <input v-model="rule.certPath" required /><button
-                          type="button"
-                          @click="choose('certificate', (p) => (rule.certPath = p))"
+                      >SSL 证书<select
+                        :value="rule.certificateId ?? ''"
+                        @change="setRuleCertificate(rule, $event)"
+                      >
+                        <option value="">请选择证书库中的证书</option>
+                        <option
+                          v-for="certificate in state.certificates.filter((item) =>
+                            rule.domains.every((domain) => item.domains.includes(domain)),
+                          )"
+                          :key="certificate.id"
+                          :value="certificate.id"
                         >
-                          选择文件
-                        </button>
-                      </div></label
-                    ><label class="full"
-                      >证书私钥路径
-                      <div class="inline-fields">
-                        <input v-model="rule.keyPath" required /><button
-                          type="button"
-                          @click="choose('key', (p) => (rule.keyPath = p))"
-                        >
-                          选择文件
-                        </button>
-                      </div></label
-                    ></template
+                          {{ certificate.name }} · {{ certificate.provider }}
+                        </option>
+                      </select></label
+                    >
+                    <p class="hint full">
+                      证书终止后由 frpc 读取本机证书；请在“SSL 证书”页导入或签发，并关联到此规则。
+                    </p></template
                   ></template
                 >
               </div>
@@ -1436,10 +1683,10 @@ onUnmounted(() => {
                 移除规则
               </button>
             </div>
-            <button type="button" @click="enterRaw">生成完整配置并进入高级模式</button
-            ><button type="button" @click="instanceDraft.mode = 'raw'">
-              直接编写高级配置
-            </button></template
+            <div class="actions-row">
+              <button type="button" @click="enterRaw">生成完整配置并进入高级模式</button>
+              <button type="button" @click="instanceDraft.mode = 'raw'">直接编写高级配置</button>
+            </div></template
           ><template v-else
             ><div class="notice warning">
               高级配置为唯一来源，表单数据不会覆盖它。服务器和版本选择用于管理；实际连接地址由原始配置决定。
@@ -1509,6 +1756,131 @@ onUnmounted(() => {
             ><button class="primary" :disabled="busy">安装所选版本</button>
           </div>
         </form>
+        <form v-if="modal === 'certificate-import'" @submit.prevent="submitCertificateImport">
+          <div class="form-grid">
+            <label
+              >证书名称<input v-model="certificateDraft.name" placeholder="例如：主站证书"
+            /></label>
+            <label class="full"
+              >域名（每行一个，也可用逗号分隔）<textarea
+                v-model="certificateDraft.domainsText"
+                rows="3"
+                required
+                placeholder="demo.example.com&#10;www.demo.example.com"
+              />
+            </label>
+            <label class="full"
+              >证书 PEM 文件
+              <div class="inline-fields">
+                <input v-model="certificateDraft.certificatePath" required /><button
+                  type="button"
+                  @click="choose('certificate', (p) => (certificateDraft.certificatePath = p))"
+                >
+                  选择证书
+                </button>
+              </div>
+            </label>
+            <label class="full"
+              >私钥 PEM 文件
+              <div class="inline-fields">
+                <input v-model="certificateDraft.privateKeyPath" required /><button
+                  type="button"
+                  @click="choose('key', (p) => (certificateDraft.privateKeyPath = p))"
+                >
+                  选择私钥
+                </button>
+              </div>
+            </label>
+          </div>
+          <p class="hint">
+            导入时会验证 PEM、证书有效期、私钥匹配关系及每个域名的 SAN
+            覆盖，再复制到本机受限权限的证书库。
+          </p>
+          <div class="modal-actions">
+            <button type="button" :disabled="busy" @click="modal = ''">取消</button
+            ><button class="primary" :disabled="busy">验证并导入</button>
+          </div>
+        </form>
+        <form v-if="modal === 'certificate-issue'" @submit.prevent="submitCertificateIssue">
+          <div class="form-grid">
+            <label
+              >证书名称<input v-model="certificateDraft.name" placeholder="例如：主站 SAN 证书"
+            /></label>
+            <label
+              >签发机构<select v-model="certificateDraft.provider">
+                <option value="letsencrypt">Let’s Encrypt</option>
+                <option value="litessl">LiteSSL</option>
+              </select></label
+            >
+            <label class="full"
+              >域名（批量签发为一张 SAN 证书，每行一个）<textarea
+                v-model="certificateDraft.domainsText"
+                rows="3"
+                required
+                placeholder="demo.example.com&#10;www.demo.example.com"
+              />
+            </label>
+            <label class="full"
+              >联系邮箱<input v-model="certificateDraft.email" type="email" required
+            /></label>
+            <label
+              >验证方式<select v-model="certificateDraft.challenge">
+                <option value="dns-01">手动 DNS-01（添加 TXT）</option>
+                <option value="http-01">HTTP-01（通过 FRP 公网 80 验证）</option>
+              </select></label
+            >
+            <template v-if="certificateDraft.provider === 'litessl'">
+              <label
+                >LiteSSL EAB KID<input v-model="certificateDraft.eabKid" autocomplete="off"
+              /></label>
+              <label class="full"
+                >LiteSSL EAB HMAC 密钥<input
+                  v-model="certificateDraft.eabHmac"
+                  type="password"
+                  autocomplete="new-password"
+              /></label>
+            </template>
+          </div>
+          <p class="hint">
+            DNS-01 会逐项显示需要添加的 TXT 记录，验证完成后可移除记录。HTTP-01 仅适用于域名已指向
+            FRP 服务器且其 HTTP 入口为公网 80 的表单实例；验证时需确认临时重启。
+          </p>
+          <label class="check-row">
+            <input v-model="certificateDraft.termsAgreed" type="checkbox" required />
+            <span>我已阅读并同意所选证书机构的服务条款</span>
+          </label>
+          <div class="modal-actions">
+            <button type="button" :disabled="busy" @click="modal = ''">取消</button
+            ><button class="primary" :disabled="busy">开始签发</button>
+          </div>
+        </form>
+        <form
+          v-if="modal === 'certificate-associate'"
+          @submit.prevent="submitCertificateAssociation"
+        >
+          <p class="hint">
+            只列出证书 SAN 覆盖全部域名的 HTTPS 证书终止规则。修改配置不会自动重启实例。
+          </p>
+          <div v-if="!certificateTargets.length" class="empty compact">
+            <p>没有可关联的规则。请先创建 HTTPS 规则并选择“证书终止后访问本地 HTTP”。</p>
+          </div>
+          <label
+            v-for="{ instance: item, rule } in certificateRules.filter(({ rule }) =>
+              certificateCoversRule(certificateToAssociate, rule),
+            )"
+            :key="`${item.id}::${rule.id}`"
+            class="check-row"
+          >
+            <input type="checkbox" :value="`${item.id}::${rule.id}`" v-model="certificateTargets" />
+            <span>{{ item.name }} · {{ rule.name }} · {{ rule.domains.join('、') }}</span>
+          </label>
+          <div class="modal-actions">
+            <button type="button" :disabled="busy" @click="modal = ''">取消</button
+            ><button class="primary" :disabled="busy || !certificateTargets.length">
+              关联所选规则
+            </button>
+          </div>
+        </form>
         <form
           v-if="modal === 'adopt'"
           @submit.prevent="
@@ -1529,12 +1901,10 @@ onUnmounted(() => {
                 required
                 placeholder="/opt/frp/frps.toml" /></label
             ><label
-              >管理方式<select v-model="adoption.mode">
-                <option value="process">后台进程</option>
-                <option value="system">系统 systemd</option>
-                <option value="user">用户 systemd</option>
-              </select></label
-            ><label>服务单元名<input v-model="adoption.service" required /></label
+              >服务名称<input
+                v-model="adoption.service"
+                required
+                placeholder="systemd 服务或 init 脚本名" /></label
             ><label class="full"
               >日志绝对路径<input
                 v-model="adoption.log"

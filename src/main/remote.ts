@@ -4,15 +4,10 @@ import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { Store } from './store';
 import { AppError, redact } from '../shared/errors';
-import {
-  reverseProxySchema,
-  type Server,
-  type Deployment,
-  type HostInfo,
-  type ReverseProxy,
-} from '../shared/types';
+import { type Server, type Deployment, type HostInfo } from '../shared/types';
 import { serverConfig, frpAdapter } from './frp';
-import { nginxProxyConfig } from './nginx';
+import { hostInfoCommand, parseHostInfo } from './host-info';
+import { deploymentManager, openrcScript, selectServiceMode, sysvScript } from './service-manager';
 
 // 所有远程命令参数都按 POSIX shell 单引号规则转义。
 export const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -26,9 +21,32 @@ export function remotePath(value: string): string {
     throw new AppError('远程路径必须为绝对路径，不得包含换行、百分号或上级目录。');
   return value;
 }
+
+// systemd 240 起支持 StandardOutput=append:；版本无法识别时保守使用 journal。
+export function supportsSystemdAppend(versionOutput: string): boolean {
+  const major = /^systemd\s+(\d+)/i.exec(versionOutput.trim())?.[1];
+  return major !== undefined && Number(major) >= 240;
+}
+
+// CentOS 7 的 systemctl 支持属性名输出，但部分状态会让 is-active 返回 unknown。
+export function parseSystemdState(output: string): string | undefined {
+  const fields = new Map<string, string>();
+  for (const line of output.split(/\r?\n/)) {
+    const separator = line.indexOf('=');
+    if (separator > 0) fields.set(line.slice(0, separator), line.slice(separator + 1).trim());
+  }
+  const active = fields.get('ActiveState');
+  if (
+    active &&
+    ['active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading'].includes(active)
+  )
+    return active;
+  return undefined;
+}
+
 export class Remote {
   private connections = new Map<string, Client>();
-  private serviceStates = new Map<string, { value: string; at: number }>();
+  private serviceStates = new Map<string, { value: string; at: number; message?: string }>();
   private rootUsers = new Set<string>();
   private connecting = new Set<string>();
   private busy = new Set<string>();
@@ -53,7 +71,7 @@ export class Remote {
     );
   }
   async connect(id: string) {
-    if (this.connected(id)) return;
+    if (this.connected(id)) return this.detect(id);
     if (this.connecting.has(id)) throw new AppError('SSH 正在连接。');
     this.connecting.add(id);
     this.changed();
@@ -96,6 +114,7 @@ export class Remote {
       server.fingerprint = fingerprint;
       await this.store.persist();
       this.connections.set(id, client);
+      this.serviceStates.delete(id);
       if ((await this.exec(id, 'id -u')) === '0') this.rootUsers.add(id);
       else this.rootUsers.delete(id);
       client.on('error', () => {
@@ -106,6 +125,7 @@ export class Remote {
         if (this.connections.get(id) === client) this.connections.delete(id);
         this.changed();
       });
+      return await this.detect(id);
     } catch (error) {
       this.connections.delete(id);
       client.end();
@@ -122,17 +142,30 @@ export class Remote {
         this.connected(server.id) &&
         Date.now() - (this.serviceStates.get(server.id)?.at ?? 0) > 5000
       ) {
-        await this.status(server.id).catch(() => {
-          this.serviceStates.set(server.id, { value: 'unknown', at: Date.now() });
+        await this.status(server.id).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.serviceStates.set(server.id, {
+            value: 'unknown',
+            at: Date.now(),
+            message: redact(message, this.store.allSecrets()).slice(0, 500),
+          });
         });
       }
     }
-    return Object.fromEntries(
-      this.store.data.servers.map((s) => [
-        s.id,
-        this.connected(s.id) ? (this.serviceStates.get(s.id)?.value ?? 'unknown') : 'unknown',
+    const services = Object.fromEntries(
+      this.store.data.servers.map((server) => [
+        server.id,
+        this.connected(server.id)
+          ? (this.serviceStates.get(server.id)?.value ?? 'unknown')
+          : 'unknown',
       ]),
     );
+    const serviceErrors = Object.fromEntries(
+      [...this.serviceStates.entries()]
+        .filter(([id, state]) => this.connected(id) && !!state.message)
+        .map(([id, state]) => [id, state.message]),
+    );
+    return { services, serviceErrors };
   }
   disconnect(id: string) {
     if (this.busy.has(id)) throw new AppError('服务器正在执行操作，请完成后断开。');
@@ -201,26 +234,10 @@ export class Remote {
     });
   }
   async detect(id: string): Promise<HostInfo> {
-    const out = await this.exec(
-      id,
-      `test "$(uname -s)" = Linux || { echo '仅支持 Linux 服务器'; exit 1; }; printf '%s\\n' "$HOME" "$(uname -m)" "$(id -u)"; if test -d /run/systemd/system; then echo yes; else echo no; fi; if systemctl --user show-environment >/dev/null 2>&1; then echo yes; else echo no; fi; if sudo -n true >/dev/null 2>&1; then echo yes; else echo no; fi; ss -lntu 2>/dev/null || true`,
-    );
-    const [home, machine, uid, systemd, userSystemd, sudo, ...ports] = out.split('\n');
-    const arch =
-      machine === 'x86_64'
-        ? 'amd64'
-        : machine === 'aarch64' || machine === 'arm64'
-          ? 'arm64'
-          : machine;
-    return {
-      home: remotePath(home),
-      arch,
-      root: uid === '0',
-      systemd: systemd === 'yes',
-      userSystemd: userSystemd === 'yes',
-      sudo: sudo === 'yes',
-      ports: ports.join('\n'),
-    };
+    const info = parseHostInfo(await this.exec(id, hostInfoCommand));
+    if (!info.supported) return { ...info, home: info.home.startsWith('/') ? info.home : '/' };
+    if (!info.home.startsWith('/')) throw new AppError('无法识别服务器用户家目录，部署已暂停。');
+    return { ...info, home: remotePath(info.home) };
   }
   private sftp(id: string) {
     return new Promise<SFTPWrapper>((resolve, reject) =>
@@ -259,7 +276,26 @@ export class Remote {
     return d;
   }
   private serviceCommand(id: string, d: Deployment, verb: string) {
-    return `${d.mode === 'system' ? `${this.rootUsers.has(id) ? '' : 'sudo -n '}systemctl` : 'systemctl --user'} ${verb} ${quote(d.service)}`;
+    const manager = deploymentManager(d);
+    const privilege = d.mode === 'system' && !this.rootUsers.has(id) ? 'sudo -n ' : '';
+    if (manager === 'openrc') {
+      if (verb === 'enable') return `${privilege}rc-update add ${quote(d.service)} default`;
+      if (verb === 'disable') return `${privilege}rc-update del ${quote(d.service)} default`;
+      return `${privilege}rc-service ${quote(d.service)} ${quote(verb)}`;
+    }
+    if (manager === 'sysv') {
+      if (verb === 'enable') return this.sysvAutostartCommand(d, true, privilege);
+      if (verb === 'disable') return this.sysvAutostartCommand(d, false, privilege);
+      const script = d.servicePath ?? `/etc/init.d/${d.service}`;
+      return `${privilege}${quote(script)} ${quote(verb)}`;
+    }
+    return `${d.mode === 'system' ? `${privilege}systemctl` : 'systemctl --user'} ${verb} ${quote(d.service)}`;
+  }
+  private sysvAutostartCommand(d: Deployment, enable: boolean, privilege: string) {
+    const command = enable
+      ? `if command -v update-rc.d >/dev/null 2>&1; then update-rc.d ${quote(d.service)} defaults; elif command -v chkconfig >/dev/null 2>&1; then chkconfig --add ${quote(d.service)} && chkconfig ${quote(d.service)} on; else for dir in /etc/rc*.d; do test -d "$dir" || continue; case "$dir" in /etc/rc0.d|/etc/rc6.d) ln -sf -- ${quote(`../init.d/${d.service}`)} "$dir/K01${d.service}";; *) ln -sf -- ${quote(`../init.d/${d.service}`)} "$dir/S99${d.service}";; esac; done; fi`
+      : `if command -v update-rc.d >/dev/null 2>&1; then update-rc.d -f ${quote(d.service)} remove; elif command -v chkconfig >/dev/null 2>&1; then chkconfig --del ${quote(d.service)}; else for dir in /etc/rc*.d; do test -d "$dir" || continue; rm -f -- "$dir"/S??${d.service} "$dir"/K??${d.service}; done; fi`;
+    return privilege ? `${privilege}sh -c ${quote(command)}` : command;
   }
   private checkedPid(d: Deployment) {
     // 只允许操作与记录的二进制及配置同时匹配的 Linux 进程。
@@ -267,13 +303,38 @@ export class Remote {
   }
   async status(id: string) {
     const d = this.deployment(id);
+    const manager = deploymentManager(d);
     let value: string;
-    if (d.mode !== 'process')
+    if (manager === 'systemd') {
+      const systemctl = d.mode === 'system' ? 'systemctl' : 'systemctl --user';
+      const output = await this.exec(
+        id,
+        `${systemctl} show ${quote(d.service)} -p ActiveState -p SubState -p Result 2>&1 || true`,
+      );
+      value = parseSystemdState(output) ?? '';
+      if (!value) {
+        const fallback = await this.exec(
+          id,
+          `${systemctl} is-active ${quote(d.service)} 2>&1 || true`,
+        );
+        const normalized = fallback.trim().split('\n').at(-1)?.trim() ?? '';
+        if (
+          ['active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading'].includes(
+            normalized,
+          )
+        )
+          value = normalized;
+        else
+          throw new AppError(
+            `systemd 状态查询失败：${[output, fallback].filter(Boolean).join('\n').trim().slice(-500) || '没有返回状态。'}`,
+          );
+      }
+    } else if (manager === 'openrc' || manager === 'sysv') {
       value = await this.exec(
         id,
-        `${d.mode === 'system' ? 'systemctl' : 'systemctl --user'} is-active ${quote(d.service)} || true`,
+        `output=$(${this.serviceCommand(id, d, 'status')} 2>&1); code=$?; case "$output" in *stopped*|*inactive*|*not\\ running*) echo inactive;; *) if test "$code" -eq 0; then echo active; elif test "$code" -eq 3; then echo inactive; else printf '%s\\n' "$output"; exit 1; fi;; esac`,
       );
-    else {
+    } else {
       try {
         await this.exec(id, this.checkedPid(d) + ' echo running');
         value = 'running';
@@ -296,39 +357,34 @@ export class Remote {
     if (!value.trim()) throw new AppError('服务端配置为空。');
     return value;
   }
-  async deploy(
-    id: string,
-    key: string,
-    requestedMode: 'auto' | 'system' | 'user' | 'process' = 'auto',
-  ) {
+  async deploy(id: string, key: string) {
     return this.locked(id, async () => {
       const server = this.store.server(id);
       if (server.deployment) throw new AppError('已有部署，请使用切换版本或先解除管理。');
       const info = await this.detect(id);
+      if (!info.supported)
+        throw new AppError(`暂不支持此服务器系统：${info.distribution}。目前仅支持 Linux。`);
       const version = this.store.version(key);
       if (version.platform !== 'linux' || version.arch !== info.arch)
         throw new AppError(`请选择 Linux/${info.arch} 安装包。`);
       if (server.configMode === 'form' && !frpAdapter.supportsForm(version.version))
         throw new AppError('此版本只能使用原始配置部署。');
-      if (requestedMode === 'system' && (!info.systemd || (!info.root && !info.sudo)))
-        throw new AppError('系统服务模式需要 systemd 和 root 或免交互 sudo 权限。');
-      if (requestedMode === 'user' && !info.userSystemd)
-        throw new AppError('此 SSH 会话无法访问用户 systemd，请选择后台进程模式。');
+      const selection = selectServiceMode(info);
       const folder = remotePath(`${info.home}/.local/share/intranet-frp/${id}`);
+      const service =
+        selection.manager === 'systemd' ? `intranet-frps-${id}.service` : `intranet-frps-${id}`;
       const d: Deployment = {
         binary: `${folder}/frps`,
         config: `${folder}/frps.${server.configMode === 'raw' ? server.rawFormat : 'toml'}`,
         log: `${folder}/frps.log`,
         pidFile: `${folder}/frps.pid`,
-        mode:
-          requestedMode === 'auto'
-            ? info.systemd && (info.root || info.sudo)
-              ? 'system'
-              : info.userSystemd
-                ? 'user'
-                : 'process'
-            : requestedMode,
-        service: `intranet-frps-${id}.service`,
+        manager: selection.manager,
+        mode: selection.mode,
+        service,
+        servicePath:
+          selection.manager === 'openrc' || selection.manager === 'sysv'
+            ? `/etc/init.d/${service}`
+            : undefined,
         managed: true,
         version: version.version,
         versionKey: key,
@@ -356,19 +412,31 @@ export class Remote {
         await this.write(id, d.config, content);
         if (frpAdapter.supportsForm(version.version))
           await this.exec(id, `${quote(d.binary)} verify -c ${quote(d.config)}`);
-        if (d.mode !== 'process') {
+        if (d.manager === 'systemd') {
           const unitPath = `${folder}/${d.service}`;
           const escapeUnit = (p: string) => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
           const serviceUser = d.mode === 'system' ? await this.exec(id, 'id -un') : '';
           const makeUnit = (fileLogs: boolean) =>
             `[Unit]\nDescription=Intranet FRP Server\nAfter=network.target\n\n[Service]\nType=simple\n${d.mode === 'system' ? `User=${serviceUser}\n` : ''}ExecStart="${escapeUnit(d.binary)}" -c "${escapeUnit(d.config)}"\n${fileLogs ? `StandardOutput=append:${escapeUnit(d.log).replace(/ /g, '\\x20')}\nStandardError=append:${escapeUnit(d.log).replace(/ /g, '\\x20')}\n` : ''}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=${d.mode === 'system' ? 'multi-user.target' : 'default.target'}\n`;
-          await this.write(id, unitPath, makeUnit(true));
-          const logMode = await this.exec(
+          // CentOS 7 的 systemd-analyze verify 不会发现 manager 不支持 append:，先按版本能力判断。
+          const systemdVersion = await this.exec(
             id,
-            `if command -v systemd-analyze >/dev/null 2>&1 && systemd-analyze verify ${quote(unitPath)} >/dev/null 2>&1; then echo file; else echo journal; fi`,
-          );
-          d.logMode = logMode === 'file' ? 'file' : 'journal';
-          if (d.logMode !== 'file') await this.write(id, unitPath, makeUnit(false));
+            `${d.mode === 'user' ? 'systemctl --user' : 'systemctl'} --version | head -n 1`,
+          ).catch(() => '');
+          d.logMode = supportsSystemdAppend(systemdVersion) ? 'file' : 'journal';
+          if (d.logMode === 'file') {
+            await this.write(id, unitPath, makeUnit(true));
+            const verified = await this.exec(
+              id,
+              `if command -v systemd-analyze >/dev/null 2>&1 && systemd-analyze verify ${quote(unitPath)} >/dev/null 2>&1; then echo yes; else echo no; fi`,
+            );
+            if (verified !== 'yes') {
+              d.logMode = 'journal';
+              await this.write(id, unitPath, makeUnit(false));
+            }
+          } else {
+            await this.write(id, unitPath, makeUnit(false));
+          }
           const units =
             d.mode === 'system' ? '/etc/systemd/system' : `${info.home}/.config/systemd/user`;
           const targetUnit = `${units}/${d.service}`;
@@ -381,6 +449,16 @@ export class Remote {
             id,
             `${privilege}mkdir -p -- ${quote(units)} && ${privilege}cp -- ${quote(unitPath)} ${quote(`${units}/${d.service}`)} && ${privilege}systemctl ${d.mode === 'user' ? '--user ' : ''}daemon-reload`,
           );
+        } else if (d.manager === 'openrc' || d.manager === 'sysv') {
+          const scriptPath = `${folder}/${d.service}.init`;
+          const script = d.manager === 'openrc' ? openrcScript(d) : sysvScript(d);
+          await this.write(id, scriptPath, script);
+          await this.exec(
+            id,
+            `chmod 755 -- ${quote(scriptPath)} && ${privilege}test ! -e ${quote(d.servicePath!)} && ${privilege}ln -s -- ${quote(scriptPath)} ${quote(d.servicePath!)}`,
+          );
+          installedUnit = d.servicePath!;
+          d.logMode = 'file';
         }
         server.deployment = d;
         await this.store.persist();
@@ -392,31 +470,49 @@ export class Remote {
               ? '普通后台进程模式，不保证开机启动；低于 1024 的端口可能需要额外权限。'
               : d.mode === 'user'
                 ? '用户 systemd 服务，注销后运行取决于服务器 linger 配置。'
-                : `systemd 服务已安装，日志写入${d.logMode === 'file' ? '可单独清理的文件' : '系统 journal（不能单独清理此服务日志）'}；可通过启用开机启动单独设置。`,
+                : d.manager === 'openrc' || d.manager === 'sysv'
+                  ? `${d.manager === 'openrc' ? 'OpenRC' : 'SysV'} 服务已安装，日志写入独立文件；服务保持停止，可单独开启开机启动。`
+                  : `systemd 服务已安装，日志写入${d.logMode === 'file' ? '可单独清理的文件' : '系统 journal（不能单独清理此服务日志）'}；可通过启用开机启动单独设置。`,
         };
       } catch (error) {
         server.deployment = undefined;
-        if (installedUnit)
-          await this.exec(
-            id,
-            `${privilege}rm -f -- ${quote(installedUnit)} && ${privilege}systemctl ${d.mode === 'user' ? '--user ' : ''}daemon-reload`,
-          ).catch(() => {});
+        if (installedUnit) {
+          if (d.manager === 'systemd')
+            await this.exec(
+              id,
+              `${privilege}rm -f -- ${quote(installedUnit)} && ${privilege}systemctl ${d.mode === 'user' ? '--user ' : ''}daemon-reload`,
+            ).catch(() => {});
+          else {
+            if (d.manager === 'openrc')
+              await this.exec(id, this.serviceCommand(id, d, 'disable')).catch(() => {});
+            if (d.manager === 'sysv')
+              await this.exec(id, this.serviceCommand(id, d, 'disable')).catch(() => {});
+            await this.exec(id, `${privilege}rm -f -- ${quote(installedUnit)}`).catch(() => {});
+          }
+        }
         await this.exec(
           id,
-          `rm -f -- ${[d.binary, d.config, `${folder}/${d.service}`].map(quote).join(' ')}`,
+          `rm -f -- ${[d.binary, d.config, `${folder}/${d.service}`, `${folder}/${d.service}.init`].map(quote).join(' ')}`,
         ).catch(() => {});
         throw error;
       }
     });
   }
   private async checkUnit(id: string, d: Deployment) {
-    if (d.mode === 'process') return;
-    const command = `${d.mode === 'system' ? 'systemctl' : 'systemctl --user'} show ${quote(d.service)} -p ExecStart --value`;
-    const start = await this.exec(id, command);
-    if (!start.includes(`path=${d.binary} ;`) || !start.includes(`-c ${d.config} `))
-      throw new AppError(
-        '服务单元的程序或配置与部署记录不一致，已阻止操作。仅支持直接运行 frps -c 配置路径的服务。',
-      );
+    const manager = deploymentManager(d);
+    if (manager === 'process') return;
+    if (manager === 'systemd') {
+      // CentOS 7 的 systemd 不支持 --value，保留属性名的输出可跨版本解析。
+      const command = `${d.mode === 'system' ? 'systemctl' : 'systemctl --user'} show ${quote(d.service)} -p ExecStart`;
+      const start = await this.exec(id, command);
+      if (!start.includes(`path=${d.binary} ;`) || !start.includes(`-c ${d.config} `))
+        throw new AppError('systemd 服务单元与部署记录不一致，已阻止操作。');
+      return;
+    }
+    const script = remotePath(d.servicePath ?? `/etc/init.d/${d.service}`);
+    const contents = await this.exec(id, `cat -- ${quote(script)}`);
+    if (!contents.includes(d.binary) || !contents.includes(d.config))
+      throw new AppError('服务器服务脚本与部署记录不一致，已阻止操作。');
   }
   async adopt(id: string, input: Deployment) {
     return this.locked(id, async () => {
@@ -426,6 +522,15 @@ export class Remote {
       const version = await this.exec(id, `${quote(input.binary)} -v`);
       if (!/^v?\d+\.\d+\.\d+/.test(version)) throw new AppError('此程序未返回有效的 FRP 版本。');
       await this.exec(id, `test -r ${quote(input.config)} || { echo '配置文件不可读'; exit 1; }`);
+      const info = await this.detect(id);
+      if (!info.supported) throw new AppError(`暂不支持接管此系统：${info.distribution}。`);
+      const selection = selectServiceMode(info);
+      input.manager = selection.manager;
+      input.mode = selection.mode;
+      input.servicePath =
+        selection.manager === 'openrc' || selection.manager === 'sysv'
+          ? `/etc/init.d/${input.service}`
+          : undefined;
       if (input.mode !== 'process') await this.checkUnit(id, input);
       if (input.mode === 'process') {
         const matches = await this.exec(
@@ -514,10 +619,21 @@ export class Remote {
   async control(id: string, action: 'start' | 'stop' | 'restart' | 'enable' | 'disable') {
     return this.locked(id, async () => {
       const d = this.deployment(id);
-      if (d.mode !== 'process') {
+      const manager = deploymentManager(d);
+      if (manager !== 'process') {
         await this.checkUnit(id, d);
         await this.exec(id, this.serviceCommand(id, d, action));
-        return this.status(id);
+        try {
+          return await this.status(id);
+        } catch (error) {
+          const message = redact(
+            error instanceof Error ? error.message : String(error),
+            this.store.allSecrets(),
+          ).slice(0, 500);
+          this.serviceStates.set(id, { value: 'unknown', at: Date.now(), message });
+          this.changed();
+          return `服务操作命令已执行，但状态未确认：${message}`;
+        }
       }
       if (action === 'enable' || action === 'disable')
         throw new AppError('普通进程模式不提供开机启动。');
@@ -546,19 +662,31 @@ export class Remote {
   }
   async logs(id: string) {
     const d = this.deployment(id);
-    const out =
-      d.mode === 'process' || d.logMode === 'file'
-        ? await this.exec(id, `tail -n 300 -- ${quote(d.log)}`)
-        : await this.exec(
-            id,
-            `${d.mode === 'system' ? `${this.rootUsers.has(id) ? '' : 'sudo -n '}journalctl` : 'journalctl --user'} -u ${quote(d.service)} -n 300 --no-pager`,
-          );
+    const manager = deploymentManager(d);
+    const journal =
+      `${d.mode === 'system' ? `${this.rootUsers.has(id) ? '' : 'sudo -n '}journalctl` : 'journalctl --user'}` +
+      ` -u ${quote(d.service)} -n 300 --no-pager`;
+    let out: string;
+    if (
+      manager === 'process' ||
+      manager === 'openrc' ||
+      manager === 'sysv' ||
+      d.logMode === 'file'
+    ) {
+      out = await this.exec(
+        id,
+        `if test -r ${quote(d.log)}; then tail -n 300 -- ${quote(d.log)}; else ${manager === 'systemd' ? `printf '%s\\n' '日志文件不存在，改为读取 systemd journal：'; ${journal}` : `echo '日志文件尚未生成，服务可能尚未启动。'`}; fi`,
+      );
+    } else {
+      out = await this.exec(id, journal);
+    }
     return redact(out, this.store.allSecrets());
   }
   async clearLogs(id: string) {
     return this.locked(id, async () => {
       const d = this.deployment(id);
-      if (d.mode !== 'process' && d.logMode !== 'file')
+      const manager = deploymentManager(d);
+      if (manager === 'systemd' && d.logMode !== 'file')
         throw new AppError(
           '此 systemd 服务的日志保存在系统 journal 中，无法安全地只清理该服务而不影响其他服务。工具管理的新部署会使用独立日志文件；接管部署请先将服务输出配置到日志文件。',
         );
@@ -569,217 +697,6 @@ export class Remote {
         `if test -L ${quote(log)}; then echo '日志路径是符号链接，已拒绝清理'; exit 1; elif test -e ${quote(log)} && ! test -f ${quote(log)}; then echo '日志路径不是普通文件，已拒绝清理'; exit 1; elif test -f ${quote(log)}; then ${privilege}truncate -s 0 -- ${quote(log)} && echo '服务端日志已清理'; else echo '日志文件不存在，当前没有可清理内容'; fi`,
       );
       return `${result}；服务不会停止。`;
-    });
-  }
-  private nginxPrivilege(id: string) {
-    // Nginx 管理需要提权；rootUsers 在 SSH 建连时通过 id -u 记录。
-    return this.rootUsers.has(id) ? '' : 'sudo -n ';
-  }
-  private nginxReload(id: string) {
-    const privilege = this.nginxPrivilege(id);
-    return `${privilege}systemctl reload nginx 2>/dev/null || ${privilege}nginx -s reload`;
-  }
-  private async writeNginxConfig(
-    id: string,
-    site: ReverseProxy,
-    withHttps: boolean,
-    allowExisting = false,
-  ) {
-    const privilege = this.nginxPrivilege(id);
-    const info = await this.detect(id);
-    const stage = `${info.home}/.local/share/intranet-frp/${id}/nginx/${site.id}.conf`;
-    const content = nginxProxyConfig(site, withHttps);
-    const folder = path.posix.dirname(stage);
-    await this.exec(id, `mkdir -p -- ${quote(folder)} && chmod 700 -- ${quote(folder)}`);
-    await this.write(id, stage, content);
-    try {
-      const prior = await this.exec(
-        id,
-        `if ${privilege}test -L ${quote(site.configPath)}; then echo symlink; elif ${privilege}test -f ${quote(site.configPath)}; then echo yes; else echo no; fi`,
-      );
-      if (prior === 'symlink' || (prior === 'yes' && !allowExisting))
-        throw new AppError('Nginx 目标配置文件已存在或是符号链接，未覆盖。');
-      const backup = `${site.configPath}.bak-${Date.now()}`;
-      await this.exec(
-        id,
-        `${privilege}mkdir -p -- ${quote(path.posix.dirname(site.configPath))} && ${prior === 'yes' ? `${privilege}cp -p -- ${quote(site.configPath)} ${quote(backup)} && ` : ''}${privilege}install -m 644 -- ${quote(stage)} ${quote(site.configPath)} && if ! ${privilege}nginx -t; then ${prior === 'yes' ? `${privilege}cp -p -- ${quote(backup)} ${quote(site.configPath)}` : `${privilege}rm -f -- ${quote(site.configPath)}`}; exit 1; fi && if ! (${this.nginxReload(id)}); then ${prior === 'yes' ? `${privilege}cp -p -- ${quote(backup)} ${quote(site.configPath)}` : `${privilege}rm -f -- ${quote(site.configPath)}`}; ${privilege}nginx -t && (${this.nginxReload(id)}); exit 1; fi`,
-      );
-    } catch (error) {
-      throw new AppError(`Nginx 配置未应用，原配置已尝试恢复：${String(error)}`);
-    } finally {
-      await this.exec(id, `rm -f -- ${quote(stage)}`).catch(() => {});
-    }
-  }
-  async addReverseProxy(
-    id: string,
-    input: Pick<ReverseProxy, 'id' | 'domain' | 'provider' | 'email' | 'httpPort' | 'httpsPort'> & {
-      certLocalPath?: string;
-      keyLocalPath?: string;
-      eabKid?: string;
-      eabHmac?: string;
-    },
-  ) {
-    return this.locked(id, async () => {
-      const server = this.store.server(id);
-      const existing = server.reverseProxies.find((site) => site.domain === input.domain);
-      if (existing) throw new AppError('此域名已由本工具配置，请使用更新或删除操作。');
-      if (server.reverseProxies.some((site) => site.id === input.id))
-        throw new AppError('站点标识重复，请重试。');
-      if (input.httpPort === input.httpsPort)
-        throw new AppError('FRP HTTP 与 HTTPS 入口端口不能相同。');
-      const info = await this.detect(id);
-      if (!info.root && !info.sudo)
-        throw new AppError('管理 Nginx 配置需要 root 或免交互 sudo 权限。');
-      const privilege = this.nginxPrivilege(id);
-      const includesConfD = await this.exec(
-        id,
-        `command -v nginx >/dev/null 2>&1 && test -d /etc/nginx/conf.d && ${privilege}nginx -T 2>&1 | grep -F 'include /etc/nginx/conf.d/*.conf' >/dev/null`,
-      ).then(
-        () => true,
-        () => false,
-      );
-      if (!includesConfD)
-        throw new AppError(
-          '未检测到可用的 Nginx /etc/nginx/conf.d/*.conf 加载入口，请先确认现有 Nginx 配置方式。',
-        );
-      const domainCheck = await this.exec(
-        id,
-        `${privilege}nginx -T 2>&1 | awk -v domain=${quote(input.domain)} '$1 == "server_name" { for (i = 2; i <= NF; i++) { gsub(/[;,]/, "", $i); if ($i == domain || ($i ~ /^\\*\\./ && domain ~ ("\\." substr($i, 3) "$"))) found = 1 } } END { if (found) print "conflict"; else print "available" }'`,
-      );
-      if (domainCheck === 'conflict')
-        throw new AppError('此域名已存在于 Nginx 配置中，请先检查现有站点，避免覆盖。');
-      const base = remotePath(`${info.home}/.local/share/intranet-frp/${id}/nginx`);
-      const site: ReverseProxy = {
-        id: input.id,
-        domain: input.domain,
-        provider: input.provider,
-        email: input.email,
-        httpPort: input.httpPort,
-        httpsPort: input.httpsPort,
-        certPath: `/etc/nginx/ssl/intranet-frp/${id}/${input.id}/fullchain.pem`,
-        keyPath: `/etc/nginx/ssl/intranet-frp/${id}/${input.id}/privkey.pem`,
-        configPath: `/etc/nginx/conf.d/intranet-frp-${id}-${input.id}.conf`,
-        webRoot: `/var/www/intranet-frp-acme/${id}/${input.id}`,
-        createdAt: Date.now(),
-      };
-      reverseProxySchema.parse(site);
-      await this.exec(
-        id,
-        `${privilege}test ! -e ${quote(site.certPath)} && ${privilege}test ! -L ${quote(site.certPath)} && ${privilege}test ! -e ${quote(site.keyPath)} && ${privilege}test ! -L ${quote(site.keyPath)} || { echo '目标证书路径已存在，未覆盖'; exit 1; }`,
-      );
-      if (input.provider === 'manual') {
-        if (!input.certLocalPath || !input.keyLocalPath)
-          throw new AppError('请选择本机上的证书链文件和私钥文件。');
-        const certText = await readFile(input.certLocalPath, 'utf8');
-        const keyText = await readFile(input.keyLocalPath, 'utf8');
-        if (
-          Buffer.byteLength(certText) > 1048576 ||
-          Buffer.byteLength(keyText) > 1048576 ||
-          !certText.includes('-----BEGIN CERTIFICATE-----') ||
-          !keyText.includes('PRIVATE KEY-----') ||
-          /ENCRYPTED|Proc-Type:\s*4,ENCRYPTED/i.test(keyText)
-        )
-          throw new AppError(
-            '证书或私钥格式不正确、超过 1MB，或私钥带有口令；请提供未加密的 PEM 证书链和私钥。',
-          );
-        const certStage = `${base}/${input.id}-fullchain.pem`;
-        const keyStage = `${base}/${input.id}-privkey.pem`;
-        await this.exec(id, `mkdir -p -- ${quote(base)} && chmod 700 -- ${quote(base)}`);
-        try {
-          await this.write(id, certStage, certText);
-          await this.write(id, keyStage, keyText);
-          await this.exec(
-            id,
-            `${privilege}mkdir -p -- ${quote(path.posix.dirname(site.certPath))} && ${privilege}chmod 700 -- ${quote(path.posix.dirname(site.certPath))} && ${privilege}install -m 644 -- ${quote(certStage)} ${quote(site.certPath)} && ${privilege}install -m 600 -- ${quote(keyStage)} ${quote(site.keyPath)} && ${privilege}openssl x509 -in ${quote(site.certPath)} -checkhost ${quote(site.domain)} -noout >/dev/null && ${privilege}openssl pkey -in ${quote(site.keyPath)} -noout >/dev/null && test "$(${privilege}openssl x509 -in ${quote(site.certPath)} -pubkey -noout | ${privilege}openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$(${privilege}openssl pkey -in ${quote(site.keyPath)} -pubout -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)" || { echo '证书无效、域名不匹配，或证书与私钥不匹配'; ${privilege}rm -f -- ${quote(site.certPath)} ${quote(site.keyPath)}; exit 1; }`,
-          );
-        } finally {
-          await this.exec(id, `rm -f -- ${quote(certStage)} ${quote(keyStage)}`).catch(() => {});
-        }
-      } else {
-        if (!input.email) throw new AppError('自动签发需要填写通知邮箱。');
-        if (input.provider === 'litessl' && (!input.eabKid || !input.eabHmac))
-          throw new AppError('LiteSSL 需要填写从证书服务平台获取的 EAB KID 和 HMAC 凭据。');
-        if (!info.root && !info.sudo)
-          throw new AppError('自动签发及 Nginx 重载需要 root 或免交互 sudo 权限。');
-        this.store.putSecret(`server:${id}:proxy:${input.id}:eabKid`, input.eabKid);
-        this.store.putSecret(`server:${id}:proxy:${input.id}:eabHmac`, input.eabHmac);
-        await this.exec(
-          id,
-          `${privilege}mkdir -p -- ${quote(site.webRoot)} ${quote(path.posix.dirname(site.certPath))} && ${privilege}chmod 755 -- ${quote(path.posix.dirname(site.webRoot))} ${quote(site.webRoot)} && ${privilege}chmod 700 -- ${quote(path.posix.dirname(site.certPath))}`,
-        );
-      }
-      await this.exec(id, `mkdir -p -- ${quote(base)} && chmod 700 -- ${quote(base)}`);
-      // 自动签发前先加载 HTTP 站点，使 ACME HTTP-01 challenge 可被 Nginx 访问。
-      try {
-        await this.writeNginxConfig(id, site, input.provider === 'manual');
-      } catch (error) {
-        this.store.dropSecrets(`server:${id}:proxy:${input.id}:`);
-        if (input.provider === 'manual')
-          await this.exec(
-            id,
-            `${privilege}rm -f -- ${quote(site.certPath)} ${quote(site.keyPath)}`,
-          ).catch(() => {});
-        throw error;
-      }
-      if (input.provider !== 'manual') {
-        const acme = '/root/.acme.sh/acme.sh';
-        const installer = `${base}/acme.sh`;
-        const provider =
-          input.provider === 'letsencrypt'
-            ? 'https://acme-v02.api.letsencrypt.org/directory'
-            : 'https://acme.litessl.com/acme/v2/directory';
-        const kid = this.store.secret(`server:${id}:proxy:${input.id}:eabKid`);
-        const hmac = this.store.secret(`server:${id}:proxy:${input.id}:eabHmac`);
-        try {
-          await this.exec(
-            id,
-            `if ! ${privilege}test -x ${quote(acme)}; then if command -v curl >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh -o ${quote(installer)}; elif command -v wget >/dev/null 2>&1; then wget -qO ${quote(installer)} https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh; else echo '需要 curl 或 wget 下载官方 ACME 客户端'; exit 1; fi; sh -n ${quote(installer)} && ${privilege}sh ${quote(installer)} --install -m ${quote(input.email!)}; fi`,
-          );
-          if (input.provider === 'litessl')
-            await this.exec(
-              id,
-              `${privilege}${quote(acme)} --register-account --server ${quote(provider)} --accountemail ${quote(input.email!)} --eab-kid ${quote(kid)} --eab-hmac-key ${quote(hmac)}`,
-              120000,
-            );
-          await this.exec(
-            id,
-            `${privilege}${quote(acme)} --issue --server ${quote(provider)} --accountemail ${quote(input.email!)} -d ${quote(site.domain)} -w ${quote(site.webRoot)} --keylength ec-256 && ${privilege}${quote(acme)} --install-cert -d ${quote(site.domain)} --key-file ${quote(site.keyPath)} --fullchain-file ${quote(site.certPath)} --reloadcmd ${quote('nginx -t && (systemctl reload nginx || nginx -s reload)')}`,
-            180000,
-          );
-          await this.writeNginxConfig(id, site, true, true);
-          // EAB 凭据已由 ACME 客户端登记在服务器端，应用本机不再保留副本。
-          this.store.dropSecrets(`server:${id}:proxy:${input.id}:`);
-        } catch (error) {
-          await this.removeNginxConfig(id, site).catch(() => {});
-          this.store.dropSecrets(`server:${id}:proxy:${input.id}:`);
-          throw new AppError(`证书申请或 Nginx 配置失败：${String(error)}`);
-        }
-      }
-      server.reverseProxies.push(site);
-      await this.store.persist();
-      this.changed();
-      return site;
-    });
-  }
-  private async removeNginxConfig(id: string, site: ReverseProxy) {
-    const privilege = this.nginxPrivilege(id);
-    const removed = `${site.configPath}.removed-${Date.now()}`;
-    await this.exec(
-      id,
-      `if test -e ${quote(site.configPath)}; then ${privilege}mv -- ${quote(site.configPath)} ${quote(removed)}; fi && if ! ${privilege}nginx -t; then if test -e ${quote(removed)}; then ${privilege}mv -- ${quote(removed)} ${quote(site.configPath)}; fi; exit 1; fi && if ! (${this.nginxReload(id)}); then if test -e ${quote(removed)}; then ${privilege}mv -- ${quote(removed)} ${quote(site.configPath)}; fi; ${privilege}nginx -t && (${this.nginxReload(id)}); exit 1; fi`,
-    );
-  }
-  async removeReverseProxy(id: string, siteId: string) {
-    return this.locked(id, async () => {
-      const server = this.store.server(id);
-      const site = server.reverseProxies.find((value) => value.id === siteId);
-      if (!site) throw new AppError('找不到此反向代理站点。');
-      await this.removeNginxConfig(id, site);
-      server.reverseProxies = server.reverseProxies.filter((value) => value.id !== siteId);
-      await this.store.persist();
-      this.store.dropSecrets(`server:${id}:proxy:${siteId}:`);
-      this.changed();
-      return 'Nginx 站点配置已移除，证书及 ACME 自动续期任务保留在服务器。';
     });
   }
   async readConfig(id: string) {
@@ -883,27 +800,42 @@ export class Remote {
       this.changed();
     });
   }
-  async uninstall(id: string, deleteAdopted: boolean) {
+  async uninstall(id: string) {
     const d = this.deployment(id);
-    if (!d.managed && !deleteAdopted) {
-      await this.detach(id);
-      return '已解除管理，远程服务和文件保留。';
-    }
     await this.control(id, 'stop');
     return this.locked(id, async () => {
-      if (d.mode !== 'process') {
+      const manager = deploymentManager(d);
+      if (manager !== 'process') {
         await this.exec(id, this.serviceCommand(id, d, 'disable'));
-        const info = await this.detect(id);
-        const unit = `${d.mode === 'system' ? '/etc/systemd/system' : `${info.home}/.config/systemd/user`}/${d.service}`;
-        await this.exec(
-          id,
-          `${d.mode === 'system' && !info.root ? 'sudo -n ' : ''}rm -f -- ${quote(unit)} && ${d.mode === 'system' ? `${this.rootUsers.has(id) ? '' : 'sudo -n '}systemctl` : 'systemctl --user'} daemon-reload`,
-        );
+        if (manager === 'systemd') {
+          const unit = `${d.mode === 'system' ? '/etc/systemd/system' : `${(await this.detect(id)).home}/.config/systemd/user`}/${d.service}`;
+          await this.exec(
+            id,
+            `${d.mode === 'system' && !this.rootUsers.has(id) ? 'sudo -n ' : ''}rm -f -- ${quote(unit)} && ${d.mode === 'system' ? `${this.rootUsers.has(id) ? '' : 'sudo -n '}systemctl` : 'systemctl --user'} daemon-reload`,
+          );
+        } else if (manager === 'openrc' || manager === 'sysv') {
+          const script = remotePath(d.servicePath ?? `/etc/init.d/${d.service}`);
+          await this.exec(
+            id,
+            `${d.mode === 'system' && !this.rootUsers.has(id) ? 'sudo -n ' : ''}rm -f -- ${quote(script)}`,
+          );
+        }
       }
       // 不递归删除目录，接管部署也只删除用户明确提供的几个文件。
       await this.exec(
         id,
-        `rm -f -- ${[d.binary, d.config, d.log, d.pidFile].map((p) => quote(remotePath(p))).join(' ')}`,
+        `rm -f -- ${[
+          d.binary,
+          d.config,
+          d.log,
+          d.pidFile,
+          d.managed && (manager === 'openrc' || manager === 'sysv')
+            ? `${path.posix.dirname(d.binary)}/${d.service}.init`
+            : '',
+        ]
+          .filter(Boolean)
+          .map((p) => quote(remotePath(p)))
+          .join(' ')}`,
       );
       this.store.server(id).deployment = undefined;
       await this.store.persist();

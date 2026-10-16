@@ -17,7 +17,7 @@ const server = await createServer();
 await server.listen();
 const child = spawn(electron, ['.'], {
   stdio: 'inherit',
-  env: { ...process.env, VITE_DEV_SERVER_URL: 'http://127.0.0.1:5173' },
+  env: { ...process.env, VITE_DEV_SERVER_URL: 'http://127.0.0.1:1854' },
 });
 child.on('exit', async (code) => {
   await server.close();
