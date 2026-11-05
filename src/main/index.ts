@@ -20,7 +20,8 @@ import { z } from 'zod';
 import { Store } from './store';
 import { Versions } from './versions';
 import { Processes, execute } from './processes';
-import { Remote } from './remote';
+import { Remote, quote } from './remote';
+import { applyNginxSite, removeHttpInclude } from './server-sites';
 import {
   Certificates,
   normalizeDomains,
@@ -75,12 +76,12 @@ function resolveHttp01Assignments(instances: Instance[], servers: Server[], doma
     const matches = instances.flatMap((instance) =>
       instance.mode === 'form'
         ? instance.proxies
-          .filter(
-            (rule) =>
-              (rule.type === 'http' || rule.type === 'https') &&
-              rule.domains.some((candidate) => candidate.toLowerCase() === domain),
-          )
-          .map((rule) => ({ instance, rule }))
+            .filter(
+              (rule) =>
+                (rule.type === 'http' || rule.type === 'https') &&
+                rule.domains.some((candidate) => candidate.toLowerCase() === domain),
+            )
+            .map((rule) => ({ instance, rule }))
         : [],
     );
     if (matches.length !== 1)
@@ -266,6 +267,10 @@ else {
             .parse(payload);
           const id = value.id;
           const server = store.server(id);
+          if (store.data.serverSites.some((site) => site.serverId === id))
+            throw new AppError(
+              '此服务器仍有应用管理的 Nginx 站点，请先删除站点后再卸载服务器配置。',
+            );
           if (store.data.instances.some((i) => i.serverId === id))
             throw new AppError('此服务器仍被客户端实例引用，请先更换关联或删除实例。');
           if (server.deployment) {
@@ -404,10 +409,146 @@ else {
           store.instance(id);
           if (!(await yes('删除客户端实例？', '此实例的本机穿透将停止，配置将删除。'))) return;
           await processes.stop(id);
+          store.data.serverSites = store.data.serverSites.map((site) =>
+            site.instanceId === id ? { ...site, outOfSync: true } : site,
+          );
           store.dropSecrets(`instance:${id}:`);
           store.data.instances = store.data.instances.filter((i) => i.id !== id);
           await store.persist();
           changed();
+        },
+        'site:create': async (p) => {
+          const input = z
+            .object({
+              instanceId: idSchema,
+              ruleId: idSchema,
+              mainConfig: z.string().max(4096).optional(),
+            })
+            .parse(p);
+          const instance = store.instance(input.instanceId);
+          const server = store.server(instance.serverId);
+          if (!remote.connected(server.id)) throw new AppError('请先连接目标服务器的 SSH。');
+          if (instance.mode !== 'form')
+            throw new AppError('高级配置实例无法自动读取 HTTP 域名，请使用表单模式。');
+          const rule = instance.proxies.find((item) => item.id === input.ruleId);
+          if (!rule || rule.type !== 'http' || !rule.domains.length)
+            throw new AppError('来源规则必须是含域名的 HTTP 规则。');
+          if (
+            store.data.serverSites.some(
+              (site) =>
+                site.serverId === server.id &&
+                site.domains.some((domain) => rule.domains.includes(domain)),
+            )
+          )
+            throw new AppError('该服务器已有站点使用这些域名。');
+          const taskId = randomBytes(12).toString('hex');
+          const progress = (step: string, message: string) =>
+            window?.webContents.send('server-site:progress', {
+              taskId,
+              status: step === '完成' ? 'completed' : 'running',
+              step,
+              message,
+              updatedAt: Date.now(),
+            });
+          return remote.locked(server.id, async () => {
+            progress('检测权限', '确认 root 或免密 sudo 权限');
+            const admin = remote.nginxAdmin(server.id);
+            await admin.run('command -v nginx >/dev/null && nginx -t');
+            progress('发现配置', '读取 Nginx 主配置路径');
+            const dump = await admin.run('nginx -T 2>&1');
+            const detected = /^nginx: the configuration file (\S+) syntax is ok/m.exec(dump)?.[1];
+            const mainConfig = input.mainConfig || detected;
+            if (!mainConfig || !mainConfig.startsWith('/'))
+              throw new AppError('无法从 nginx -T 定位主配置。可再次创建并填写主配置绝对路径。');
+            const info = await remote.detect(server.id);
+            const root = `${info.home}/.local/share/intranet-frp`;
+            const site = {
+              id: randomBytes(12).toString('hex'),
+              name: rule.name,
+              domains: rule.domains,
+              upstreamPort: server.httpPort,
+              acmeRoot: `${root}/acme/http01`,
+            };
+            progress('备份并写入', '保存 Nginx 配置备份并生成站点');
+            await admin.run(
+              `mkdir -p -- ${quote(`${root}/vhost/nginx`)} ${quote(`${root}/acme/http01/.well-known/acme-challenge`)} ${quote(`${root}/backups`)}`,
+            );
+            const applied = await applyNginxSite(admin, mainConfig, site);
+            const record = {
+              ...site,
+              serverId: server.id,
+              instanceId: instance.id,
+              ruleId: rule.id,
+              configPath: applied.configPath,
+              mainConfig,
+              includeCreatedByApp: applied.includeCreatedByApp,
+              createdAt: Date.now(),
+              outOfSync: false,
+            };
+            await store.saveServerSite(record);
+            progress('完成', 'Nginx 语法检查与重载成功');
+            changed();
+            return record;
+          });
+        },
+        'site:delete': async (p) => {
+          const { id } = z.object({ id: idSchema }).parse(p);
+          const site = store.data.serverSites.find((item) => item.id === id);
+          if (!site) throw new AppError('站点记录不存在。');
+          if (
+            !(await yes(
+              '删除 Nginx 站点？',
+              `${site.domains.join('、')}\n只删除应用创建的站点配置，并测试、重载 Nginx。`,
+            ))
+          )
+            return;
+          if (!remote.connected(site.serverId)) await remote.connect(site.serverId);
+          return remote.locked(site.serverId, async () => {
+            const admin = remote.nginxAdmin(site.serverId);
+            const path = site.configPath;
+            const content = await admin.read(path);
+            if (!content.includes('# 由穿透工作台管理；修改前请在应用中操作。'))
+              throw new AppError(
+                '站点配置已不再带有本应用标记，为避免删除用户修改后的文件，已停止操作。',
+              );
+            const backup = `${path}.intranet-backup-${Date.now()}`;
+            const remaining = store.data.serverSites.filter(
+              (item) => item.serverId === site.serverId && item.id !== id,
+            );
+            const mainConfig = site.mainConfig;
+            const includeRoot = path.split('/vhost/nginx/')[0];
+            const includePath = `${includeRoot}/vhost/nginx/*.conf`;
+            const removeInclude = !remaining.length && !!mainConfig && site.includeCreatedByApp;
+            const mainContent = removeInclude && mainConfig ? await admin.read(mainConfig) : '';
+            const mainMode = removeInclude && mainConfig ? await admin.mode(mainConfig) : '644';
+            const mainBackup = removeInclude
+              ? `${includeRoot}/backups/nginx-main-remove-${Date.now()}.conf`
+              : '';
+            if (removeInclude && mainConfig && (await admin.read(mainConfig)) !== mainContent)
+              throw new AppError('Nginx 主配置在操作期间发生变化，请重试以避免覆盖外部修改。');
+            await admin.run(
+              `${removeInclude && mainConfig ? `cp -p -- ${quote(mainConfig)} ${quote(mainBackup)} && ` : ''}cp -p -- ${quote(path)} ${quote(backup)} && rm -f -- ${quote(path)}`,
+            );
+            try {
+              if (removeInclude && mainConfig)
+                await admin.write(
+                  mainConfig,
+                  removeHttpInclude(mainContent, includePath),
+                  mainMode,
+                );
+              await admin.run('nginx -t && nginx -s reload');
+            } catch (error) {
+              await admin.write(path, content, '644').catch(() => {});
+              if (removeInclude && mainConfig)
+                await admin.write(mainConfig, mainContent, mainMode).catch(() => {});
+              await admin.run('nginx -t && nginx -s reload').catch(() => {});
+              throw error;
+            }
+            store.data.serverSites = store.data.serverSites.filter((item) => item.id !== id);
+            await store.persist();
+            changed();
+            return { note: 'Nginx 站点已删除。' };
+          });
         },
         'instance:start': async (p) => {
           const id = pickId(p);
@@ -671,9 +812,8 @@ else {
           nodeIntegration: false,
           sandbox: true,
         },
-      }
-      if (process.env.NODE_ENV === 'development')
-        opt.width = 3280;
+      };
+      if (process.env.NODE_ENV === 'development') opt.width = 3280;
       window = new BrowserWindow(opt);
       // 打包时 preload 输出重命名见构建脚本，开发时使用同一文件名。
       window.on('closed', () => {

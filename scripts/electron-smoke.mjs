@@ -54,7 +54,7 @@ try {
   await page.getByRole('button', { name: '关闭', exact: true }).click();
   await page.locator('nav button').filter({ hasText: '设置与帮助' }).click();
   await expect(page.getByText('下载网络', { exact: true })).toBeVisible();
-  await page.locator('nav button').filter({ hasText: '服务器' }).click();
+  await page.locator('nav button').first().click();
   await mkdir('artifacts', { recursive: true });
   await page.screenshot({ path: 'artifacts/desktop-smoke.png', fullPage: true });
   await application.evaluate(({ BrowserWindow }) => {

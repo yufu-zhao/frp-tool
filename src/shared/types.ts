@@ -50,6 +50,37 @@ export const certificateSchema = z.object({
   pendingRestartInstances: z.array(id).default([]),
   createdAt: z.number().int().nonnegative(),
 });
+// 服务器站点和服务器证书独立于本机 frpc 证书库。
+export const serverSiteSchema = z.object({
+  id,
+  serverId: id,
+  instanceId: id,
+  ruleId: id,
+  name: z.string().min(1).max(100),
+  domains: z.array(z.string().min(1).max(253)).min(1).max(100),
+  upstreamPort: port,
+  configPath: text,
+  mainConfig: text.optional(),
+  includeCreatedByApp: z.boolean().default(false),
+  certificateId: id.optional(),
+  outOfSync: z.boolean().default(false),
+  createdAt: z.number().int().nonnegative(),
+});
+export const serverCertificateSchema = z.object({
+  id,
+  serverId: id,
+  name: z.string().min(1).max(100),
+  provider: z.enum(['manual', 'letsencrypt', 'litessl']),
+  domains: z.array(z.string().min(1).max(253)).min(1).max(100),
+  email: z.string().email().optional(),
+  challenge: z.enum(['http-01', 'dns-01']).optional(),
+  certPath: text,
+  keyPath: text,
+  expiresAt: z.string().datetime().optional(),
+  autoRenew: z.boolean().default(false),
+  renewalManager: z.enum(['systemd', 'cron', 'manual', 'unavailable']).default('manual'),
+  createdAt: z.number().int().nonnegative(),
+});
 export const deploymentSchema = z.object({
   binary: text,
   config: text,
@@ -109,6 +140,8 @@ export type Deployment = z.infer<typeof deploymentSchema>;
 export type Instance = z.infer<typeof instanceSchema>;
 export type ProxyRule = z.infer<typeof proxySchema>;
 export type CertificateRecord = z.infer<typeof certificateSchema>;
+export type ServerSite = z.infer<typeof serverSiteSchema>;
+export type ServerCertificate = z.infer<typeof serverCertificateSchema>;
 export type Settings = z.infer<typeof settingsSchema>;
 export type InstallRequest = z.infer<typeof installSchema>;
 export interface Asset {
@@ -147,11 +180,20 @@ export interface State {
   servers: Server[];
   instances: Instance[];
   certificates: CertificateRecord[];
+  serverSites: ServerSite[];
+  serverCertificates: ServerCertificate[];
   versions: InstalledVersion[];
   settings: Settings;
   secureStorage: boolean;
   platform: string;
   arch: string;
+}
+export interface ServerSiteProgress {
+  taskId: string;
+  status: 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled';
+  step: string;
+  message: string;
+  updatedAt: number;
 }
 export interface Runtime {
   status: 'stopped' | 'starting' | 'running' | 'connected' | 'error';
@@ -185,6 +227,7 @@ export interface DesktopApi {
   call<T = unknown>(action: string, payload?: unknown): Promise<Result<T>>;
   onChange(callback: () => void): () => void;
   onCertificateProgress(callback: (progress: CertificateIssueProgress) => void): () => void;
+  onServerSiteProgress(callback: (progress: ServerSiteProgress) => void): () => void;
 }
 
 export interface CertificateIssueProgress {

@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { CertificateIssueProgress, DesktopApi } from '../shared/types';
+import type { CertificateIssueProgress, DesktopApi, ServerSiteProgress } from '../shared/types';
 
 // 只暴露固定 RPC 通道，不允许页面直接使用 Node 或任意 IPC。
 const api: DesktopApi = {
@@ -14,6 +14,12 @@ const api: DesktopApi = {
       callback(progress);
     ipcRenderer.on('certificate:progress', handler);
     return () => ipcRenderer.removeListener('certificate:progress', handler);
+  },
+  onServerSiteProgress: (callback) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: ServerSiteProgress) =>
+      callback(progress);
+    ipcRenderer.on('server-site:progress', handler);
+    return () => ipcRenderer.removeListener('server-site:progress', handler);
   },
 };
 contextBridge.exposeInMainWorld('desktop', api);

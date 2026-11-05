@@ -191,6 +191,45 @@ export class Remote {
       this.busy.delete(id);
     }
   }
+  // 服务器站点操作只在 root 或免密 sudo 可用时执行，避免交互式 sudo 卡住 SSH。
+  async adminExec(id: string, command: string, timeout = 30000) {
+    if (this.rootUsers.has(id)) return this.exec(id, command, timeout);
+    await this.exec(id, 'sudo -n true', 10000);
+    return this.exec(id, `sudo -n sh -c ${quote(command)}`, timeout);
+  }
+  async writeUserFile(id: string, destination: string, content: string, mode = '600') {
+    const safePath = remotePath(destination);
+    const payload = Buffer.from(content).toString('base64');
+    await this.exec(
+      id,
+      `mkdir -p -- ${quote(path.posix.dirname(safePath))} && printf %s ${quote(payload)} | base64 -d > ${quote(safePath)} && chmod ${quote(mode)} ${quote(safePath)}`,
+    );
+  }
+  // 提供站点管理事务可用的免密特权读写能力，不暴露任意文件 IPC 给渲染进程。
+  nginxAdmin(id: string) {
+    return {
+      run: (command: string) => this.adminExec(id, command, 90000),
+      read: async (destination: string) => {
+        const output = await this.adminExec(
+          id,
+          `base64 -w0 -- ${quote(remotePath(destination))}`,
+          30000,
+        );
+        return Buffer.from(output, 'base64').toString('utf8');
+      },
+      mode: async (destination: string) =>
+        this.adminExec(id, `stat -c %a -- ${quote(remotePath(destination))}`, 10000),
+      write: async (destination: string, content: string, mode = '600') => {
+        const safePath = remotePath(destination);
+        const payload = Buffer.from(content).toString('base64');
+        await this.adminExec(
+          id,
+          `printf %s ${quote(payload)} | base64 -d > ${quote(safePath)} && chmod ${quote(mode)} ${quote(safePath)}`,
+          30000,
+        );
+      },
+    };
+  }
   exec(id: string, command: string, timeout = 30000): Promise<string> {
     return new Promise((resolve, reject) => {
       const client = this.connection(id);

@@ -4,6 +4,11 @@
   "private": true,
   "description": "跨平台 FRP 服务器与本机穿透管理工具",
   "main": "dist/main/index.js",
+  "author": {
+    "name": "yufu",
+    "email": "228762287@qq.com"
+  },
+  "homepage": "https://github.com/yufu-zhao/frp-tool",
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "npm run icons && npm run typecheck && vite build && tsup",
@@ -104,7 +109,6 @@
     "@electron/get": "^5.1.0",
     "esbuild": "^0.28.2"
   },
-  "author": "Intranet 项目",
   "license": "UNLICENSED",
   "desktopName": "intranet-frp-desktop.desktop"
 }

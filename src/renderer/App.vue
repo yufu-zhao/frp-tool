@@ -12,6 +12,7 @@ import type {
   Deployment,
   InstallRequest,
   CertificateIssueProgress,
+  ServerSiteProgress,
 } from '../shared/types';
 import logoUrl from '../../assets/brand/logo.svg';
 import { accessAddress } from '../shared/address';
@@ -21,6 +22,8 @@ const state = ref<State>({
   servers: [],
   instances: [],
   certificates: [],
+  serverSites: [],
+  serverCertificates: [],
   versions: [],
   settings: { proxyUrl: '' },
   secureStorage: true,
@@ -69,6 +72,9 @@ const certificateDraft = reactive({
 });
 const certificateToAssociate = ref('');
 const certificateTargets = ref<string[]>([]);
+const siteSelection = ref('');
+const siteMainConfig = ref('');
+const siteProgress = ref<ServerSiteProgress>();
 const certificateProgress = ref<CertificateIssueProgress>();
 const certificateProgressHistory = ref<CertificateIssueProgress[]>([]);
 const activeCertificateTask = ref('');
@@ -86,6 +92,7 @@ const adoption = reactive<Deployment>({
 let timer: ReturnType<typeof setInterval>;
 let unsubscribe: () => void;
 let unsubscribeCertificateProgress: () => void;
+let unsubscribeServerSiteProgress: () => void;
 const uid = () => crypto.randomUUID();
 const server = computed(() => state.value.servers.find((s) => s.id === selectedServer.value));
 const instance = computed(() => state.value.instances.find((s) => s.id === selectedInstance.value));
@@ -94,6 +101,15 @@ const certificateRules = computed(() =>
     item.mode === 'form'
       ? item.proxies
           .filter((rule) => rule.type === 'https' && rule.tlsMode === 'terminate')
+          .map((rule) => ({ instance: item, rule }))
+      : [],
+  ),
+);
+const siteRules = computed(() =>
+  state.value.instances.flatMap((item) =>
+    item.mode === 'form'
+      ? item.proxies
+          .filter((rule) => rule.type === 'http' && rule.domains.length)
           .map((rule) => ({ instance: item, rule }))
       : [],
   ),
@@ -112,6 +128,7 @@ const navIcons: Record<string, string> = {
   servers: '▤',
   clients: '⇄',
   certificates: '◇',
+  sites: '⌂',
   versions: '▦',
   settings: '⚙',
 };
@@ -131,6 +148,7 @@ const titles: Record<string, string> = {
   servers: '服务器',
   clients: '客户端实例',
   certificates: 'SSL 证书',
+  sites: '服务器站点',
   versions: '版本库',
   settings: '设置与帮助',
 };
@@ -138,6 +156,7 @@ const descriptions: Record<string, string> = {
   servers: '连接你的 Linux 服务器，部署或接管 FRP 服务。',
   clients: '将本机服务分享出去，多套配置可以同时运行。',
   certificates: '在本机导入或签发证书，并关联到 HTTPS 客户端规则。',
+  sites: '通过 SSH 管理 Nginx 站点和服务器端证书。',
   versions: '按版本、平台和架构管理程序，联网与离线都能安装。',
   settings: '调整下载网络，了解平台权限和部署注意事项。',
 };
@@ -178,6 +197,26 @@ async function act(action: string, payload?: unknown, success = '') {
     error.value = (e as Error).message;
   } finally {
     busy.value = false;
+  }
+}
+async function createServerSite() {
+  const [instanceId, ruleId] = siteSelection.value.split(':');
+  const source = siteRules.value.find(
+    (item) => item.instance.id === instanceId && item.rule.id === ruleId,
+  );
+  if (!source) return;
+  const result = await act(
+    'site:create',
+    {
+      instanceId: source.instance.id,
+      ruleId: source.rule.id,
+      ...(siteMainConfig.value ? { mainConfig: siteMainConfig.value } : {}),
+    },
+    'Nginx 站点已创建并应用。',
+  );
+  if (result) {
+    siteSelection.value = '';
+    siteMainConfig.value = '';
   }
 }
 function newServer() {
@@ -694,6 +733,10 @@ function statusLabel(value: string) {
 }
 onMounted(async () => {
   unsubscribeCertificateProgress = api?.onCertificateProgress(updateCertificateProgress);
+  unsubscribeServerSiteProgress = api?.onServerSiteProgress((progress) => {
+    siteProgress.value = progress;
+    if (progress.status === 'completed') setTimeout(() => (siteProgress.value = undefined), 5000);
+  });
   try {
     await refresh();
     proxyUrl.value = state.value.settings.proxyUrl;
@@ -714,6 +757,7 @@ onUnmounted(() => {
   clearInterval(timer);
   unsubscribe?.();
   unsubscribeCertificateProgress?.();
+  unsubscribeServerSiteProgress?.();
 });
 </script>
 
@@ -790,6 +834,9 @@ onUnmounted(() => {
       </div>
       <div v-if="message && modal !== 'logs'" class="notice success" role="status">
         {{ message }}<button @click="message = ''">×</button>
+      </div>
+      <div v-if="siteProgress" class="notice progress" role="status">
+        <strong>{{ siteProgress.step }}</strong> · {{ siteProgress.message }}
       </div>
       <div v-if="busy" class="notice progress">正在执行操作，请稍候…</div>
       <div v-if="!state.secureStorage" class="notice warning">
@@ -1224,6 +1271,70 @@ onUnmounted(() => {
           <p v-if="!state.secureStorage" class="notice warning">
             系统安全存储不可用，ACME 账号密钥不能跨会话保存，因此自动续期暂不可用。
           </p>
+        </section>
+      </template>
+
+      <template v-if="page === 'sites'">
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>从 HTTP 规则创建站点</h2>
+              <p>站点上游使用服务器配置的 FRP HTTP 入口端口。</p>
+            </div>
+          </div>
+          <div class="form-grid">
+            <label
+              >来源规则
+              <select v-model="siteSelection">
+                <option value="">选择一条 HTTP 规则</option>
+                <option
+                  v-for="item in siteRules"
+                  :key="`${item.instance.id}:${item.rule.id}`"
+                  :value="`${item.instance.id}:${item.rule.id}`"
+                >
+                  {{ item.instance.name }} / {{ item.rule.name }} —
+                  {{ item.rule.domains.join(', ') }}
+                </option>
+              </select>
+            </label>
+            <label
+              >可选：Nginx 主配置绝对路径
+              <input
+                v-model="siteMainConfig"
+                placeholder="自动检测失败时填写，如 /etc/nginx/nginx.conf"
+              />
+            </label>
+            <button class="primary" :disabled="busy || !siteSelection" @click="createServerSite">
+              创建并应用 Nginx 站点
+            </button>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>已管理站点</h2>
+              <p>删除只清理本应用创建的 Nginx 站点文件。</p>
+            </div>
+          </div>
+          <div v-if="!state.serverSites.length" class="empty">尚未创建服务器站点。</div>
+          <article v-for="site in state.serverSites" :key="site.id" class="record-card">
+            <div>
+              <strong>{{ site.name }}</strong>
+              <p>{{ site.domains.join(' · ') }}</p>
+              <small
+                >{{ state.servers.find((item) => item.id === site.serverId)?.name }} · 上游
+                127.0.0.1:{{ site.upstreamPort }} ·
+                {{ site.outOfSync ? '来源规则可能已变化' : 'HTTP' }}</small
+              >
+            </div>
+            <button
+              class="danger"
+              :disabled="busy"
+              @click="act('site:delete', { id: site.id }, '站点已删除。')"
+            >
+              删除站点
+            </button>
+          </article>
         </section>
       </template>
 

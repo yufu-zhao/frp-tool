@@ -32,6 +32,7 @@ import {
   selectServiceMode,
   sysvScript,
 } from '../src/main/service-manager';
+import { insertHttpInclude, renderNginxSite, applyNginxSite } from '../src/main/server-sites';
 
 const hostInfoOutput = `platform=Linux
 kernel=5.14.0
@@ -61,6 +62,52 @@ const server = serverSchema.parse({
   auth: 'key',
   publicHost: 'demo.example.com',
   frpPort: 7000,
+});
+
+describe('Nginx 站点配置', () => {
+  const site = {
+    id: 'site1',
+    name: '官网',
+    domains: ['www.example.com', 'example.com'],
+    upstreamPort: 8080,
+    acmeRoot: '/home/user/.local/share/intranet-frp/acme/http01',
+  };
+  it('只在 http 块加入一次 include，忽略注释和其他上下文', () => {
+    const config =
+      '# http {\nevents { worker_connections 128; }\nhttp {\n server { listen 80; }\n}\n';
+    const first = insertHttpInclude(config, '/home/user/sites/*.conf');
+    expect(first).toContain('http {\n  include /home/user/sites/*.conf;');
+    expect(insertHttpInclude(first, '/home/user/sites/*.conf')).toBe(first);
+    expect(first.indexOf('include')).toBeGreaterThan(first.indexOf('http {'));
+  });
+  it('生成单个 server 块、FRP 上游和 ACME 路径，拒绝非法域名', () => {
+    const rendered = renderNginxSite(site);
+    expect(rendered.match(/server \{/g) ?? []).toHaveLength(1);
+    expect(rendered).toContain('proxy_pass http://127.0.0.1:8080;');
+    expect(rendered).toContain('location ^~ /.well-known/acme-challenge/');
+    expect(rendered).toContain('proxy_set_header X-Forwarded-Proto $scheme;');
+    expect(() => renderNginxSite({ ...site, domains: ['bad domain'] })).toThrow('域名');
+  });
+  it('测试或重载失败时恢复主配置与站点文件', async () => {
+    const commands: string[] = [];
+    let writes = 0;
+    const admin = {
+      read: async () => 'events {}\nhttp {}\n',
+      mode: async () => '640',
+      write: async () => {
+        writes += 1;
+      },
+      run: async (command: string) => {
+        commands.push(command);
+        if (command === 'nginx -T 2>&1') return 'nginx: configuration file ok';
+        if (command === 'nginx -t') throw new Error('bad config');
+        return '';
+      },
+    };
+    await expect(applyNginxSite(admin, '/etc/nginx/nginx.conf', site)).rejects.toThrow('回滚');
+    expect(writes).toBe(2);
+    expect(commands.some((command) => command.includes('cp -p'))).toBe(true);
+  });
 });
 const rule: ProxyRule = {
   id: 'rule1',

@@ -5,11 +5,15 @@ import {
   instanceSchema,
   settingsSchema,
   certificateSchema,
+  serverSiteSchema,
+  serverCertificateSchema,
   type Server,
   type Instance,
   type InstalledVersion,
   type Settings,
   type CertificateRecord,
+  type ServerSite,
+  type ServerCertificate,
 } from '../shared/types';
 import { AppError } from '../shared/errors';
 
@@ -25,6 +29,8 @@ interface DiskState {
   versions: InstalledVersion[];
   settings: Settings;
   certificates: CertificateRecord[];
+  serverSites: ServerSite[];
+  serverCertificates: ServerCertificate[];
   secrets: Record<string, string>;
 }
 
@@ -37,6 +43,8 @@ export class Store {
     versions: [],
     settings: { proxyUrl: '' },
     certificates: [],
+    serverSites: [],
+    serverCertificates: [],
     secrets: {},
   };
   private writes: Promise<void> = Promise.resolve();
@@ -68,6 +76,12 @@ export class Store {
       raw.settings = settingsSchema.parse(raw.settings);
       raw.certificates = Array.isArray(raw.certificates)
         ? raw.certificates.map((item: unknown) => certificateSchema.parse(item))
+        : [];
+      raw.serverSites = Array.isArray(raw.serverSites)
+        ? raw.serverSites.map((item: unknown) => serverSiteSchema.parse(item))
+        : [];
+      raw.serverCertificates = Array.isArray(raw.serverCertificates)
+        ? raw.serverCertificates.map((item: unknown) => serverCertificateSchema.parse(item))
         : [];
       if (
         !raw.secrets ||
@@ -149,17 +163,55 @@ export class Store {
   async saveInstance(item: Instance) {
     this.server(item.serverId);
     this.version(item.versionKey);
+    const previous = this.data.instances.find((s) => s.id === item.id);
     this.putSecret(`instance:${item.id}:rawConfig`, item.rawConfig);
     this.data.instances = [
       ...this.data.instances.filter((s) => s.id !== item.id),
       { ...item, rawConfig: '' },
     ];
+    if (previous) {
+      const domainsByRule = (instance: Instance) =>
+        new Map(
+          instance.proxies.map((rule) => [
+            rule.id,
+            rule.domains.map((domain) => domain.toLowerCase()),
+          ]),
+        );
+      const before = domainsByRule(previous);
+      const after = domainsByRule(item);
+      this.data.serverSites = this.data.serverSites.map((site) => {
+        if (site.instanceId !== item.id) return site;
+        const oldDomains = before.get(site.ruleId) ?? [];
+        const newDomains = after.get(site.ruleId) ?? [];
+        return oldDomains.join('\0') === newDomains.join('\0')
+          ? site
+          : { ...site, outOfSync: true };
+      });
+    }
     await this.persist();
   }
   async saveCertificate(item: CertificateRecord) {
     const parsed = certificateSchema.parse(item);
     this.data.certificates = [
       ...this.data.certificates.filter((certificate) => certificate.id !== parsed.id),
+      parsed,
+    ];
+    await this.persist();
+  }
+  async saveServerSite(item: ServerSite) {
+    const parsed = serverSiteSchema.parse(item);
+    this.server(parsed.serverId);
+    this.data.serverSites = [
+      ...this.data.serverSites.filter((site) => site.id !== parsed.id),
+      parsed,
+    ];
+    await this.persist();
+  }
+  async saveServerCertificate(item: ServerCertificate) {
+    const parsed = serverCertificateSchema.parse(item);
+    this.server(parsed.serverId);
+    this.data.serverCertificates = [
+      ...this.data.serverCertificates.filter((certificate) => certificate.id !== parsed.id),
       parsed,
     ];
     await this.persist();
@@ -177,6 +229,8 @@ export class Store {
       })),
       versions: this.data.versions,
       certificates: this.data.certificates,
+      serverSites: this.data.serverSites,
+      serverCertificates: this.data.serverCertificates,
       settings: this.data.settings,
       secureStorage: this.secure,
       platform: process.platform === 'win32' ? 'windows' : process.platform,
