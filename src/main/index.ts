@@ -22,6 +22,7 @@ import { Versions } from './versions';
 import { Processes, execute } from './processes';
 import { Remote, quote } from './remote';
 import { applyNginxSite, removeHttpInclude } from './server-sites';
+import { parseDiscoveredFrpsConfig } from './service-discovery';
 import {
   Certificates,
   normalizeDomains,
@@ -36,11 +37,12 @@ import {
   instanceSchema,
   settingsSchema,
   installSchema,
-  deploymentSchema,
+  terminalFavoriteSchema,
   type Result,
   type Instance,
   type Server,
   type CertificateIssueProgress,
+  type TerminalEvent,
 } from '../shared/types';
 
 const iconDirectory = path.join(__dirname, '../../assets/icons');
@@ -254,6 +256,8 @@ else {
         },
         'server:save': async (payload) => {
           const server = serverSchema.parse(payload);
+          if (store.data.servers.find((item) => item.id === server.id)?.accessMode === 'readonly')
+            throw new AppError('只读服务器不可编辑 FRP 服务端管理配置。');
           if (server.configMode === 'raw' && !server.rawConfig.trim())
             throw new AppError('高级服务端配置不能为空，请重新导入或输入配置。');
           if (remote.connected(server.id))
@@ -304,10 +308,60 @@ else {
         },
         'server:connect': (p) => remote.connect(pickId(p)),
         'server:disconnect': (p) => remote.disconnect(pickId(p)),
+        'terminal:open': async (p) => {
+          const value = z
+            .object({
+              serverId: idSchema,
+              terminalId: z.string().uuid(),
+              cols: z.number().int().min(20).max(400),
+              rows: z.number().int().min(5).max(200),
+            })
+            .parse(p);
+          if (!remote.connected(value.serverId)) await remote.connect(value.serverId);
+          return remote.openTerminal(
+            value.serverId,
+            value.terminalId,
+            value.cols,
+            value.rows,
+            (event: TerminalEvent) => {
+              if (window && !window.isDestroyed()) window.webContents.send('terminal:event', event);
+            },
+          );
+        },
+        'terminal:history': async (p) => {
+          const id = pickId(p);
+          if (!remote.connected(id))
+            throw new AppError('请先连接服务器 SSH 后再读取 shell history。');
+          return remote.shellHistory(id);
+        },
+        'terminal-favorite:save': async (p) => {
+          const favorite = terminalFavoriteSchema.parse(p);
+          favorite.updatedAt = Date.now();
+          await store.saveTerminalFavorite(favorite);
+          changed();
+          return favorite;
+        },
+        'terminal-favorite:delete': async (p) => {
+          const id = z.string().min(1).max(100).parse(p);
+          await store.deleteTerminalFavorite(id);
+          changed();
+        },
+        'terminal-favorite:reorder': async (p) => {
+          const ids = z.array(z.string().min(1).max(100)).max(1000).parse(p);
+          await store.reorderTerminalFavorites(ids);
+          changed();
+        },
         'server:detect': (p) => remote.detect(pickId(p)),
-        'server:status': (p) => remote.status(pickId(p)),
+        'server:status': (p) => {
+          const id = pickId(p);
+          if (store.server(id).accessMode === 'readonly')
+            throw new AppError('只读服务器不提供 FRP 服务端状态管理。');
+          return remote.status(id);
+        },
         'server:deploy': async (p) => {
           const { id, key } = z.object({ id: idSchema, key: z.string() }).parse(p);
+          if (store.server(id).accessMode === 'readonly')
+            throw new AppError('此服务器为只读连接，不能部署或管理 FRP 服务端。');
           if (
             !(await yes(
               '安装 FRP 服务端？',
@@ -317,9 +371,51 @@ else {
             return;
           return remote.deploy(id, key);
         },
-        'server:adopt': (p) => {
-          const value = z.object({ id: idSchema, deployment: deploymentSchema }).parse(p);
-          return remote.adopt(value.id, value.deployment);
+        'server:search-services': async (p) => {
+          const value = z
+            .object({ id: idSchema, keyword: z.string().max(100).default('') })
+            .parse(p);
+          if (!remote.connected(value.id)) throw new AppError('请先连接服务器 SSH 后再检索服务。');
+          return remote.searchFrpsServices(value.id, value.keyword);
+        },
+        'server:import-service': async (p) => {
+          const value = z
+            .object({
+              id: idSchema,
+              service: z.string().min(1).max(255),
+              manager: z.enum(['systemd', 'openrc', 'sysv', 'process']),
+              state: z.string().max(80),
+              binary: z.string().min(1).max(4096),
+              config: z.string().min(1).max(4096),
+            })
+            .parse(p);
+          const server = store.server(value.id);
+          if (server.accessMode === 'readonly') throw new AppError('此只读服务器已完成服务检索。');
+          if (server.deployment) throw new AppError('此服务器已有本机管理的部署，不能导入为只读。');
+          if (!remote.connected(value.id)) throw new AppError('请先连接服务器 SSH 后再读取配置。');
+          const matches = await remote.searchFrpsServices(value.id, value.service);
+          const candidate = matches.find(
+            (item) =>
+              item.service === value.service &&
+              item.manager === value.manager &&
+              item.binary === value.binary &&
+              item.config === value.config,
+          );
+          if (!candidate) throw new AppError('服务信息已变化或不再匹配 FRP，请重新检索。');
+          const rawConfig = await remote.readRemoteText(value.id, candidate.config);
+          const connection = parseDiscoveredFrpsConfig(rawConfig, candidate.config);
+          const securelyStored = await store.saveDiscoveredServerConfig(value.id, connection, {
+            name: candidate.service,
+            manager: candidate.manager,
+            binary: candidate.binary,
+            config: candidate.config,
+          });
+          changed();
+          return {
+            note: securelyStored
+              ? `已读取 ${connection.format.toUpperCase()} 配置并保存为只读服务器；FRP 令牌使用系统安全存储保护。`
+              : `已读取 ${connection.format.toUpperCase()} 配置并保存为只读服务器；当前系统安全存储不可用，令牌只在本次应用运行期间保留，重启后需重新检索。`,
+          };
         },
         'server:control': (p) => {
           const value = z
@@ -328,11 +424,20 @@ else {
               action: z.enum(['start', 'stop', 'restart', 'enable', 'disable']),
             })
             .parse(p);
+          if (store.server(value.id).accessMode === 'readonly')
+            throw new AppError('只读服务器不可控制 FRP 服务端。');
           return remote.control(value.id, value.action);
         },
-        'server:logs': (p) => remote.logs(pickId(p)),
+        'server:logs': (p) => {
+          const id = pickId(p);
+          if (store.server(id).accessMode === 'readonly')
+            throw new AppError('只读服务器不开放服务端日志管理。');
+          return remote.logs(id);
+        },
         'server:logs:clear': async (p) => {
           const id = pickId(p);
+          if (store.server(id).accessMode === 'readonly')
+            throw new AppError('只读服务器不开放服务端日志管理。');
           if (
             await yes(
               '清理服务端日志？',
@@ -341,9 +446,16 @@ else {
           )
             return remote.clearLogs(id);
         },
-        'server:backups': (p) => remote.backups(pickId(p)),
+        'server:backups': (p) => {
+          const id = pickId(p);
+          if (store.server(id).accessMode === 'readonly')
+            throw new AppError('只读服务器不开放备份管理。');
+          return remote.backups(id);
+        },
         'server:restore': async (p) => {
           const value = z.object({ id: idSchema, path: z.string() }).parse(p);
+          if (store.server(value.id).accessMode === 'readonly')
+            throw new AppError('只读服务器不开放备份恢复。');
           if (
             await yes(
               '恢复部署备份？',
@@ -352,9 +464,16 @@ else {
           )
             return remote.restore(value.id, value.path);
         },
-        'server:read-config': (p) => remote.readConfig(pickId(p)),
+        'server:read-config': (p) => {
+          const id = pickId(p);
+          if (store.server(id).accessMode === 'readonly')
+            throw new AppError('只读服务器配置已导入，不能作为服务端管理配置编辑。');
+          return remote.readConfig(id);
+        },
         'server:apply': async (p) => {
           const id = pickId(p);
+          if (store.server(id).accessMode === 'readonly')
+            throw new AppError('只读服务器不可修改 FRP 服务端配置。');
           if (
             !(await yes(
               '应用服务端配置？',
@@ -366,6 +485,8 @@ else {
         },
         'server:version': async (p) => {
           const value = z.object({ id: idSchema, key: z.string() }).parse(p);
+          if (store.server(value.id).accessMode === 'readonly')
+            throw new AppError('只读服务器不可替换服务端版本。');
           if (
             !(await yes(
               '替换服务端版本？',
@@ -427,6 +548,8 @@ else {
             .parse(p);
           const instance = store.instance(input.instanceId);
           const server = store.server(instance.serverId);
+          if (server.accessMode === 'readonly')
+            throw new AppError('只读服务器不可修改 Nginx 站点。');
           if (!remote.connected(server.id)) throw new AppError('请先连接目标服务器的 SSH。');
           if (instance.mode !== 'form')
             throw new AppError('高级配置实例无法自动读取 HTTP 域名，请使用表单模式。');
@@ -495,6 +618,8 @@ else {
           const { id } = z.object({ id: idSchema }).parse(p);
           const site = store.data.serverSites.find((item) => item.id === id);
           if (!site) throw new AppError('站点记录不存在。');
+          if (store.server(site.serverId).accessMode === 'readonly')
+            throw new AppError('只读服务器不可删除 Nginx 站点。');
           if (
             !(await yes(
               '删除 Nginx 站点？',
@@ -797,6 +922,34 @@ else {
             code: error instanceof AppError ? error.code : 'FAILED',
           };
         }
+      });
+      const isMainFrame = (event: Electron.IpcMainEvent) =>
+        !!window &&
+        event.sender === window.webContents &&
+        event.senderFrame === window.webContents.mainFrame;
+      ipcMain.on('terminal:input', (event, payload: unknown) => {
+        if (!isMainFrame(event)) return;
+        const value = z
+          .object({ terminalId: z.string().uuid(), data: z.string().max(262144) })
+          .safeParse(payload);
+        if (value.success) remote.writeTerminal(value.data.terminalId, value.data.data);
+      });
+      ipcMain.on('terminal:resize', (event, payload: unknown) => {
+        if (!isMainFrame(event)) return;
+        const value = z
+          .object({
+            terminalId: z.string().uuid(),
+            cols: z.number().int().min(20).max(400),
+            rows: z.number().int().min(5).max(200),
+          })
+          .safeParse(payload);
+        if (value.success)
+          remote.resizeTerminal(value.data.terminalId, value.data.cols, value.data.rows);
+      });
+      ipcMain.on('terminal:close', (event, payload: unknown) => {
+        if (!isMainFrame(event)) return;
+        const value = z.string().uuid().safeParse(payload);
+        if (value.success) remote.closeTerminal(value.data);
       });
       const opt: Electron.BrowserWindowConstructorOptions = {
         width: 1280,

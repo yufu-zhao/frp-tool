@@ -1,6 +1,6 @@
 {
-  "name": "intranet-frp-desktop",
-  "version": "0.2.1",
+  "name": "frp-desktop",
+  "version": "0.3.0",
   "private": true,
   "description": "跨平台 FRP 服务器与本机穿透管理工具",
   "main": "dist/main/index.js",
@@ -30,6 +30,8 @@
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "acme-client": "^5.4.0",
     "ssh2": "^1.16.0",
     "tar": "^7.5.0",

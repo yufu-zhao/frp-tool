@@ -21,5 +21,17 @@ const api: DesktopApi = {
     ipcRenderer.on('server-site:progress', handler);
     return () => ipcRenderer.removeListener('server-site:progress', handler);
   },
+  onTerminalEvent: (callback) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      terminalEvent: Parameters<typeof callback>[0],
+    ) => callback(terminalEvent);
+    ipcRenderer.on('terminal:event', handler);
+    return () => ipcRenderer.removeListener('terminal:event', handler);
+  },
+  terminalInput: (terminalId, data) => ipcRenderer.send('terminal:input', { terminalId, data }),
+  terminalResize: (terminalId, cols, rows) =>
+    ipcRenderer.send('terminal:resize', { terminalId, cols, rows }),
+  terminalClose: (terminalId) => ipcRenderer.send('terminal:close', terminalId),
 };
 contextBridge.exposeInMainWorld('desktop', api);

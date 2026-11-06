@@ -41,6 +41,8 @@ try {
   await page.getByRole('button', { name: '保存配置', exact: true }).click();
   await expect(page.locator('.modal')).toHaveCount(0);
   await expect(page.locator('.item strong')).toHaveText('界面验证服务器');
+  await expect(page.getByRole('heading', { name: '检索已有 FRP 服务' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '接管已有部署' })).toHaveCount(0);
   await page.locator('nav button').filter({ hasText: '客户端实例' }).click();
   await page.getByRole('button', { name: '创建第一个实例' }).click();
   await expect(page.locator('.rule-editor')).toHaveCount(1);

@@ -33,6 +33,10 @@ import {
   sysvScript,
 } from '../src/main/service-manager';
 import { insertHttpInclude, renderNginxSite, applyNginxSite } from '../src/main/server-sites';
+import {
+  parseDiscoveredFrpsConfig,
+  parseSystemdFrpsCandidate,
+} from '../src/main/service-discovery';
 
 const hostInfoOutput = `platform=Linux
 kernel=5.14.0
@@ -107,6 +111,106 @@ describe('Nginx 站点配置', () => {
     await expect(applyNginxSite(admin, '/etc/nginx/nginx.conf', site)).rejects.toThrow('回滚');
     expect(writes).toBe(2);
     expect(commands.some((command) => command.includes('cp -p'))).toBe(true);
+  });
+});
+
+describe('已有 FRP 服务检索与连接配置导入', () => {
+  it('从 TOML 配置提取 FRP 端口与令牌', () => {
+    expect(
+      parseDiscoveredFrpsConfig(
+        'bindPort = 7001\nvhostHTTPPort = 8081\nvhostHTTPSPort = 8444\n[auth]\nmethod = "token"\ntoken = "secret"\n',
+        '/opt/frps.toml',
+      ),
+    ).toEqual({ frpPort: 7001, httpPort: 8081, httpsPort: 8444, token: 'secret', format: 'toml' });
+  });
+  it('读取旧版 INI 配置并兼容默认入口端口', () => {
+    expect(
+      parseDiscoveredFrpsConfig(
+        '[common]\nbind_port = 7000\ntoken = old-secret\n',
+        '/etc/frps.ini',
+      ),
+    ).toEqual({
+      frpPort: 7000,
+      httpPort: 8080,
+      httpsPort: 8443,
+      token: 'old-secret',
+      format: 'ini',
+    });
+  });
+  it('读取 YAML 连接字段并拒绝缺失令牌', () => {
+    expect(
+      parseDiscoveredFrpsConfig(
+        'bindPort: 7002\nvhostHTTPPort: 8082\nauth:\n  method: token\n  token: yaml-secret\n',
+        '/etc/frps.yaml',
+      ),
+    ).toMatchObject({
+      frpPort: 7002,
+      httpPort: 8082,
+      httpsPort: 8443,
+      token: 'yaml-secret',
+      format: 'yaml',
+    });
+    expect(() => parseDiscoveredFrpsConfig('bindPort: 7002\n', '/etc/frps.yaml')).toThrow('令牌');
+  });
+  it('从 JSON 配置提取连接字段', () => {
+    expect(
+      parseDiscoveredFrpsConfig(
+        '{"bindPort":7003,"vhostHTTPPort":8083,"auth":{"token":"json-secret"}}',
+        '/etc/frps.json',
+      ),
+    ).toMatchObject({
+      frpPort: 7003,
+      httpPort: 8083,
+      httpsPort: 8443,
+      token: 'json-secret',
+      format: 'json',
+    });
+  });
+  it('不把非 FRP 服务误列为候选，并兼容旧 systemctl 属性输出', () => {
+    expect(
+      parseSystemdFrpsCandidate(
+        'nginx.service',
+        'ExecStart={ path=/usr/sbin/nginx ; argv[]=/usr/sbin/nginx ; }\nActiveState=active',
+      ),
+    ).toBeUndefined();
+    expect(
+      parseSystemdFrpsCandidate(
+        'intranet-frps-test.service',
+        'ExecStart={ path=/opt/frps ; argv[]=/opt/frps -c /opt/frps.toml ; }\nActiveState=active',
+      ),
+    ).toMatchObject({
+      service: 'intranet-frps-test.service',
+      manager: 'systemd',
+      binary: '/opt/frps',
+      config: '/opt/frps.toml',
+      state: 'active',
+    });
+  });
+  it('服务名搜索使用固定安全命令，并只返回匹配的 FRP 单元', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const exec = vi
+      .spyOn(remote, 'exec')
+      .mockResolvedValueOnce('intranet-frps-a.service enabled\nnginx.service enabled')
+      .mockResolvedValueOnce(
+        'ExecStart={ path=/opt/frps ; argv[]=/opt/frps -c /opt/frps.toml ; }\nActiveState=active',
+      );
+    const results = await remote.searchFrpsServices(server.id, 'frps');
+    expect(results).toHaveLength(1);
+    expect(exec.mock.calls[0][1]).toContain('list-unit-files');
+    expect(exec.mock.calls[0][1]).not.toContain('frps');
+    expect(exec.mock.calls[1][1]).toContain("'intranet-frps-a.service'");
+  });
+  it('令牌或配置端口无效时拒绝保存', () => {
+    expect(() => parseDiscoveredFrpsConfig('bindPort = 0\n', '/etc/frps.toml')).toThrow('令牌');
+    expect(() =>
+      parseDiscoveredFrpsConfig('[common]\nbind_port=70000\ntoken=x', '/etc/frps.ini'),
+    ).toThrow('端口');
   });
 });
 const rule: ProxyRule = {
@@ -708,6 +812,29 @@ describe('存储、命令与日志保护', () => {
     await reloaded.load();
     expect(reloaded.secret('server:server1:token')).toBe('');
   });
+  it('检索导入的服务器标为只读，令牌不进入可见服务器状态', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    const securelyStored = await store.saveDiscoveredServerConfig(
+      server.id,
+      { frpPort: 7001, httpPort: 8081, httpsPort: 8444, token: 'remote-token' },
+      {
+        name: 'intranet-frps-server.service',
+        manager: 'systemd',
+        binary: '/opt/frps',
+        config: '/opt/frps.toml',
+      },
+    );
+    expect(securelyStored).toBe(false);
+    expect(store.server(server.id).accessMode).toBe('readonly');
+    expect(store.server(server.id).frpPort).toBe(7001);
+    expect(store.secret('server:server1:token')).toBe('remote-token');
+    expect(store.snapshot().servers[0].token).toBeUndefined();
+    expect(
+      JSON.parse(await readFile(path.join(root, 'state.json'), 'utf8')).secrets,
+    ).not.toHaveProperty('server:server1:token');
+  });
   it('加密字段重启可恢复，普通编辑保留凭据', async () => {
     const key = randomBytes(32);
     const crypto: CryptoProvider = {
@@ -783,38 +910,6 @@ describe('存储、命令与日志保护', () => {
     expect(() => remotePath('/a\nb')).toThrow();
     expect(remotePath('/home/a b/frps')).toBe('/home/a b/frps');
   });
-  it('接管系统服务必须匹配程序与配置，不能误管其他单元', async () => {
-    const store = new Store(root, noCrypto);
-    await store.load();
-    await store.saveServer(server);
-    const remote = new Remote(
-      store,
-      async () => false,
-      () => {},
-    );
-    const exec = vi
-      .spyOn(remote, 'exec')
-      .mockResolvedValueOnce('0.71.0')
-      .mockResolvedValueOnce('')
-      .mockResolvedValueOnce(hostInfoOutput)
-      .mockResolvedValueOnce('{ path=/usr/sbin/nginx ; argv[]=/usr/sbin/nginx ; }');
-    await expect(
-      remote.adopt(server.id, {
-        binary: '/opt/frps',
-        config: '/opt/frps.toml',
-        log: '/opt/frps.log',
-        pidFile: '/opt/frps.pid',
-        mode: 'system',
-        service: 'nginx.service',
-        managed: false,
-        version: '',
-        versionKey: '',
-      }),
-    ).rejects.toThrow('不一致');
-    expect(store.server(server.id).deployment).toBeUndefined();
-    expect(exec.mock.calls.some((call) => call[1].includes('systemctl stop'))).toBe(false);
-    expect(exec.mock.calls.some((call) => call[1].includes('--value'))).toBe(false);
-  });
   it('系统日志文件缺失时回退到 systemd journal', async () => {
     const store = new Store(root, noCrypto);
     await store.load();
@@ -840,37 +935,6 @@ describe('存储、命令与日志保护', () => {
     await expect(remote.logs(server.id)).resolves.toContain('journal output');
     expect(exec.mock.calls[0][1]).toContain('if test -r');
     expect(exec.mock.calls[0][1]).toContain('journalctl -u');
-  });
-  it('兼容旧版 systemd 的 ExecStart 输出并完成 FRP 接管校验', async () => {
-    const store = new Store(root, noCrypto);
-    await store.load();
-    await store.saveServer(server);
-    const remote = new Remote(
-      store,
-      async () => false,
-      () => {},
-    );
-    const exec = vi.spyOn(remote, 'exec').mockResolvedValueOnce('0.71.0').mockResolvedValueOnce('');
-    exec
-      .mockResolvedValueOnce(hostInfoOutput)
-      .mockResolvedValueOnce(
-        'ExecStart={ path=/opt/frps ; argv[]=/opt/frps -c /opt/frps.toml ; ignore_errors=no ; }',
-      );
-    await remote.adopt(server.id, {
-      binary: '/opt/frps',
-      config: '/opt/frps.toml',
-      log: '/opt/frps.log',
-      pidFile: '/opt/frps.pid',
-      mode: 'system',
-      service: 'frps.service',
-      managed: false,
-      version: '',
-      versionKey: '',
-    });
-    expect(store.server(server.id).deployment?.service).toBe('frps.service');
-    const inspectCommand = exec.mock.calls[3][1];
-    expect(inspectCommand).toContain('systemctl show');
-    expect(inspectCommand).not.toContain('--value');
   });
   it.each([
     ['openrc', "rc-service 'intranet-test' 'start'"],

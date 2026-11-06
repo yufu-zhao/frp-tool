@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import type {
   State,
   Server,
@@ -10,9 +13,12 @@ import type {
   HostInfo,
   Runtime,
   Deployment,
+  FrpsServiceCandidate,
   InstallRequest,
   CertificateIssueProgress,
   ServerSiteProgress,
+  TerminalFavorite,
+  TerminalHistory,
 } from '../shared/types';
 import logoUrl from '../../assets/brand/logo.svg';
 import { accessAddress } from '../shared/address';
@@ -24,6 +30,7 @@ const state = ref<State>({
   certificates: [],
   serverSites: [],
   serverCertificates: [],
+  terminalFavorites: [],
   versions: [],
   settings: { proxyUrl: '' },
   secureStorage: true,
@@ -78,17 +85,22 @@ const siteProgress = ref<ServerSiteProgress>();
 const certificateProgress = ref<CertificateIssueProgress>();
 const certificateProgressHistory = ref<CertificateIssueProgress[]>([]);
 const activeCertificateTask = ref('');
-const adoption = reactive<Deployment>({
-  binary: '',
-  config: '',
-  log: '',
-  pidFile: '',
-  mode: 'process',
-  service: 'frps',
-  managed: false,
-  version: '',
-  versionKey: '',
-});
+const serviceKeyword = ref('frps');
+const serviceCandidates = ref<FrpsServiceCandidate[]>([]);
+const serviceSearchDone = ref(false);
+const terminalTabs = ref<
+  Array<{ id: string; serverId: string; title: string; history: TerminalHistory }>
+>([]);
+const activeTerminalId = ref('');
+const terminalPaneCollapsed = ref(false);
+const terminalFavoritesCollapsed = ref(false);
+const terminalHistoryCollapsed = ref(false);
+const terminalHistoryLoading = ref(false);
+const terminalHistoryNotice = ref('');
+const terminalFavoriteDraft = reactive({ id: '', name: '', command: '' });
+const terminalContextMenu = ref<{ x: number; y: number; command: string; favoriteId?: string }>();
+const terminalInstances = new Map<string, { terminal: Terminal; fit: FitAddon }>();
+let unsubscribeTerminal: (() => void) | undefined;
 let timer: ReturnType<typeof setInterval>;
 let unsubscribe: () => void;
 let unsubscribeCertificateProgress: () => void;
@@ -106,13 +118,19 @@ const certificateRules = computed(() =>
   ),
 );
 const siteRules = computed(() =>
-  state.value.instances.flatMap((item) =>
-    item.mode === 'form'
-      ? item.proxies
-          .filter((rule) => rule.type === 'http' && rule.domains.length)
-          .map((rule) => ({ instance: item, rule }))
-      : [],
-  ),
+  state.value.instances
+    .filter(
+      (item) =>
+        state.value.servers.find((server) => server.id === item.serverId)?.accessMode !==
+        'readonly',
+    )
+    .flatMap((item) =>
+      item.mode === 'form'
+        ? item.proxies
+            .filter((rule) => rule.type === 'http' && rule.domains.length)
+            .map((rule) => ({ instance: item, rule }))
+        : [],
+    ),
 );
 const linuxVersions = computed(() =>
   state.value.versions.filter(
@@ -124,8 +142,13 @@ const localVersions = computed(() =>
     (v) => v.platform === state.value.platform && v.arch === state.value.arch,
   ),
 );
+const activeTerminal = computed(() =>
+  terminalTabs.value.find((tab) => tab.id === activeTerminalId.value),
+);
+const terminalServer = (id: string) => state.value.servers.find((item) => item.id === id);
 const navIcons: Record<string, string> = {
   servers: '▤',
+  terminal: '⌘',
   clients: '⇄',
   certificates: '◇',
   sites: '⌂',
@@ -133,6 +156,7 @@ const navIcons: Record<string, string> = {
   settings: '⚙',
 };
 const modalTitles: Record<string, string> = {
+  'terminal-favorite': '快捷命令',
   server: '服务器配置',
   instance: '客户端实例配置',
   manual: '手动安装与离线导入',
@@ -140,12 +164,12 @@ const modalTitles: Record<string, string> = {
   'certificate-issue': '签发 SSL 证书',
   'certificate-progress': '证书签发进度',
   'certificate-associate': '关联 SSL 证书',
-  adopt: '接管已有部署',
   logs: '运行日志',
   backups: '部署备份',
 };
 const titles: Record<string, string> = {
   servers: '服务器',
+  terminal: '终端',
   clients: '客户端实例',
   certificates: 'SSL 证书',
   sites: '服务器站点',
@@ -153,7 +177,8 @@ const titles: Record<string, string> = {
   settings: '设置与帮助',
 };
 const descriptions: Record<string, string> = {
-  servers: '连接你的 Linux 服务器，部署或接管 FRP 服务。',
+  servers: '连接服务器、检索已有 FRP 服务，或部署并管理服务端。',
+  terminal: '通过 SSH 连接已添加的服务器，管理多个独立终端会话。',
   clients: '将本机服务分享出去，多套配置可以同时运行。',
   certificates: '在本机导入或签发证书，并关联到 HTTPS 客户端规则。',
   sites: '通过 SSH 管理 Nginx 站点和服务器端证书。',
@@ -219,6 +244,26 @@ async function createServerSite() {
     siteMainConfig.value = '';
   }
 }
+async function searchFrpsServices() {
+  if (!server.value) return;
+  const result = await act('server:search-services', {
+    id: server.value.id,
+    keyword: serviceKeyword.value,
+  });
+  if (Array.isArray(result)) {
+    serviceCandidates.value = result;
+    serviceSearchDone.value = true;
+  }
+}
+async function importFrpsService(candidate: FrpsServiceCandidate) {
+  if (!server.value) return;
+  await act(
+    'server:import-service',
+    { id: server.value.id, ...candidate },
+    'FRP 服务连接信息已保存为只读服务器。',
+  );
+  if (!error.value) serviceCandidates.value = [];
+}
 function newServer() {
   hostInfo.value = undefined;
   serverDraft.value = {
@@ -233,6 +278,7 @@ function newServer() {
     frpPort: 7000,
     httpPort: 8080,
     httpsPort: 8443,
+    accessMode: 'managed',
     configMode: 'form',
     rawConfig: '',
     rawFormat: 'toml',
@@ -627,6 +673,8 @@ function selectServer(id: string) {
   selectedServer.value = id;
   hostInfo.value = undefined;
   versionChoice.value = '';
+  serviceCandidates.value = [];
+  serviceSearchDone.value = false;
   if (runtime.value.ssh[id] === 'connected') void detectServer();
 }
 async function disconnectServer() {
@@ -713,6 +761,169 @@ function formatTime(value: string) {
 function instanceServer(i: Instance) {
   return state.value.servers.find((s) => s.id === i.serverId);
 }
+// 创建标签后再挂载 xterm，避免 SSH 输出落到尚未初始化的视图。
+async function openTerminalForServer(serverId: string) {
+  if (!terminalServer(serverId)) return;
+  const id = uid();
+  const terminalTab = {
+    id,
+    serverId,
+    title: `${terminalServer(serverId)?.name ?? '服务器'} · ${terminalTabs.value.filter((tab) => tab.serverId === serverId).length + 1}`,
+    history: { shell: 'unknown', commands: [], available: false } as TerminalHistory,
+  };
+  terminalTabs.value.push(terminalTab);
+  activeTerminalId.value = id;
+  page.value = 'terminal';
+  await nextTick();
+  const host = document.querySelector<HTMLElement>(`[data-terminal-screen="${id}"]`);
+  if (!host) return;
+  const terminal = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'Menlo, Monaco, "Cascadia Code", monospace',
+    fontSize: 13,
+    convertEol: false,
+    scrollback: 5000,
+    theme: { background: '#101827', foreground: '#d8e1f0', cursor: '#8db4ff' },
+  });
+  const fit = new FitAddon();
+  terminal.loadAddon(fit);
+  terminal.open(host);
+  terminalInstances.set(id, { terminal, fit });
+  terminal.onData((data) => api?.terminalInput(id, data));
+  fit.fit();
+  terminal.focus();
+  try {
+    await rpc('terminal:open', {
+      serverId,
+      terminalId: id,
+      cols: terminal.cols,
+      rows: terminal.rows,
+    });
+    terminalResize(id);
+    await loadTerminalHistory(id);
+  } catch (e) {
+    terminal.writeln(`\r\n\x1b[31m连接失败：${(e as Error).message}\x1b[0m`);
+  }
+}
+function terminalResize(id: string) {
+  const instance = terminalInstances.get(id);
+  if (!instance || activeTerminalId.value !== id) return;
+  try {
+    instance.fit.fit();
+    api?.terminalResize(id, instance.terminal.cols, instance.terminal.rows);
+  } catch {
+    // 标签尚未布局完成时忽略尺寸同步，显示后会再次适配。
+  }
+}
+async function selectTerminal(id: string) {
+  activeTerminalId.value = id;
+  await nextTick();
+  terminalResize(id);
+  terminalInstances.get(id)?.terminal.focus();
+  await loadTerminalHistory(id);
+}
+// 切换标签时读取服务器持久化 history；当前 shell 的未落盘命令不会被伪造补入。
+async function loadTerminalHistory(id: string) {
+  const tab = terminalTabs.value.find((item) => item.id === id);
+  if (!tab) return;
+  terminalHistoryLoading.value = true;
+  terminalHistoryNotice.value = '';
+  try {
+    tab.history = await rpc<TerminalHistory>('terminal:history', tab.serverId);
+    if (tab.history.available && !tab.history.commands.length)
+      terminalHistoryNotice.value =
+        '服务器 history 文件中暂无已保存命令；当前 shell 的新命令可能要等退出后才写入。';
+    else if (!tab.history.available)
+      terminalHistoryNotice.value = `未找到可读取的 ${tab.history.shell} history 文件。`;
+  } catch (e) {
+    terminalHistoryNotice.value = (e as Error).message;
+  } finally {
+    terminalHistoryLoading.value = false;
+  }
+}
+function runTerminalCommand(command: string) {
+  if (!activeTerminalId.value || !terminalInstances.has(activeTerminalId.value)) {
+    error.value = '请先打开一个终端标签。';
+    return;
+  }
+  api?.terminalInput(activeTerminalId.value, `${command}\r`);
+  terminalInstances.get(activeTerminalId.value)?.terminal.focus();
+}
+function closeTerminalTab(id: string) {
+  api?.terminalClose(id);
+  const instance = terminalInstances.get(id);
+  instance?.terminal.dispose();
+  terminalInstances.delete(id);
+  terminalTabs.value = terminalTabs.value.filter((tab) => tab.id !== id);
+  if (activeTerminalId.value === id) {
+    const next = terminalTabs.value.at(-1);
+    activeTerminalId.value = next?.id ?? '';
+    if (next) void selectTerminal(next.id);
+  }
+}
+function addTerminalFavorite(command: string) {
+  if (state.value.terminalFavorites.some((item) => item.command === command)) return;
+  Object.assign(terminalFavoriteDraft, {
+    id: uid(),
+    name: command.trim().split(/\s+/).slice(0, 4).join(' ').slice(0, 100) || '快捷命令',
+    command,
+  });
+  modal.value = 'terminal-favorite';
+  terminalContextMenu.value = undefined;
+}
+function showTerminalContextMenu(event: MouseEvent, command: string, favoriteId?: string) {
+  const width = 210;
+  const height = favoriteId ? 140 : 100;
+  terminalContextMenu.value = {
+    x: Math.min(event.clientX, window.innerWidth - width - 12),
+    y: Math.min(event.clientY, window.innerHeight - height - 12),
+    command,
+    favoriteId,
+  };
+}
+function editTerminalFavorite(item?: TerminalFavorite) {
+  if (!item) return;
+  Object.assign(terminalFavoriteDraft, { id: item.id, name: item.name, command: item.command });
+  modal.value = 'terminal-favorite';
+}
+function navigatePage(target: string) {
+  page.value = target;
+  if (target === 'terminal' && activeTerminalId.value) {
+    void nextTick(() => {
+      terminalResize(activeTerminalId.value);
+      terminalInstances.get(activeTerminalId.value)?.terminal.focus();
+    });
+  }
+}
+async function saveTerminalFavorite() {
+  const current = state.value.terminalFavorites.find(
+    (item) => item.id === terminalFavoriteDraft.id,
+  );
+  await act(
+    'terminal-favorite:save',
+    {
+      ...terminalFavoriteDraft,
+      order: current?.order ?? state.value.terminalFavorites.length,
+      updatedAt: Date.now(),
+    },
+    '快捷命令已保存。',
+  );
+  if (!error.value) modal.value = '';
+}
+async function removeTerminalFavorite(id: string) {
+  await act('terminal-favorite:delete', id, '快捷命令已删除。');
+}
+async function moveTerminalFavorite(id: string, offset: number) {
+  const ordered = [...state.value.terminalFavorites].sort((a, b) => a.order - b.order);
+  const index = ordered.findIndex((item) => item.id === id);
+  const target = index + offset;
+  if (index < 0 || target < 0 || target >= ordered.length) return;
+  [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+  await act(
+    'terminal-favorite:reorder',
+    ordered.map((item) => item.id),
+  );
+}
 function clientStatus(id: string) {
   return runtime.value.clients[id]?.status ?? 'stopped';
 }
@@ -732,6 +943,15 @@ function statusLabel(value: string) {
   );
 }
 onMounted(async () => {
+  unsubscribeTerminal = api?.onTerminalEvent((event) => {
+    const terminal = terminalInstances.get(event.terminalId)?.terminal;
+    if (!terminal) return;
+    if (event.type === 'data' && event.data) terminal.write(event.data);
+    else if (event.type === 'error')
+      terminal.writeln(`\r\n\x1b[31m终端错误：${event.message ?? '连接异常'}\x1b[0m`);
+    else if (event.type === 'closed') terminal.writeln('\r\n[SSH 终端已关闭]');
+  });
+  window.addEventListener('resize', resizeActiveTerminal);
   unsubscribeCertificateProgress = api?.onCertificateProgress(updateCertificateProgress);
   unsubscribeServerSiteProgress = api?.onServerSiteProgress((progress) => {
     siteProgress.value = progress;
@@ -758,7 +978,12 @@ onUnmounted(() => {
   unsubscribe?.();
   unsubscribeCertificateProgress?.();
   unsubscribeServerSiteProgress?.();
+  unsubscribeTerminal?.();
+  window.removeEventListener('resize', resizeActiveTerminal);
 });
+function resizeActiveTerminal() {
+  if (activeTerminalId.value) terminalResize(activeTerminalId.value);
+}
 </script>
 
 <template>
@@ -774,7 +999,7 @@ onUnmounted(() => {
           v-for="(title, key) in titles"
           :key="key"
           :class="{ active: page === key }"
-          @click="page = key"
+          @click="navigatePage(key)"
         >
           <span>{{ navIcons[key] }}</span
           >{{ title }}<b v-if="key === 'servers'">{{ state.servers.length }}</b
@@ -853,7 +1078,7 @@ onUnmounted(() => {
         <div v-if="!state.servers.length" class="empty">
           <div class="empty-icon">▤</div>
           <h3>从一台服务器开始</h3>
-          <p>支持 SSH 密码或密钥登录，可安装新服务，也能接管已有 FRP。</p>
+          <p>支持 SSH 密码或密钥登录，可部署 FRP 服务端，或检索已有服务并保存只读连接。</p>
           <button class="primary" @click="newServer">添加第一台服务器</button>
         </div>
         <div v-else class="split">
@@ -870,9 +1095,11 @@ onUnmounted(() => {
               ><span class="badge" :class="runtime.ssh[s.id]"
                 >SSH {{ statusLabel(runtime.ssh[s.id] ?? 'disconnected') }}</span
               ><small>{{
-                s.deployment
-                  ? `FRP ${s.deployment.version} · ${s.deployment.mode}`
-                  : '尚未部署或接管'
+                s.accessMode === 'readonly'
+                  ? `只读 FRP · ${s.discoveredService?.name ?? '已检索'}`
+                  : s.deployment
+                    ? `FRP ${s.deployment.version} · ${s.deployment.mode}`
+                    : '尚未部署服务端'
               }}</small>
             </button>
           </div>
@@ -882,9 +1109,17 @@ onUnmounted(() => {
                 <h2>{{ server.name }}</h2>
                 <p>{{ server.username }}@{{ server.host }}:{{ server.sshPort }}</p>
               </div>
-              <button class="secondary" :disabled="busy" @click="editServer">编辑配置</button>
+              <button
+                v-if="server.accessMode !== 'readonly'"
+                class="secondary"
+                :disabled="busy"
+                @click="editServer"
+              >
+                编辑配置</button
+              ><span v-else class="badge">只读连接</span>
             </div>
             <div class="actions">
+              <button class="secondary" @click="openTerminalForServer(server.id)">打开终端</button>
               <button
                 class="primary"
                 :disabled="busy || runtime.ssh[server.id] === 'connected'"
@@ -932,126 +1167,186 @@ onUnmounted(() => {
               </details>
             </div>
             <hr />
-            <h3>服务端部署</h3>
-            <template v-if="!server.deployment"
-              ><p class="muted">先在版本库安装 Linux 包，再选择部署。已有服务可指定路径接管。</p>
-              <div class="inline-fields">
-                <select v-model="versionChoice">
-                  <option value="">选择 Linux 安装包</option>
-                  <option v-for="v in linuxVersions" :key="v.key" :value="v.key">
-                    {{ versionLabel(v) }}
-                  </option>
-                </select>
-                <button
-                  class="primary"
-                  :disabled="
-                    busy ||
-                    !versionChoice ||
-                    !hostInfo?.supported ||
-                    runtime.ssh[server.id] !== 'connected'
-                  "
-                  @click="act('server:deploy', { id: server.id, key: versionChoice })"
-                >
-                  安装服务端
-                </button>
-                <button
-                  class="secondary"
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected' || !hostInfo?.supported"
-                  @click="modal = 'adopt'"
-                >
-                  接管已有部署
-                </button>
-              </div>
-            </template>
-            <template v-else
-              ><div class="deployment-meta">
-                <span class="badge connected">FRP {{ server.deployment.version }}</span
-                ><span
-                  class="badge"
-                  :title="runtime.serviceErrors?.[server.id] || ''"
-                  :class="
-                    ['active', 'running'].includes(runtime.services?.[server.id]) ? 'connected' : ''
-                  "
-                  >服务 {{ serviceLabel(server.id) }}</span
-                ><small v-if="runtime.serviceErrors?.[server.id]" class="muted">
-                  {{ runtime.serviceErrors[server.id] }} </small
-                ><span
-                  >{{ deploymentLabel(server.deployment) }} ·
-                  {{ server.deployment.managed ? '工具安装' : '接管部署' }}</span
-                >
+            <template v-if="server.accessMode === 'readonly'">
+              <h3>FRP 只读连接</h3>
+              <div class="notice warning">
+                已从服务器服务配置导入连接参数。此记录仅供客户端实例连接，不会启停、修改或卸载服务器上的服务。
               </div>
               <div class="path-info">
-                程序：{{ server.deployment.binary }}<br />配置：{{ server.deployment.config }}
+                服务：{{ server.discoveredService?.name }}（{{
+                  server.discoveredService?.manager
+                }}）<br />
+                程序：{{ server.discoveredService?.binary }}<br />
+                配置：{{ server.discoveredService?.config }}<br />
+                FRP 端口：{{ server.frpPort }} · HTTP 入口：{{ server.httpPort }} · HTTPS 入口：{{
+                  server.httpsPort
+                }}
               </div>
-              <div class="actions">
-                <button
-                  v-for="(label, action) in { start: '启动', stop: '停止', restart: '重启' }"
-                  :key="action"
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="act('server:control', { id: server.id, action })"
-                >
-                  {{ label }}</button
-                ><button
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="act('server:status', server.id)"
-                >
-                  查看服务状态</button
-                ><button
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="loadLogs('server')"
-                >
-                  查看日志
-                </button>
-              </div>
-              <div class="actions">
-                <button
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="act('server:apply', server.id)"
-                >
-                  应用已保存配置</button
-                ><button
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="readRemoteConfig"
-                >
-                  读取远程配置</button
-                ><button
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="loadBackups"
-                >
-                  查看 / 恢复备份</button
-                ><button
-                  v-if="
-                    (server.deployment.manager ??
-                      (server.deployment.mode === 'process' ? 'process' : 'systemd')) !== 'process'
-                  "
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="act('server:control', { id: server.id, action: 'enable' })"
-                >
-                  开启开机启动</button
-                ><button
-                  v-if="
-                    (server.deployment.manager ??
-                      (server.deployment.mode === 'process' ? 'process' : 'systemd')) !== 'process'
-                  "
-                  :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                  @click="act('server:control', { id: server.id, action: 'disable' })"
-                >
-                  关闭开机启动
-                </button>
-              </div>
-              <div class="inline-fields">
-                <select v-model="versionChoice">
-                  <option value="">选择替换版本</option>
-                  <option v-for="v in linuxVersions" :key="v.key" :value="v.key">
-                    {{ versionLabel(v) }}
-                  </option></select
-                ><button
-                  :disabled="busy || !versionChoice || runtime.ssh[server.id] !== 'connected'"
-                  @click="act('server:version', { id: server.id, key: versionChoice })"
-                >
-                  停止后切换版本
-                </button>
-              </div>
+            </template>
+            <template v-else>
+              <h3>服务端部署</h3>
+              <template v-if="!server.deployment"
+                ><p class="muted">
+                  已安装 FRP 服务可先检索并导入为只读连接；新服务请从版本库安装对应 Linux 包后部署。
+                </p>
+                <section class="panel compact-panel">
+                  <h4>检索已有 FRP 服务</h4>
+                  <p class="muted">
+                    默认扫描应用命名的 FRP 服务和运行进程，也可输入服务名关键词筛选。
+                  </p>
+                  <div class="inline-fields">
+                    <input v-model="serviceKeyword" placeholder="服务名关键词，如 intranet-frps" />
+                    <button
+                      class="secondary"
+                      :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                      @click="searchFrpsServices"
+                    >
+                      检索服务
+                    </button>
+                  </div>
+                  <div v-if="serviceCandidates.length" class="candidate-list">
+                    <article
+                      v-for="candidate in serviceCandidates"
+                      :key="`${candidate.manager}:${candidate.service}`"
+                      class="record-card"
+                    >
+                      <div>
+                        <strong
+                          >{{ candidate.service }} · {{ candidate.manager }} ·
+                          {{ candidate.state }}</strong
+                        >
+                        <small>程序：{{ candidate.binary }}</small>
+                        <small>配置：{{ candidate.config }}</small>
+                      </div>
+                      <button
+                        class="primary"
+                        :disabled="busy"
+                        @click="importFrpsService(candidate)"
+                      >
+                        读取配置并保存只读连接
+                      </button>
+                    </article>
+                  </div>
+                  <p v-else-if="serviceSearchDone" class="hint">
+                    没有找到匹配的 FRP 服务。检查服务名关键词、SSH
+                    账号的服务可见权限，或确认服务正在以 FRP 服务端程序运行。
+                  </p>
+                </section>
+                <div class="inline-fields">
+                  <select v-model="versionChoice">
+                    <option value="">选择 Linux 安装包</option>
+                    <option v-for="v in linuxVersions" :key="v.key" :value="v.key">
+                      {{ versionLabel(v) }}
+                    </option>
+                  </select>
+                  <button
+                    class="primary"
+                    :disabled="
+                      busy ||
+                      !versionChoice ||
+                      !hostInfo?.supported ||
+                      runtime.ssh[server.id] !== 'connected'
+                    "
+                    @click="act('server:deploy', { id: server.id, key: versionChoice })"
+                  >
+                    安装服务端
+                  </button>
+                </div>
+              </template>
+              <template v-else
+                ><div class="deployment-meta">
+                  <span class="badge connected">FRP {{ server.deployment.version }}</span
+                  ><span
+                    class="badge"
+                    :title="runtime.serviceErrors?.[server.id] || ''"
+                    :class="
+                      ['active', 'running'].includes(runtime.services?.[server.id])
+                        ? 'connected'
+                        : ''
+                    "
+                    >服务 {{ serviceLabel(server.id) }}</span
+                  ><small v-if="runtime.serviceErrors?.[server.id]" class="muted">
+                    {{ runtime.serviceErrors[server.id] }} </small
+                  ><span
+                    >{{ deploymentLabel(server.deployment) }} ·
+                    {{ server.deployment.managed ? '工具安装' : '外部服务记录' }}</span
+                  >
+                </div>
+                <div class="path-info">
+                  程序：{{ server.deployment.binary }}<br />配置：{{ server.deployment.config }}
+                </div>
+                <div class="actions">
+                  <button
+                    v-for="(label, action) in { start: '启动', stop: '停止', restart: '重启' }"
+                    :key="action"
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="act('server:control', { id: server.id, action })"
+                  >
+                    {{ label }}</button
+                  ><button
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="act('server:status', server.id)"
+                  >
+                    查看服务状态</button
+                  ><button
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="loadLogs('server')"
+                  >
+                    查看日志
+                  </button>
+                </div>
+                <div class="actions">
+                  <button
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="act('server:apply', server.id)"
+                  >
+                    应用已保存配置</button
+                  ><button
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="readRemoteConfig"
+                  >
+                    读取远程配置</button
+                  ><button
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="loadBackups"
+                  >
+                    查看 / 恢复备份</button
+                  ><button
+                    v-if="
+                      (server.deployment.manager ??
+                        (server.deployment.mode === 'process' ? 'process' : 'systemd')) !==
+                      'process'
+                    "
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="act('server:control', { id: server.id, action: 'enable' })"
+                  >
+                    开启开机启动</button
+                  ><button
+                    v-if="
+                      (server.deployment.manager ??
+                        (server.deployment.mode === 'process' ? 'process' : 'systemd')) !==
+                      'process'
+                    "
+                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    @click="act('server:control', { id: server.id, action: 'disable' })"
+                  >
+                    关闭开机启动
+                  </button>
+                </div>
+                <div class="inline-fields">
+                  <select v-model="versionChoice">
+                    <option value="">选择替换版本</option>
+                    <option v-for="v in linuxVersions" :key="v.key" :value="v.key">
+                      {{ versionLabel(v) }}
+                    </option></select
+                  ><button
+                    :disabled="busy || !versionChoice || runtime.ssh[server.id] !== 'connected'"
+                    @click="act('server:version', { id: server.id, key: versionChoice })"
+                  >
+                    停止后切换版本
+                  </button>
+                </div>
+              </template>
             </template>
             <div class="actions">
               <button
@@ -1061,7 +1356,7 @@ onUnmounted(() => {
                   act('server:uninstall', { id: server.id, removeRemote: !!server.deployment })
                 "
               >
-                卸载
+                {{ server.accessMode === 'readonly' ? '移除只读配置' : '卸载' }}
               </button>
             </div>
             <div class="hint">
@@ -1437,6 +1732,218 @@ onUnmounted(() => {
         </section>
       </template>
 
+      <section
+        v-show="page === 'terminal'"
+        class="terminal-workspace"
+        @click="terminalContextMenu = undefined"
+      >
+        <div class="terminal-toolbar">
+          <div class="terminal-tabs" role="tablist" aria-label="终端标签">
+            <button
+              v-for="tab in terminalTabs"
+              :key="tab.id"
+              class="terminal-tab"
+              :class="{ active: activeTerminalId === tab.id }"
+              role="tab"
+              :aria-selected="activeTerminalId === tab.id"
+              @click="selectTerminal(tab.id)"
+            >
+              {{ tab.title
+              }}<span @click.stop="closeTerminalTab(tab.id)" aria-label="关闭终端">×</span>
+            </button>
+          </div>
+          <div class="inline-fields">
+            <select v-model="selectedServer" aria-label="选择服务器">
+              <option value="">选择服务器</option>
+              <option v-for="item in state.servers" :key="item.id" :value="item.id">
+                {{ item.name }} · {{ item.host }}
+              </option>
+            </select>
+            <button
+              class="primary"
+              :disabled="!selectedServer"
+              @click="openTerminalForServer(selectedServer)"
+            >
+              ＋ 新终端
+            </button>
+          </div>
+        </div>
+        <div v-if="!state.servers.length" class="empty">
+          <h3>先添加一台服务器</h3>
+          <p>终端使用已保存的 SSH 配置和主机指纹校验。</p>
+          <button
+            class="primary"
+            @click="
+              page = 'servers';
+              newServer();
+            "
+          >
+            添加服务器
+          </button>
+        </div>
+        <div v-else-if="!terminalTabs.length" class="empty terminal-empty">
+          <h3>打开一个 SSH 终端</h3>
+          <p>每个标签对应独立的 SSH shell 会话；关闭标签会结束该会话。</p>
+          <button
+            class="primary"
+            :disabled="!selectedServer"
+            @click="openTerminalForServer(selectedServer)"
+          >
+            连接所选服务器
+          </button>
+        </div>
+        <div v-else class="terminal-layout" :class="{ collapsed: terminalPaneCollapsed }">
+          <aside class="terminal-shortcuts">
+            <div class="shortcut-header">
+              <strong>快捷命令</strong>
+              <button @click="terminalPaneCollapsed = !terminalPaneCollapsed">
+                {{ terminalPaneCollapsed ? '展开' : '收起' }}
+              </button>
+            </div>
+            <template v-if="!terminalPaneCollapsed">
+              <div class="shortcut-section">
+                <button
+                  class="shortcut-heading"
+                  @click="terminalFavoritesCollapsed = !terminalFavoritesCollapsed"
+                >
+                  常用 <span>{{ terminalFavoritesCollapsed ? '＋' : '−' }}</span>
+                </button>
+                <div v-if="!terminalFavoritesCollapsed" class="shortcut-list">
+                  <div v-if="!state.terminalFavorites.length" class="shortcut-empty">
+                    还没有常用命令
+                  </div>
+                  <div
+                    v-for="(favorite, index) in [...state.terminalFavorites].sort(
+                      (a, b) => a.order - b.order,
+                    )"
+                    :key="favorite.id"
+                    class="shortcut-row"
+                    @dblclick="runTerminalCommand(favorite.command)"
+                    @contextmenu.prevent="
+                      showTerminalContextMenu($event, favorite.command, favorite.id)
+                    "
+                    :title="favorite.command"
+                  >
+                    <button class="shortcut-command" @click="runTerminalCommand(favorite.command)">
+                      {{ favorite.name }}
+                    </button>
+                    <div class="shortcut-actions">
+                      <button
+                        :disabled="index === 0"
+                        title="上移"
+                        @click="moveTerminalFavorite(favorite.id, -1)"
+                      >
+                        ↑
+                      </button>
+                      <button
+                        :disabled="index === state.terminalFavorites.length - 1"
+                        title="下移"
+                        @click="moveTerminalFavorite(favorite.id, 1)"
+                      >
+                        ↓
+                      </button>
+                      <button title="重命名或编辑" @click="editTerminalFavorite(favorite)">
+                        ✎
+                      </button>
+                      <button title="删除" @click="removeTerminalFavorite(favorite.id)">×</button>
+                    </div>
+                  </div>
+                  <button class="add-favorite" @click="addTerminalFavorite('')">
+                    ＋ 添加常用命令
+                  </button>
+                </div>
+              </div>
+              <div class="shortcut-section history-section">
+                <button
+                  class="shortcut-heading"
+                  @click="terminalHistoryCollapsed = !terminalHistoryCollapsed"
+                >
+                  记录 <span>{{ terminalHistoryCollapsed ? '＋' : '−' }}</span>
+                </button>
+                <div v-if="!terminalHistoryCollapsed" class="shortcut-list">
+                  <div v-if="terminalHistoryLoading" class="shortcut-empty">
+                    正在读取服务器 history…
+                  </div>
+                  <div v-else-if="terminalHistoryNotice" class="shortcut-empty">
+                    {{ terminalHistoryNotice }}
+                  </div>
+                  <div
+                    v-for="(command, index) in activeTerminal?.history.commands ?? []"
+                    :key="`${index}-${command}`"
+                    class="history-command"
+                    :title="command"
+                    @dblclick="runTerminalCommand(command)"
+                    @contextmenu.prevent="showTerminalContextMenu($event, command)"
+                  >
+                    {{ command }}
+                  </div>
+                  <div v-if="activeTerminal?.history.commands.length" class="shortcut-footnote">
+                    双击执行 · 右键添加到常用
+                  </div>
+                </div>
+              </div>
+            </template>
+          </aside>
+          <div class="terminal-main">
+            <div
+              v-for="tab in terminalTabs"
+              :key="tab.id"
+              v-show="activeTerminalId === tab.id"
+              :data-terminal-screen="tab.id"
+              class="terminal-screen"
+            ></div>
+          </div>
+        </div>
+        <div
+          v-if="terminalContextMenu"
+          class="terminal-context-menu"
+          :style="{ left: `${terminalContextMenu.x}px`, top: `${terminalContextMenu.y}px` }"
+          @click.stop
+        >
+          <button
+            @click="
+              runTerminalCommand(terminalContextMenu.command);
+              terminalContextMenu = undefined;
+            "
+          >
+            在当前终端执行
+          </button>
+          <button
+            v-if="!terminalContextMenu.favoriteId"
+            @click="addTerminalFavorite(terminalContextMenu.command)"
+          >
+            添加到常用
+          </button>
+          <template v-else>
+            <button
+              @click="
+                editTerminalFavorite(
+                  state.terminalFavorites.find(
+                    (item) => item.id === terminalContextMenu?.favoriteId,
+                  ),
+                );
+                terminalContextMenu = undefined;
+              "
+            >
+              编辑 / 重命名
+            </button>
+            <button
+              class="danger-link"
+              @click="
+                removeTerminalFavorite(terminalContextMenu.favoriteId!);
+                terminalContextMenu = undefined;
+              "
+            >
+              删除
+            </button>
+          </template>
+        </div>
+        <p v-if="terminalTabs.length" class="terminal-history-hint">
+          记录读取服务器登录用户的 shell history 文件；多数 shell
+          会在退出时写入新命令，因此刚执行的命令可能暂时不显示。
+        </p>
+      </section>
+
       <template v-if="page === 'settings'">
         <section class="panel narrow">
           <h2>下载网络</h2>
@@ -1522,6 +2029,29 @@ onUnmounted(() => {
           <button :disabled="busy" @click="modal = ''">×</button>
         </div>
         <div v-if="error" class="notice error">{{ error }}</div>
+        <form v-if="modal === 'terminal-favorite'" @submit.prevent="saveTerminalFavorite">
+          <label
+            >显示名称<input
+              v-model="terminalFavoriteDraft.name"
+              required
+              maxlength="100"
+              placeholder="例如：查看磁盘空间"
+          /></label>
+          <label
+            >命令<textarea
+              v-model="terminalFavoriteDraft.command"
+              required
+              maxlength="8192"
+              rows="5"
+              placeholder="df -h"
+            />
+          </label>
+          <p class="hint">命令会发送到当前选中的服务器终端执行，请确认内容安全后再运行。</p>
+          <div class="modal-actions">
+            <button type="button" @click="modal = ''">取消</button
+            ><button class="primary" type="submit">保存</button>
+          </div>
+        </form>
         <section
           v-if="modal === 'certificate-progress' && certificateProgress"
           class="issue-progress"
@@ -2012,51 +2542,6 @@ onUnmounted(() => {
             ><button class="primary" :disabled="busy || !certificateTargets.length">
               关联所选规则
             </button>
-          </div>
-        </form>
-        <form
-          v-if="modal === 'adopt'"
-          @submit.prevent="
-            act('server:adopt', { id: selectedServer, deployment: adoption }).then(() => {
-              if (!error) modal = '';
-            })
-          "
-        >
-          <div class="form-grid">
-            <label class="full"
-              >程序绝对路径<input
-                v-model="adoption.binary"
-                required
-                placeholder="/opt/frp/frps" /></label
-            ><label class="full"
-              >配置绝对路径<input
-                v-model="adoption.config"
-                required
-                placeholder="/opt/frp/frps.toml" /></label
-            ><label
-              >服务名称<input
-                v-model="adoption.service"
-                required
-                placeholder="systemd 服务或 init 脚本名" /></label
-            ><label class="full"
-              >日志绝对路径<input
-                v-model="adoption.log"
-                required
-                placeholder="/opt/frp/frps.log" /></label
-            ><label class="full"
-              >PID 文件绝对路径<input
-                v-model="adoption.pidFile"
-                required
-                placeholder="后台进程模式需保存对应进程 PID"
-            /></label>
-          </div>
-          <p class="hint">
-            接管先检测程序、配置和服务。后台进程会检测匹配的运行实例并补记
-            PID，仅操作二进制与配置都匹配的进程；接管默认保留文件。
-          </p>
-          <div class="modal-actions">
-            <button type="button" @click="modal = ''">取消</button
-            ><button class="primary" :disabled="busy">检测并接管</button>
           </div>
         </form>
         <template v-if="modal === 'backups'"

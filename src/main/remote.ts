@@ -1,13 +1,22 @@
-import { Client, type SFTPWrapper } from 'ssh2';
+import { Client, type ClientChannel, type SFTPWrapper } from 'ssh2';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
 import { Store } from './store';
 import { AppError, redact } from '../shared/errors';
-import { type Server, type Deployment, type HostInfo } from '../shared/types';
+import {
+  type Server,
+  type Deployment,
+  type HostInfo,
+  type FrpsServiceCandidate,
+  type TerminalEvent,
+  type TerminalHistory,
+} from '../shared/types';
 import { serverConfig, frpAdapter } from './frp';
 import { hostInfoCommand, parseHostInfo } from './host-info';
 import { deploymentManager, openrcScript, selectServiceMode, sysvScript } from './service-manager';
+import { parseShellHistory, parseSystemdFrpsCandidate } from './service-discovery';
 
 // 所有远程命令参数都按 POSIX shell 单引号规则转义。
 export const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -46,6 +55,7 @@ export function parseSystemdState(output: string): string | undefined {
 
 export class Remote {
   private connections = new Map<string, Client>();
+  private terminals = new Map<string, { serverId: string; stream: ClientChannel }>();
   private serviceStates = new Map<string, { value: string; at: number; message?: string }>();
   private rootUsers = new Set<string>();
   private connecting = new Set<string>();
@@ -119,10 +129,12 @@ export class Remote {
       else this.rootUsers.delete(id);
       client.on('error', () => {
         if (this.connections.get(id) === client) this.connections.delete(id);
+        this.closeServerTerminals(id);
         this.changed();
       });
       client.on('close', () => {
         if (this.connections.get(id) === client) this.connections.delete(id);
+        this.closeServerTerminals(id);
         this.changed();
       });
       return await this.detect(id);
@@ -169,13 +181,93 @@ export class Remote {
   }
   disconnect(id: string) {
     if (this.busy.has(id)) throw new AppError('服务器正在执行操作，请完成后断开。');
+    this.closeServerTerminals(id);
     this.connections.get(id)?.end();
     this.connections.delete(id);
     this.changed();
   }
   closeAll() {
+    for (const terminalId of this.terminals.keys()) this.closeTerminal(terminalId);
     for (const client of this.connections.values()) client.end();
     this.connections.clear();
+  }
+  // 每个界面标签对应独立 SSH PTY 通道，输入输出不会与其他 shell 混用。
+  async openTerminal(
+    serverId: string,
+    terminalId: string,
+    cols: number,
+    rows: number,
+    notify: (event: TerminalEvent) => void,
+  ) {
+    if (this.terminals.has(terminalId)) throw new AppError('终端标签标识已存在。');
+    const client = this.connection(serverId);
+    const stream = await new Promise<ClientChannel>((resolve, reject) => {
+      client.shell({ term: 'xterm-256color', cols, rows }, (error, channel) => {
+        if (error) reject(error);
+        else resolve(channel);
+      });
+    });
+    this.terminals.set(terminalId, { serverId, stream });
+    const decoder = new StringDecoder('utf8');
+    stream.on('data', (data: Buffer) =>
+      notify({ terminalId, type: 'data', data: decoder.write(data) }),
+    );
+    stream.on('close', () => {
+      const remainder = decoder.end();
+      if (remainder) notify({ terminalId, type: 'data', data: remainder });
+      this.terminals.delete(terminalId);
+      notify({ terminalId, type: 'closed' });
+    });
+    stream.on('error', (error: Error) =>
+      notify({
+        terminalId,
+        type: 'error',
+        message: redact(error.message, this.store.allSecrets()),
+      }),
+    );
+    return { terminalId };
+  }
+  writeTerminal(terminalId: string, data: string) {
+    const terminal = this.terminals.get(terminalId);
+    if (!terminal) return;
+    terminal.stream.write(data);
+  }
+  resizeTerminal(terminalId: string, cols: number, rows: number) {
+    const terminal = this.terminals.get(terminalId);
+    if (terminal) terminal.stream.setWindow(rows, cols, 0, 0);
+  }
+  closeTerminal(terminalId: string) {
+    const terminal = this.terminals.get(terminalId);
+    if (!terminal) return;
+    this.terminals.delete(terminalId);
+    terminal.stream.close();
+  }
+  private closeServerTerminals(serverId: string) {
+    for (const [terminalId, terminal] of this.terminals) {
+      if (terminal.serverId === serverId) this.closeTerminal(terminalId);
+    }
+  }
+  // 仅读取登录用户自己的 history 文件，不把历史内容写入当前终端。
+  async shellHistory(serverId: string): Promise<TerminalHistory> {
+    const output = await this.exec(
+      serverId,
+      `
+shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7 || awk -F: -v user="$(id -un)" '$1 == user {print $7}' /etc/passwd 2>/dev/null)
+shell=$(basename "$shell")
+[ -n "$shell" ] || shell=$(basename "$SHELL")
+case "$shell" in bash|zsh|fish|sh) ;; *) shell=unknown ;; esac
+printf '__TERMINAL_SHELL__%s\\n' "$shell"
+case "$shell" in
+  zsh) file="$HOME/.zsh_history" ;;
+  fish) file="$HOME/.local/share/fish/fish_history" ;;
+  bash) file="\${XDG_STATE_HOME:-$HOME/.local/state}/bash/history"; [ -r "$file" ] || file="$HOME/.bash_history" ;;
+  sh) file="$HOME/.sh_history" ;;
+  *) printf '__NO_HISTORY__\\n'; exit 0 ;;
+esac
+if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; fi
+`,
+    );
+    return parseShellHistory('unknown', output);
   }
   private connection(id: string) {
     const c = this.connections.get(id);
@@ -309,10 +401,151 @@ export class Remote {
       await this.exec(id, `rm -f -- ${quote(temporary)}`).catch(() => {});
     }
   }
+  // SFTP 只读取当前 SSH 用户有权读取的配置，不自动提权。
+  async readRemoteText(id: string, destination: string) {
+    const sftp = await this.sftp(id);
+    try {
+      return await new Promise<string>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        const stream = sftp.createReadStream(remotePath(destination));
+        stream.on('data', (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 1024 * 1024) {
+            stream.destroy();
+            reject(new AppError('服务端配置超过 1 MB，未导入。'));
+          } else chunks.push(chunk);
+        });
+        stream.on('error', (error: Error) =>
+          reject(new AppError(`无法读取服务端配置 ${destination}：${error.message}`)),
+        );
+        stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      });
+    } finally {
+      sftp.end();
+    }
+  }
+  // 扫描 systemd 服务单位，并核验 ExecStart 确实启动 frps。
+  async searchFrpsServices(id: string, keyword = ''): Promise<FrpsServiceCandidate[]> {
+    const term = keyword.trim().toLowerCase();
+    const listing = await this.exec(
+      id,
+      'systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null || true',
+    ).catch(() => '');
+    const units = [
+      ...new Set(
+        listing
+          .split(/\r?\n/)
+          .map((line) => line.trim().split(/\s+/)[0])
+          .filter((name) => name?.endsWith('.service')),
+      ),
+    ]
+      .filter((name) =>
+        term
+          ? name.toLowerCase().includes(term) || /frps/i.test(name)
+          : /frps|intranet/i.test(name),
+      )
+      .slice(0, 100);
+    const candidates: FrpsServiceCandidate[] = [];
+    for (const service of units) {
+      const output = await this.exec(
+        id,
+        `systemctl show ${quote(service)} -p ExecStart -p ActiveState`,
+        10000,
+      ).catch(() => '');
+      const candidate = parseSystemdFrpsCandidate(service, output);
+      if (candidate && (!term || candidate.service.toLowerCase().includes(term)))
+        candidates.push(candidate);
+    }
+    // OpenRC 与 SysV 的应用服务同样可检索；只接受明确包含 FRP 程序和配置参数的启动脚本。
+    if (!candidates.length) {
+      const openrcList = await this.exec(id, 'rc-service -l 2>/dev/null || true').catch(() => '');
+      const sysvList = await this.exec(
+        id,
+        'find /etc/init.d -maxdepth 1 -type f -printf "%f\\n" 2>/dev/null || true',
+      ).catch(() => '');
+      for (const [manager, listing] of [
+        ['openrc', openrcList],
+        ['sysv', sysvList],
+      ] as const) {
+        const services = listing
+          .split(/\r?\n/)
+          .map((name) => name.trim())
+          .filter(
+            (name) =>
+              name &&
+              (term
+                ? name.toLowerCase().includes(term) || /frps|intranet/i.test(name)
+                : /frps|intranet/i.test(name)),
+          )
+          .slice(0, 100);
+        for (const service of services) {
+          const scriptPath = `/etc/init.d/${service}`;
+          const contents = await this.exec(id, `cat -- ${quote(scriptPath)}`).catch(() => '');
+          if (!/frps|Intranet FRP/i.test(contents)) continue;
+          const command = /(?:^|\n)\s*(?:command|BIN)=['"]?([^'"\s\n]+)['"]?/m.exec(contents)?.[1];
+          const config = /(?:-c\s+|CONFIG=['"]?)(?:"([^"]+)"|'([^']+)'|(\S+?)(?:['"\s]|$))/m.exec(
+            contents,
+          );
+          if (!command || !config) continue;
+          const state = await this.exec(id, `${quote(scriptPath)} status`)
+            .then(() => 'active')
+            .catch(() => 'inactive');
+          candidates.push({
+            service,
+            manager,
+            state,
+            binary: command,
+            config: config[1] ?? config[2] ?? config[3],
+          });
+        }
+      }
+    }
+    // 如果 systemd 列表不可用，再扫描当前用户可见的 FRP 进程命令行。
+    if (!candidates.length) {
+      const processes = await this.exec(
+        id,
+        `for f in /proc/[0-9]*/cmdline; do test -r "$f" || continue; pid="\${f#/proc/}"; pid="\${pid%/cmdline}"; exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true); args=$(tr '\\0' ' ' < "$f" 2>/dev/null || true); case "$exe $args" in *frps*) printf '%s\\t%s\\t%s\\n' "$pid" "$exe" "$args";; esac; done`,
+        20000,
+      ).catch(() => '');
+      for (const line of processes.split(/\r?\n/)) {
+        const [pid, binary, ...rest] = line.split('\t');
+        if (!pid || !binary) continue;
+        const args = rest.join('\t');
+        const match = /(?:^|\s)(?:-c|--config)\s+(?:"([^"]+)"|(\S+))/.exec(args);
+        if (!match) continue;
+        candidates.push({
+          service: `frps (PID ${pid})`,
+          manager: 'process',
+          state: 'running',
+          binary,
+          config: match[1] ?? match[2],
+        });
+      }
+    }
+    return candidates.filter(
+      (candidate) => !term || candidate.service.toLowerCase().includes(term),
+    );
+  }
   private deployment(id: string) {
     const d = this.store.server(id).deployment;
-    if (!d) throw new AppError('请先安装或接管服务端。');
+    if (!d) throw new AppError('此服务器没有本机管理的 FRP 服务部署。');
     return d;
+  }
+  private async checkUnit(id: string, d: Deployment) {
+    const manager = deploymentManager(d);
+    if (manager === 'process') return;
+    if (manager === 'systemd') {
+      const command = `${d.mode === 'system' ? 'systemctl' : 'systemctl --user'} show ${quote(d.service)} -p ExecStart`;
+      const start = await this.exec(id, command);
+      if (!start.includes(`path=${d.binary} ;`) || !start.includes(`-c ${d.config} `))
+        throw new AppError('systemd 服务单元与本机部署记录不一致，已阻止操作。');
+      return;
+    }
+    const script = remotePath(d.servicePath ?? `/etc/init.d/${d.service}`);
+    const contents = await this.exec(id, `cat -- ${quote(script)}`);
+    if (!contents.includes(d.binary) || !contents.includes(d.config))
+      throw new AppError('服务器服务脚本与本机部署记录不一致，已阻止操作。');
   }
   private serviceCommand(id: string, d: Deployment, verb: string) {
     const manager = deploymentManager(d);
@@ -432,14 +665,16 @@ export class Remote {
       if (server.configMode === 'form') {
         for (const port of [server.frpPort, server.httpPort, server.httpsPort]) {
           if (info.ports.split('\n').some((line) => new RegExp(`:${port}(?:\\s|$)`).test(line)))
-            throw new AppError(`服务器端口 ${port} 已占用，请更换端口或接管已有服务。`);
+            throw new AppError(
+              `服务器端口 ${port} 已占用，请更换端口，或检索现有 FRP 服务并保存为只读连接。`,
+            );
         }
       }
       const privilege = d.mode === 'system' && !info.root ? 'sudo -n ' : '';
       // 检查现有目录，避免覆盖先前失败部署或其他安装。
       await this.exec(
         id,
-        `test ! -e ${quote(d.binary)} || { echo '安装目录已有程序，请接管已有部署或选择其他服务器配置'; exit 1; }; mkdir -p -- ${quote(folder)}; chmod 700 -- ${quote(folder)}`,
+        `test ! -e ${quote(d.binary)} || { echo '安装目录已有程序，请检索现有 FRP 服务并保存为只读连接，或选择其他服务器配置'; exit 1; }; mkdir -p -- ${quote(folder)}; chmod 700 -- ${quote(folder)}`,
       );
       let installedUnit = '';
       try {
@@ -535,69 +770,6 @@ export class Remote {
         ).catch(() => {});
         throw error;
       }
-    });
-  }
-  private async checkUnit(id: string, d: Deployment) {
-    const manager = deploymentManager(d);
-    if (manager === 'process') return;
-    if (manager === 'systemd') {
-      // CentOS 7 的 systemd 不支持 --value，保留属性名的输出可跨版本解析。
-      const command = `${d.mode === 'system' ? 'systemctl' : 'systemctl --user'} show ${quote(d.service)} -p ExecStart`;
-      const start = await this.exec(id, command);
-      if (!start.includes(`path=${d.binary} ;`) || !start.includes(`-c ${d.config} `))
-        throw new AppError('systemd 服务单元与部署记录不一致，已阻止操作。');
-      return;
-    }
-    const script = remotePath(d.servicePath ?? `/etc/init.d/${d.service}`);
-    const contents = await this.exec(id, `cat -- ${quote(script)}`);
-    if (!contents.includes(d.binary) || !contents.includes(d.config))
-      throw new AppError('服务器服务脚本与部署记录不一致，已阻止操作。');
-  }
-  async adopt(id: string, input: Deployment) {
-    return this.locked(id, async () => {
-      const server = this.store.server(id);
-      if (server.deployment) throw new AppError('请先解除当前部署的管理。');
-      for (const field of ['binary', 'config', 'log', 'pidFile'] as const) remotePath(input[field]);
-      const version = await this.exec(id, `${quote(input.binary)} -v`);
-      if (!/^v?\d+\.\d+\.\d+/.test(version)) throw new AppError('此程序未返回有效的 FRP 版本。');
-      await this.exec(id, `test -r ${quote(input.config)} || { echo '配置文件不可读'; exit 1; }`);
-      const info = await this.detect(id);
-      if (!info.supported) throw new AppError(`暂不支持接管此系统：${info.distribution}。`);
-      const selection = selectServiceMode(info);
-      input.manager = selection.manager;
-      input.mode = selection.mode;
-      input.servicePath =
-        selection.manager === 'openrc' || selection.manager === 'sysv'
-          ? `/etc/init.d/${input.service}`
-          : undefined;
-      if (input.mode !== 'process') await this.checkUnit(id, input);
-      if (input.mode === 'process') {
-        const matches = await this.exec(
-          id,
-          `for entry in /proc/[0-9]*/exe; do test \"$(readlink -f \"$entry\" 2>/dev/null)\" = \"$(readlink -f ${quote(input.binary)})\" || continue; procdir=\"\${entry%/exe}\"; tr '\\0' '\\n' < \"$procdir/cmdline\" 2>/dev/null | grep -Fx -- ${quote(input.config)} >/dev/null && echo \"\${procdir##*/}\"; done; true`,
-        );
-        const pids = matches.split('\n').filter(Boolean);
-        if (pids.length > 1)
-          throw new AppError('多个进程使用同一程序和配置，请先保留一个进程再接管。');
-        if (pids.length === 1) {
-          const previous = await this.exec(
-            id,
-            `cat -- ${quote(input.pidFile)} 2>/dev/null || true`,
-          );
-          if (previous && previous !== pids[0])
-            throw new AppError('PID 文件与实际进程不一致，已阻止接管。');
-          if (!previous) await this.write(id, input.pidFile, `${pids[0]}\n`);
-        }
-      }
-      server.deployment = {
-        ...input,
-        managed: false,
-        version: version.trim().replace(/^v/, ''),
-        versionKey: '',
-      };
-      await this.store.persist();
-      this.changed();
-      return server.deployment;
     });
   }
   async apply(id: string) {
@@ -727,7 +899,7 @@ export class Remote {
       const manager = deploymentManager(d);
       if (manager === 'systemd' && d.logMode !== 'file')
         throw new AppError(
-          '此 systemd 服务的日志保存在系统 journal 中，无法安全地只清理该服务而不影响其他服务。工具管理的新部署会使用独立日志文件；接管部署请先将服务输出配置到日志文件。',
+          '此 systemd 服务的日志保存在系统 journal 中，无法安全地只清理该服务而不影响其他服务。工具管理的新部署会使用独立日志文件。',
         );
       const log = remotePath(d.log);
       const privilege = d.mode === 'system' && !this.rootUsers.has(id) ? 'sudo -n ' : '';
@@ -860,7 +1032,7 @@ export class Remote {
           );
         }
       }
-      // 不递归删除目录，接管部署也只删除用户明确提供的几个文件。
+      // 不递归删除目录，只删除本机部署记录中明确列出的文件。
       await this.exec(
         id,
         `rm -f -- ${[

@@ -20,7 +20,9 @@
 | 正常退出                   | 本机进程停止，临时配置清理；远程测试服务停止并卸载                                                                                                                          |
 | 依赖安全审计               | `npm audit --omit=dev` 报告 acme-client 间接依赖的 node-forge 1.4.0 有 2 项高危告警；本次签发代码使用 acme-client v5 的现代 crypto 接口，公开发行前仍需处理或确认该依赖风险 |
 
-本次另验证 systemd 旧格式 `ExecStart` 接管解析、服务状态错误诊断及旧版站点记录清理；测试使用模拟输出，未在 CentOS 7 实机连接验证。
+旧版本曾另验证 systemd 旧格式 `ExecStart` 接管解析、服务状态错误诊断及旧版站点记录清理；这些接管入口后来已移除，相关历史结果不代表当前功能。
+
+2026-11-06 更新：移除“接管已有部署”流程，新增只读 FRP 服务检索及连接参数导入。服务候选验证、TOML/INI/YAML/JSON 连接字段解析、系统安全存储降级和只读状态通过本地模拟测试；真实 systemd/OpenRC/SysV 服务器检索及第二台电脑连接尚未实机验收。旧接管测试记录仅代表旧版本行为，不代表当前 UI 仍提供接管功能。
 
 本次新增 SSL 证书库和多域名 HTTPS 终止配置回归：证书导入使用本地 PEM 测试样本，ACME 使用模拟客户端，未向真实 Let’s Encrypt 或 LiteSSL 发起签发。HTTP-01 临时 FRP 规则、TXT 提示、签发进度记录及 DNS 等待阶段取消通过单元模拟验证；公网 80 可达性、真实域名签发、各桌面系统安全存储和托盘续期仍需实机验收。
 
@@ -34,7 +36,7 @@ v0.1.2 新增官方发布页日期解析、FRP `frp_sha256_checksums.txt` 校验
 
 - `npm test`：无需服务器的核心回归。
 - `npm run test:desktop`：构建并启动 Electron，使用独立临时数据目录，截图位于 `artifacts/desktop-smoke.png`。
-- `npm run test:remote`：显式指定服务器环境变量后执行真实协议、部署、接管、备份恢复与卸载测试。
+- `npm run test:remote`：显式指定服务器环境变量后执行真实协议、部署、备份恢复与卸载测试。
 - `npm run test:remote-user`：使用前一步下载的 Linux 包，创建临时账号验证用户服务与进程模式，结束清理。
 - `npm run test:local-frp`：使用已有本机包验证多实例、跨版本、失败和重连；另一个官方版本缺失时会下载。
 

@@ -97,7 +97,7 @@ async function main() {
     await remote.connect(id);
     checks.disconnectKeptService = await remote.status(id);
     checks.logs = (await remote.logs(id)).includes('frps started successfully');
-    // 接管错误 PID 不能误停同一用户的其他进程。
+    // 错误 PID 不能误停同一用户的其他进程。
     const d = store.server(id).deployment!;
     await remote.exec(
       id,
@@ -117,12 +117,6 @@ async function main() {
     checks.stop = await remote.control(id, 'stop');
     checks.restart = await remote.control(id, 'restart');
     if (checks.restart !== 'running') throw new Error('后台重启失败');
-    const adopted = { ...store.server(id).deployment! };
-    await remote.detach(id);
-    await remote.exec(id, `rm -f -- ${quote(adopted.pidFile)}`);
-    await remote.adopt(id, adopted);
-    checks.pidRecoveredOnAdopt = await remote.status(id);
-    if (checks.pidRecoveredOnAdopt !== 'running') throw new Error('进程接管没有恢复正确 PID');
     await remote.control(id, 'stop');
     await remote.uninstall(id, true);
     checks.uninstalled = true;

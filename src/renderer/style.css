@@ -838,6 +838,212 @@ label .inline-fields {
   white-space: pre-wrap;
   word-break: break-all;
 }
+.terminal-workspace {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 190px);
+  gap: 12px;
+}
+.terminal-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+}
+.terminal-tabs {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+}
+.terminal-tab {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
+  background: #e9edf4;
+  border-color: transparent;
+}
+.terminal-tab.active {
+  background: #fff;
+  border-color: #cbd5e5;
+  color: #2455bd;
+}
+.terminal-tab span {
+  color: #8490a4;
+  font-size: 18px;
+  line-height: 12px;
+}
+.terminal-layout {
+  display: grid;
+  grid-template-columns: 290px minmax(0, 1fr);
+  min-height: 520px;
+  flex: 1;
+  overflow: hidden;
+  border: 1px solid #dce2eb;
+  border-radius: 10px;
+  background: white;
+}
+.terminal-layout.collapsed {
+  grid-template-columns: 46px minmax(0, 1fr);
+}
+.terminal-shortcuts {
+  min-width: 0;
+  overflow: auto;
+  background: #f8f9fc;
+  border-right: 1px solid #e2e7ef;
+}
+.terminal-layout.collapsed .terminal-shortcuts {
+  overflow: hidden;
+}
+.shortcut-header,
+.shortcut-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+.shortcut-header {
+  height: 49px;
+  padding: 0 12px;
+  border-bottom: 1px solid #e2e7ef;
+  white-space: nowrap;
+}
+.shortcut-header button {
+  padding: 4px 7px;
+  font-size: 12px;
+}
+.terminal-layout.collapsed .shortcut-header {
+  flex-direction: column;
+  height: auto;
+  padding: 8px 2px;
+  gap: 8px;
+}
+.terminal-layout.collapsed .shortcut-header strong {
+  writing-mode: vertical-rl;
+}
+.shortcut-section + .shortcut-section {
+  border-top: 1px solid #e2e7ef;
+}
+.shortcut-heading {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 12px;
+  font-weight: 650;
+}
+.shortcut-heading span {
+  color: #8995a9;
+}
+.shortcut-list {
+  padding: 0 8px 10px;
+}
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  min-height: 34px;
+  border-radius: 5px;
+}
+.shortcut-row:hover,
+.history-command:hover {
+  background: #eaf0fa;
+}
+.shortcut-command {
+  min-width: 0;
+  border: 0;
+  background: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  padding: 6px;
+}
+.shortcut-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 1px;
+}
+.shortcut-actions button {
+  width: 23px;
+  height: 25px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #7d899d;
+}
+.shortcut-actions button:hover {
+  color: #2455bd;
+}
+.history-command {
+  padding: 7px 6px;
+  border-radius: 5px;
+  font:
+    11px/1.45 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.shortcut-empty,
+.shortcut-footnote {
+  padding: 7px 6px;
+  color: #8590a2;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.add-favorite {
+  margin: 6px 0 0 4px;
+  padding: 4px 6px;
+  border: 0;
+  color: #3864bf;
+  background: transparent;
+  font-size: 12px;
+}
+.terminal-main {
+  min-width: 0;
+  min-height: 0;
+  padding: 10px;
+  background: #101827;
+}
+.terminal-screen {
+  width: 100%;
+  height: 100%;
+  min-height: 490px;
+}
+.terminal-screen .xterm {
+  height: 100%;
+  padding: 5px;
+}
+.terminal-history-hint {
+  margin: 0;
+  color: #8791a2;
+  font-size: 11px;
+}
+.terminal-context-menu {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  width: 210px;
+  padding: 5px;
+  border: 1px solid #d8deea;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 8px 25px #182a451f;
+}
+.terminal-context-menu button {
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+.terminal-empty {
+  margin: auto;
+}
 @media (max-width: 1150px) {
   .sidebar {
     width: 190px;

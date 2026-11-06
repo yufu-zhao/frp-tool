@@ -81,6 +81,14 @@ export const serverCertificateSchema = z.object({
   renewalManager: z.enum(['systemd', 'cron', 'manual', 'unavailable']).default('manual'),
   createdAt: z.number().int().nonnegative(),
 });
+// 快捷命令仅保存在本机，由用户主动选择并执行。
+export const terminalFavoriteSchema = z.object({
+  id,
+  name: z.string().min(1).max(100),
+  command: z.string().min(1).max(8192),
+  order: z.number().int().nonnegative(),
+  updatedAt: z.number().int().nonnegative(),
+});
 export const deploymentSchema = z.object({
   binary: text,
   config: text,
@@ -112,6 +120,16 @@ export const serverSchema = z.object({
   token: text.optional(),
   fingerprint: text.optional(),
   deployment: deploymentSchema.optional(),
+  // 只读服务器只能用于创建 frpc 实例，不能操作远端 frps 服务。
+  accessMode: z.enum(['managed', 'readonly']).default('managed'),
+  discoveredService: z
+    .object({
+      name: z.string().min(1).max(255),
+      manager: z.enum(['systemd', 'openrc', 'sysv', 'process']),
+      binary: text,
+      config: text,
+    })
+    .optional(),
   configMode: z.enum(['form', 'raw']).default('form'),
   rawConfig: z.string().max(1048576).default(''),
   rawFormat: z.enum(['toml', 'ini', 'yaml', 'json']).default('toml'),
@@ -142,6 +160,7 @@ export type ProxyRule = z.infer<typeof proxySchema>;
 export type CertificateRecord = z.infer<typeof certificateSchema>;
 export type ServerSite = z.infer<typeof serverSiteSchema>;
 export type ServerCertificate = z.infer<typeof serverCertificateSchema>;
+export type TerminalFavorite = z.infer<typeof terminalFavoriteSchema>;
 export type Settings = z.infer<typeof settingsSchema>;
 export type InstallRequest = z.infer<typeof installSchema>;
 export interface Asset {
@@ -182,6 +201,7 @@ export interface State {
   certificates: CertificateRecord[];
   serverSites: ServerSite[];
   serverCertificates: ServerCertificate[];
+  terminalFavorites: TerminalFavorite[];
   versions: InstalledVersion[];
   settings: Settings;
   secureStorage: boolean;
@@ -194,6 +214,13 @@ export interface ServerSiteProgress {
   step: string;
   message: string;
   updatedAt: number;
+}
+export interface FrpsServiceCandidate {
+  service: string;
+  manager: 'systemd' | 'openrc' | 'sysv' | 'process';
+  state: string;
+  binary: string;
+  config: string;
 }
 export interface Runtime {
   status: 'stopped' | 'starting' | 'running' | 'connected' | 'error';
@@ -228,6 +255,23 @@ export interface DesktopApi {
   onChange(callback: () => void): () => void;
   onCertificateProgress(callback: (progress: CertificateIssueProgress) => void): () => void;
   onServerSiteProgress(callback: (progress: ServerSiteProgress) => void): () => void;
+  onTerminalEvent(callback: (event: TerminalEvent) => void): () => void;
+  terminalInput(terminalId: string, data: string): void;
+  terminalResize(terminalId: string, cols: number, rows: number): void;
+  terminalClose(terminalId: string): void;
+}
+
+export interface TerminalEvent {
+  terminalId: string;
+  type: 'data' | 'closed' | 'error';
+  data?: string;
+  message?: string;
+}
+
+export interface TerminalHistory {
+  shell: string;
+  commands: string[];
+  available: boolean;
 }
 
 export interface CertificateIssueProgress {

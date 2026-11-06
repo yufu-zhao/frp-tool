@@ -241,16 +241,6 @@ async function main() {
     await remote.control(serverId, 'start');
     checks.restart = await remote.status(serverId);
     await remote.control(serverId, 'stop');
-    const d = { ...store.server(serverId).deployment! };
-    await remote.detach(serverId);
-    await remote.adopt(serverId, d);
-    checks.adopt = store.server(serverId).deployment?.managed === false;
-    await remote.uninstall(serverId, false);
-    checks.detachKeptBinary = await remote.exec(
-      serverId,
-      `test -x '${d.binary}' && echo preserved`,
-    );
-    await remote.adopt(serverId, d);
     await remote.uninstall(serverId, true);
     deployed = false;
     checks.uninstalled = '测试服务已停止并移除，备份保留';

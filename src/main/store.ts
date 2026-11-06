@@ -7,6 +7,7 @@ import {
   certificateSchema,
   serverSiteSchema,
   serverCertificateSchema,
+  terminalFavoriteSchema,
   type Server,
   type Instance,
   type InstalledVersion,
@@ -14,6 +15,7 @@ import {
   type CertificateRecord,
   type ServerSite,
   type ServerCertificate,
+  type TerminalFavorite,
 } from '../shared/types';
 import { AppError } from '../shared/errors';
 
@@ -31,6 +33,7 @@ interface DiskState {
   certificates: CertificateRecord[];
   serverSites: ServerSite[];
   serverCertificates: ServerCertificate[];
+  terminalFavorites: TerminalFavorite[];
   secrets: Record<string, string>;
 }
 
@@ -45,6 +48,7 @@ export class Store {
     certificates: [],
     serverSites: [],
     serverCertificates: [],
+    terminalFavorites: [],
     secrets: {},
   };
   private writes: Promise<void> = Promise.resolve();
@@ -82,6 +86,9 @@ export class Store {
         : [];
       raw.serverCertificates = Array.isArray(raw.serverCertificates)
         ? raw.serverCertificates.map((item: unknown) => serverCertificateSchema.parse(item))
+        : [];
+      raw.terminalFavorites = Array.isArray(raw.terminalFavorites)
+        ? raw.terminalFavorites.map((item: unknown) => terminalFavoriteSchema.parse(item))
         : [];
       if (
         !raw.secrets ||
@@ -156,9 +163,28 @@ export class Store {
       rawConfig: '',
       fingerprint: previous?.fingerprint,
       deployment: previous?.deployment,
+      accessMode: previous?.accessMode ?? input.accessMode,
+      discoveredService: previous?.discoveredService ?? input.discoveredService,
     };
     this.data.servers = [...this.data.servers.filter((s) => s.id !== item.id), item];
     await this.persist();
+  }
+  // 检索到的服务只导入客户端连接字段；密钥链不可用时令牌仅保留在当前会话。
+  async saveDiscoveredServerConfig(
+    id: string,
+    config: { frpPort: number; httpPort: number; httpsPort: number; token: string },
+    service: NonNullable<Server['discoveredService']>,
+  ) {
+    const server = this.server(id);
+    if (server.deployment) throw new AppError('此服务器已有本机管理的部署，不能转为只读检索记录。');
+    this.putSecret(`server:${id}:token`, config.token);
+    server.frpPort = config.frpPort;
+    server.httpPort = config.httpPort;
+    server.httpsPort = config.httpsPort;
+    server.accessMode = 'readonly';
+    server.discoveredService = service;
+    await this.persist();
+    return this.secure;
   }
   async saveInstance(item: Instance) {
     this.server(item.serverId);
@@ -216,6 +242,33 @@ export class Store {
     ];
     await this.persist();
   }
+  async saveTerminalFavorite(item: TerminalFavorite) {
+    const parsed = terminalFavoriteSchema.parse(item);
+    this.data.terminalFavorites = [
+      ...this.data.terminalFavorites.filter((favorite) => favorite.id !== parsed.id),
+      parsed,
+    ]
+      .sort((a, b) => a.order - b.order)
+      .map((favorite, order) => ({ ...favorite, order }));
+    await this.persist();
+  }
+  async deleteTerminalFavorite(id: string) {
+    this.data.terminalFavorites = this.data.terminalFavorites
+      .filter((favorite) => favorite.id !== id)
+      .sort((a, b) => a.order - b.order)
+      .map((favorite, order) => ({ ...favorite, order }));
+    await this.persist();
+  }
+  async reorderTerminalFavorites(ids: string[]) {
+    if (
+      new Set(ids).size !== this.data.terminalFavorites.length ||
+      ids.some((id) => !this.data.terminalFavorites.some((favorite) => favorite.id === id))
+    )
+      throw new AppError('快捷命令排序列表与当前记录不匹配，请刷新后重试。');
+    const byId = new Map(this.data.terminalFavorites.map((favorite) => [favorite.id, favorite]));
+    this.data.terminalFavorites = ids.map((id, order) => ({ ...byId.get(id)!, order }));
+    await this.persist();
+  }
   snapshot() {
     // 原始配置需要在编辑器内可读，磁盘上仍使用加密存储。
     return {
@@ -231,6 +284,7 @@ export class Store {
       certificates: this.data.certificates,
       serverSites: this.data.serverSites,
       serverCertificates: this.data.serverCertificates,
+      terminalFavorites: this.data.terminalFavorites,
       settings: this.data.settings,
       secureStorage: this.secure,
       platform: process.platform === 'win32' ? 'windows' : process.platform,
