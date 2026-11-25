@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { CertificateIssueProgress, DesktopApi, ServerSiteProgress } from '../shared/types';
+import type {
+  CertificateIssueProgress,
+  DesktopApi,
+  DownloadProgress,
+  TlsProxyProgress,
+  ServerDeployProgress,
+} from '../shared/types';
 
 // 只暴露固定 RPC 通道，不允许页面直接使用 Node 或任意 IPC。
 const api: DesktopApi = {
@@ -15,11 +21,23 @@ const api: DesktopApi = {
     ipcRenderer.on('certificate:progress', handler);
     return () => ipcRenderer.removeListener('certificate:progress', handler);
   },
-  onServerSiteProgress: (callback) => {
-    const handler = (_event: Electron.IpcRendererEvent, progress: ServerSiteProgress) =>
+  onDownloadProgress: (callback) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: DownloadProgress) =>
       callback(progress);
-    ipcRenderer.on('server-site:progress', handler);
-    return () => ipcRenderer.removeListener('server-site:progress', handler);
+    ipcRenderer.on('download:progress', handler);
+    return () => ipcRenderer.removeListener('download:progress', handler);
+  },
+  onTlsProxyProgress: (callback) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: TlsProxyProgress) =>
+      callback(progress);
+    ipcRenderer.on('tls-proxy:progress', handler);
+    return () => ipcRenderer.removeListener('tls-proxy:progress', handler);
+  },
+  onServerDeployProgress: (callback) => {
+    const handler = (_event: Electron.IpcRendererEvent, progress: ServerDeployProgress) =>
+      callback(progress);
+    ipcRenderer.on('server:deploy-progress', handler);
+    return () => ipcRenderer.removeListener('server:deploy-progress', handler);
   },
   onTerminalEvent: (callback) => {
     const handler = (

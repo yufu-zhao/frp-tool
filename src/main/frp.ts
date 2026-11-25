@@ -16,6 +16,7 @@ export const frpAdapter = {
 export function validateRules(rules: ProxyRule[]) {
   const names = new Set<string>();
   const ports = new Set<string>();
+  // HTTP 与 HTTPS 分别注册在 frps 的 vhostHTTPPort / vhostHTTPSPort，同一域名可同时存在。
   const domains = new Set<string>();
   for (const rule of rules) {
     if (names.has(rule.name)) throw new AppError(`代理名称重复：${rule.name}`);
@@ -35,8 +36,10 @@ export function validateRules(rules: ProxyRule[]) {
           )
         )
           throw new AppError(`${rule.name} 请填写不含协议和端口的域名。`);
-        if (domains.has(normalized)) throw new AppError(`HTTP/HTTPS 域名重复：${normalized}`);
-        domains.add(normalized);
+        const domainKey = `${rule.type}:${normalized}`;
+        if (domains.has(domainKey))
+          throw new AppError(`${rule.type.toUpperCase()} 域名重复：${normalized}`);
+        domains.add(domainKey);
       }
     }
     if (
@@ -107,6 +110,7 @@ export function clientConfig(
 }
 export function serverConfig(server: Server, token: string): string {
   if (!token) throw new AppError('服务端需要认证令牌，请先在服务器配置中填写。');
+  // vhost 端口按服务器现状手填：80/443 空闲时可直接占用，被占用时改高端口并反代。
   if (new Set([server.frpPort, server.httpPort, server.httpsPort]).size !== 3)
     throw new AppError('FRP 连接、HTTP、HTTPS 入口端口不能重复。');
   const config = TOML.stringify({

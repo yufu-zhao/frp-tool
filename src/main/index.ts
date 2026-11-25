@@ -15,34 +15,53 @@ import {
 import path from 'node:path';
 import os from 'node:os';
 import { readFile } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { Store } from './store';
-import { Versions } from './versions';
+import { Versions, versionKey } from './versions';
+import { progressEvent } from './downloader';
+import { VersionResolver } from './version-resolver';
 import { Processes, execute } from './processes';
-import { Remote, quote } from './remote';
-import { applyNginxSite, removeHttpInclude } from './server-sites';
+import { Remote } from './remote';
 import { parseDiscoveredFrpsConfig } from './service-discovery';
 import {
   Certificates,
   normalizeDomains,
   type DnsChallengeRecord,
   type CertificateIssueProgressUpdate,
+  type HttpChallengeRunner,
 } from './certificates';
 import { validateRules } from './frp';
+import { ServerCertificates } from './server-certificates';
+import { manageAdapterForAccount } from './dns-automation';
+import { SiteInspector } from './site-inspector';
+import { WebIncludeManager } from './web-include';
+import { TlsProxyManager } from './tls-proxy';
+import {
+  ACTIONS,
+  EVENTS,
+  CHECKSUM_UNAVAILABLE,
+  type IssueServerInput,
+  type DnsTestInput,
+  type DnsAccountTestInput,
+} from '../shared/contracts';
 import { notifyRenderer } from './lifecycle';
 import { AppError, friendlyError, redact } from '../shared/errors';
+import { deployFailureHint } from '../shared/deploy-hint';
 import {
   serverSchema,
   instanceSchema,
   settingsSchema,
   installSchema,
   terminalFavoriteSchema,
+  dnsAccountSchema,
   type Result,
-  type Instance,
-  type Server,
   type CertificateIssueProgress,
   type TerminalEvent,
+  type DownloadProgress,
+  type TlsProxyProgress,
+  type ServerDeployProgress,
+  type ServerDeployProgressUpdate,
 } from '../shared/types';
 
 const iconDirectory = path.join(__dirname, '../../assets/icons');
@@ -52,8 +71,11 @@ let quitting = false;
 let store: Store;
 let processes: Processes;
 let remote: Remote;
-let certificates: Certificates;
-let certificateRenewalTimer: ReturnType<typeof setInterval> | undefined;
+let serverCertificates: ServerCertificates;
+let localCertificates: Certificates;
+let siteInspector: SiteInspector;
+let webInclude: WebIncludeManager;
+let tlsProxy: TlsProxyManager;
 const certificateIssueControllers = new Map<string, AbortController>();
 const dnsChallengeWaiters = new Map<string, (continueIssue: boolean) => void>();
 const changed = () => notifyRenderer(window, quitting);
@@ -68,44 +90,24 @@ function reportCertificateProgress(
     ...progress,
     updatedAt: Date.now(),
   };
-  if (window && !window.isDestroyed()) window.webContents.send('certificate:progress', state);
+  if (window && !window.isDestroyed()) window.webContents.send(EVENTS.certificateProgress, state);
+}
+
+function reportDownloadProgress(progress: DownloadProgress) {
+  if (window && !window.isDestroyed()) window.webContents.send(EVENTS.downloadProgress, progress);
+}
+
+function reportTlsProxyProgress(progress: TlsProxyProgress) {
+  if (window && !window.isDestroyed()) window.webContents.send(EVENTS.tlsProxyProgress, progress);
+}
+
+function reportServerDeployProgress(taskId: string, update: ServerDeployProgressUpdate) {
+  const progress: ServerDeployProgress = { taskId, ...update, updatedAt: Date.now() };
+  if (window && !window.isDestroyed())
+    window.webContents.send(EVENTS.serverDeployProgress, progress);
 }
 
 // HTTP-01 必须把每个域名的验证请求映射到唯一的表单实例及公网 80 入口。
-function resolveHttp01Assignments(instances: Instance[], servers: Server[], domains: string[]) {
-  const assignments = new Map<string, Set<string>>();
-  for (const domain of domains) {
-    const matches = instances.flatMap((instance) =>
-      instance.mode === 'form'
-        ? instance.proxies
-            .filter(
-              (rule) =>
-                (rule.type === 'http' || rule.type === 'https') &&
-                rule.domains.some((candidate) => candidate.toLowerCase() === domain),
-            )
-            .map((rule) => ({ instance, rule }))
-        : [],
-    );
-    if (matches.length !== 1)
-      throw new AppError(
-        `域名 ${domain} 必须恰好关联一条表单 HTTP/HTTPS 规则，才能通过 FRP 完成 HTTP-01 验证。`,
-      );
-    const { instance } = matches[0];
-    const server = servers.find((item) => item.id === instance.serverId);
-    // TODO 临时注释
-    // if (!server || server.configMode !== 'form' || server.httpPort !== 80)
-    //   throw new AppError(
-    //     `域名 ${domain} 对应的服务器未确认 FRP HTTP 入口为公网 80 端口，请改用手动 DNS-01。`,
-    //   );
-    const instanceDomains = assignments.get(instance.id) ?? new Set<string>();
-    instanceDomains.add(domain);
-    assignments.set(instance.id, instanceDomains);
-  }
-  return [...assignments].map(([instanceId, values]) => ({
-    instanceId,
-    domains: [...values],
-  }));
-}
 
 // 测试使用独立 Electron 用户目录，避免与已安装应用争夺单实例锁。
 if (process.env.INTRANET_TEST_DATA) app.setPath('userData', process.env.INTRANET_TEST_DATA);
@@ -161,6 +163,8 @@ else {
         (url, init) => network.fetch(url, init),
         (binary) => execute(binary, ['-v']),
       );
+      // 使用点（安装服务端 / 创建客户端）的版本自动解析与自动准备包。
+      const versionResolver = new VersionResolver(store, versions, reportDownloadProgress, changed);
       processes = new Processes(store, changed);
       remote = new Remote(
         store,
@@ -178,71 +182,75 @@ else {
         },
         changed,
       );
-      certificates = new Certificates(
+      siteInspector = new SiteInspector(store, remote);
+      webInclude = new WebIncludeManager(store, remote);
+      const serverHttpChallenge: HttpChallengeRunner = async (assignments, operation, signal) => {
+        if (signal?.aborted) throw new AppError('用户已取消 HTTP-01 验证。', 'CANCELLED');
+        const running = assignments.filter((item) => processes.running(item.instanceId));
+        const result = await processes.withHttp01Challenge(assignments, operation);
+        return result;
+      };
+      const promptDns = async (records: DnsChallengeRecord[]) => {
+        const detail = records
+          .map((record) => `${record.record}\nTXT 值：${record.value}`)
+          .join('\n\n');
+        const answer = await dialog.showMessageBox({
+          type: 'info',
+          title: '添加 DNS 验证记录',
+          message: '请在域名 DNS 服务中添加下面的 TXT 记录。',
+          detail,
+          buttons: ['取消签发', '已添加，继续验证'],
+          defaultId: 0,
+          cancelId: 0,
+        });
+        return answer.response === 1;
+      };
+      localCertificates = new Certificates(store, changed, promptDns, serverHttpChallenge, (id) =>
+        processes.running(id),
+      );
+      serverCertificates = new ServerCertificates(
         store,
         changed,
-        async (records: DnsChallengeRecord[]) => {
-          const detail = records
-            .map((record) => `${record.record}\nTXT 值：${record.value}`)
-            .join('\n\n');
-          const answer = await dialog.showMessageBox({
-            type: 'info',
-            title: '添加 DNS 验证记录',
-            message: '请在域名 DNS 服务中添加下面的 TXT 记录。',
-            detail,
-            buttons: ['取消签发', '已添加，继续验证'],
-            defaultId: 0,
-            cancelId: 0,
-          });
-          return answer.response === 1;
-        },
-        async (assignments, operation, signal) => {
-          const running = assignments.filter((item) => processes.running(item.instanceId));
-          if (running.length) {
-            const names = running.map((item) => store.instance(item.instanceId).name).join('、');
-            const answer = await dialog.showMessageBox({
+        localCertificates,
+        serverHttpChallenge,
+        webInclude,
+        (serverId) => remote.detect(serverId),
+      );
+      tlsProxy = new TlsProxyManager(store, remote, changed);
+      const idSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/);
+      // 渲染层危险操作统一携带 { id, confirmed: true }；兼容早期只传 id 字符串的调用。
+      const pickId = (input: unknown) =>
+        idSchema.parse(
+          typeof input === 'object' && input !== null && 'id' in input
+            ? (input as { id: unknown }).id
+            : input,
+        );
+      const alreadyConfirmed = (payload: unknown) =>
+        (typeof payload === 'object' &&
+          payload !== null &&
+          (payload as { confirmed?: unknown }).confirmed === true) ||
+        store.data.settings.confirmDangerous === false;
+      // 页面已用 ConfirmDialog 确认时不再弹系统原生框，避免双重确认与视觉割裂。
+      const yes = async (message: string, detail: string, payload?: unknown) => {
+        if (alreadyConfirmed(payload)) return true;
+        return (
+          (
+            await dialog.showMessageBox(window!, {
               type: 'warning',
-              title: 'HTTP-01 验证需要临时重启客户端实例',
-              message: '签发期间相关实例会短暂中断。',
-              detail: `以下实例会添加临时验证规则；验证结束后恢复原配置并重新启动：${names}。确认继续？`,
-              buttons: ['取消', '确认并继续'],
+              message,
+              detail,
+              buttons: ['取消', '确认'],
               defaultId: 0,
               cancelId: 0,
-            });
-            if (answer.response !== 1) throw new AppError('用户取消了 HTTP-01 临时重启。');
-          }
-          if (signal?.aborted) throw new AppError('用户已取消 HTTP-01 临时重启。', 'CANCELLED');
-          const result = await processes.withHttp01Challenge(assignments, operation);
-          for (const { instanceId } of running) await certificates.instanceStarted(instanceId);
-          return result;
-        },
-        (id) => processes.running(id),
-      );
-      const checkCertificateRenewals = () =>
-        certificates
-          .renewDue((certificate) =>
-            resolveHttp01Assignments(store.data.instances, store.data.servers, certificate.domains),
-          )
-          .catch((error: unknown) => {
-            const message = error instanceof Error ? error.message : String(error);
-            console.warn(`SSL 自动续期检查失败：${redact(message, store.allSecrets())}`);
-          });
-      void checkCertificateRenewals();
-      certificateRenewalTimer = setInterval(() => void checkCertificateRenewals(), 60 * 60 * 1000);
-      certificateRenewalTimer.unref();
-      const idSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/);
-      const pickId = (input: unknown) => idSchema.parse(input);
-      const yes = async (message: string, detail: string) =>
-        (
-          await dialog.showMessageBox(window!, {
-            type: 'warning',
-            message,
-            detail,
-            buttons: ['取消', '确认'],
-            defaultId: 0,
-            cancelId: 0,
-          })
-        ).response === 1;
+            })
+          ).response === 1
+        );
+      };
+      const tlsInput = z.object({
+        taskId: idSchema,
+        serverId: idSchema,
+        confirmed: z.boolean().optional(),
+      });
       const handlers: Record<string, (payload: any) => Promise<unknown> | unknown> = {
         state: () => store.snapshot(),
         runtime: async () => {
@@ -260,8 +268,6 @@ else {
             throw new AppError('只读服务器不可编辑 FRP 服务端管理配置。');
           if (server.configMode === 'raw' && !server.rawConfig.trim())
             throw new AppError('高级服务端配置不能为空，请重新导入或输入配置。');
-          if (remote.connected(server.id))
-            throw new AppError('请先断开 SSH 再修改服务器连接配置。');
           await store.saveServer(server);
           changed();
         },
@@ -271,27 +277,28 @@ else {
             .parse(payload);
           const id = value.id;
           const server = store.server(id);
-          if (store.data.serverSites.some((site) => site.serverId === id))
-            throw new AppError(
-              '此服务器仍有应用管理的 Nginx 站点，请先删除站点后再卸载服务器配置。',
-            );
           if (store.data.instances.some((i) => i.serverId === id))
             throw new AppError('此服务器仍被客户端实例引用，请先更换关联或删除实例。');
           if (server.deployment) {
-            const answer = await dialog.showMessageBox(window!, {
-              type: 'warning',
-              title: '卸载服务器配置',
-              message: `卸载「${server.name}」？`,
-              detail: value.removeRemote
-                ? '将自动连接 SSH，停止并卸载远端服务及记录的程序、配置、日志和 PID 文件；历史备份保留。'
-                : '只移除本机配置并解除管理；远端 FRP 服务和文件继续保留。',
-              buttons: ['取消', '仅从本机移除', '同时卸载远端服务'],
-              defaultId: 2,
-              cancelId: 0,
-            });
-            if (answer.response === 0) return;
-            value.removeRemote = answer.response === 2;
-          } else if (!(await yes('卸载服务器配置？', `${server.name}\n只移除本机配置。`))) {
+            // 渲染层确认框已让用户选择「仅本机移除 / 同时卸载远端」；未带确认标记时兜底。
+            if (!alreadyConfirmed(payload)) {
+              const answer = await dialog.showMessageBox(window!, {
+                type: 'warning',
+                title: '卸载服务器配置',
+                message: `卸载「${server.name}」？`,
+                detail: value.removeRemote
+                  ? '将自动连接 SSH，停止并卸载远端服务及记录的程序、配置、日志和 PID 文件；历史备份保留。'
+                  : '只移除本机配置并解除管理；远端 FRP 服务和文件继续保留。',
+                buttons: ['取消', '仅从本机移除', '同时卸载远端服务'],
+                defaultId: 2,
+                cancelId: 0,
+              });
+              if (answer.response === 0) return;
+              value.removeRemote = answer.response === 2;
+            }
+          } else if (
+            !(await yes('卸载服务器配置？', `${server.name}\n只移除本机配置。`, payload))
+          ) {
             return;
           }
           if (value.removeRemote && server.deployment) {
@@ -352,24 +359,159 @@ else {
           changed();
         },
         'server:detect': (p) => remote.detect(pickId(p)),
+        [ACTIONS.webIncludeInspect]: (p) => webInclude.inspect(pickId(p)),
+        [ACTIONS.webIncludeApply]: (p) => {
+          const { serverId, flavor } = z
+            .object({
+              serverId: idSchema,
+              flavor: z.enum(['nginx', 'apache']),
+            })
+            .parse(p);
+          return webInclude.apply(serverId, flavor);
+        },
+        [ACTIONS.webIncludeRemove]: (p) => webInclude.remove(pickId(p)),
+        [ACTIONS.siteConfigSave]: (p) => {
+          const { serverId, ruleId, content, flavor } = z
+            .object({
+              serverId: idSchema,
+              ruleId: idSchema,
+              content: z.string().max(1048576),
+              flavor: z.enum(['nginx', 'apache']),
+            })
+            .parse(p);
+          return webInclude.saveSiteConfig(serverId, ruleId, content, flavor);
+        },
+        [ACTIONS.siteConfigRead]: (p) => {
+          const { serverId, ruleId } = z.object({ serverId: idSchema, ruleId: idSchema }).parse(p);
+          return webInclude.readSiteConfig(serverId, ruleId);
+        },
         'server:status': (p) => {
           const id = pickId(p);
           if (store.server(id).accessMode === 'readonly')
             throw new AppError('只读服务器不提供 FRP 服务端状态管理。');
           return remote.status(id);
         },
+        'server:install-precheck': async (p) => {
+          const { id, taskId } = z
+            .object({ id: idSchema, taskId: z.string().max(80).optional() })
+            .parse(p);
+          if (!remote.connected(id)) throw new AppError('请先连接服务器 SSH 后再预检安装条件。');
+          const report = taskId
+            ? (update: Omit<ServerDeployProgressUpdate, 'serverId'>) =>
+                reportServerDeployProgress(taskId, { serverId: id, ...update })
+            : undefined;
+          try {
+            return await remote.installPrecheck(id, report);
+          } catch (error) {
+            const message = (error as Error).message;
+            report?.({
+              status: 'failed',
+              step: '预检失败',
+              message,
+              percent: null,
+              error: message,
+              hint: '请检查 SSH 连接与服务器权限后重试；预检只读，不会修改服务器。',
+            });
+            throw error;
+          }
+        },
+        'server:remove-existing': async (p) => {
+          const value = z
+            .object({
+              id: idSchema,
+              service: z.object({
+                service: z.string().min(1).max(255),
+                manager: z.enum(['systemd', 'openrc', 'sysv', 'process']),
+                state: z.string().max(80),
+                binary: z.string().max(4096),
+                config: z.string().max(4096),
+              }),
+              confirmed: z.boolean().optional(),
+            })
+            .parse(p);
+          if (store.server(value.id).accessMode === 'readonly')
+            throw new AppError('只读连接不可移除服务器上的服务。');
+          if (
+            !(await yes(
+              '移除已有 FRP 服务并安装新服务？',
+              `将停止 ${value.service.service}、关闭开机启动、备份其程序与配置（.bak），再删除服务单元。已有配置不会直接删除，可按需回滚。`,
+              p,
+            ))
+          )
+            return { cancelled: true };
+          return remote.removeExistingFrps(value.id, value.service);
+        },
         'server:deploy': async (p) => {
-          const { id, key } = z.object({ id: idSchema, key: z.string() }).parse(p);
-          if (store.server(id).accessMode === 'readonly')
-            throw new AppError('此服务器为只读连接，不能部署或管理 FRP 服务端。');
+          const { id, key, taskId, overwrite } = z
+            .object({
+              id: idSchema,
+              key: z.string(),
+              taskId: z.string().max(80).optional(),
+              overwrite: z.boolean().optional(),
+            })
+            .parse(p);
+          const tid = taskId ?? randomUUID();
+          const report = (update: Omit<ServerDeployProgressUpdate, 'serverId'>) =>
+            reportServerDeployProgress(tid, { serverId: id, ...update });
+          if (store.server(id).accessMode === 'readonly') {
+            const error = '此服务器为只读连接，不能部署或管理 FRP 服务端。';
+            report({
+              status: 'failed',
+              step: '检查服务器',
+              message: error,
+              percent: null,
+              error,
+              hint: '此只读连接不能安装服务端。请在服务器配置中改为可管理模式后再安装。',
+            });
+            throw new AppError(error);
+          }
           if (
             !(await yes(
               '安装 FRP 服务端？',
-              '将上传所选 Linux 安装包，写入配置并安装可用的服务管理方式。安装后需要单独点击启动；不会修改防火墙或云安全组。',
+              '将上传所选 Linux 安装包，写入配置、安装服务并立即启动；不会修改防火墙或云安全组。',
+              p,
             ))
-          )
+          ) {
+            report({
+              status: 'cancelled',
+              step: '已取消',
+              message: '已取消安装服务端',
+              percent: null,
+            });
             return;
-          return remote.deploy(id, key);
+          }
+          report({
+            status: 'starting',
+            step: '准备安装',
+            message: '已接受安装任务，正在准备',
+            percent: 0,
+          });
+          try {
+            const result = await remote.deploy(
+              id,
+              key,
+              (update) => reportServerDeployProgress(tid, update),
+              overwrite === true,
+            );
+            report({
+              status: 'succeeded',
+              step: '安装完成',
+              message: result.note || 'FRP 服务端已安装并启动',
+              percent: 100,
+            });
+            return result;
+          } catch (error) {
+            const message = (error as Error).message;
+            report({
+              status: 'failed',
+              step: '安装失败',
+              message,
+              percent: null,
+              error: message,
+              hint: deployFailureHint(message),
+            });
+            throw error;
+          }
         },
         'server:search-services': async (p) => {
           const value = z
@@ -393,17 +535,33 @@ else {
           if (server.accessMode === 'readonly') throw new AppError('此只读服务器已完成服务检索。');
           if (server.deployment) throw new AppError('此服务器已有本机管理的部署，不能导入为只读。');
           if (!remote.connected(value.id)) throw new AppError('请先连接服务器 SSH 后再读取配置。');
+          // 只按服务名与管理器定位最新候选：运行状态、程序/配置路径会随服务重启或升级变化，
+          // 用它做全字段相等匹配会让只读保存频繁误报「服务信息已变化」。
           const matches = await remote.searchFrpsServices(value.id, value.service);
-          const candidate = matches.find(
-            (item) =>
-              item.service === value.service &&
-              item.manager === value.manager &&
-              item.binary === value.binary &&
-              item.config === value.config,
-          );
+          const candidate =
+            matches.find(
+              (item) => item.service === value.service && item.manager === value.manager,
+            ) ??
+            matches.find((item) => item.service === value.service) ??
+            matches.find((item) => item.config === value.config);
           if (!candidate) throw new AppError('服务信息已变化或不再匹配 FRP，请重新检索。');
-          const rawConfig = await remote.readRemoteText(value.id, candidate.config);
-          const connection = parseDiscoveredFrpsConfig(rawConfig, candidate.config);
+          let rawConfig: string;
+          try {
+            rawConfig = await remote.readRemoteText(value.id, candidate.config);
+          } catch (error) {
+            const detail = (error as Error).message;
+            throw new AppError(
+              `无法读取服务端 frps 配置 ${candidate.config}：${detail}。请确认 SSH 账号有读取权限，或改选「移除并重新安装」。`,
+            );
+          }
+          let connection;
+          try {
+            connection = parseDiscoveredFrpsConfig(rawConfig, candidate.config);
+          } catch (error) {
+            throw new AppError(
+              `服务端配置 ${candidate.config} 未包含可识别的 FRP 连接参数：${(error as Error).message}。可改选「移除并重新安装」。`,
+            );
+          }
           const securelyStored = await store.saveDiscoveredServerConfig(value.id, connection, {
             name: candidate.service,
             manager: candidate.manager,
@@ -411,10 +569,11 @@ else {
             config: candidate.config,
           });
           changed();
+          const filled = `连接端口 ${connection.frpPort} / ${connection.httpPort} / ${connection.httpsPort}，令牌已写入安全存储`;
           return {
             note: securelyStored
-              ? `已读取 ${connection.format.toUpperCase()} 配置并保存为只读服务器；FRP 令牌使用系统安全存储保护。`
-              : `已读取 ${connection.format.toUpperCase()} 配置并保存为只读服务器；当前系统安全存储不可用，令牌只在本次应用运行期间保留，重启后需重新检索。`,
+              ? `已从服务端 ${candidate.config} 读取 ${connection.format.toUpperCase()} 配置并回填到本地服务器：${filled}；已保存为只读连接。`
+              : `已从服务端 ${candidate.config} 读取 ${connection.format.toUpperCase()} 配置并回填到本地服务器：${filled}（当前系统安全存储不可用，令牌仅在本次运行期间有效）。`,
           };
         },
         'server:control': (p) => {
@@ -442,6 +601,7 @@ else {
             await yes(
               '清理服务端日志？',
               '只清空此部署的日志文件，不停止服务；systemd journal 日志无法按单个服务安全清理。',
+              p,
             )
           )
             return remote.clearLogs(id);
@@ -460,6 +620,7 @@ else {
             await yes(
               '恢复部署备份？',
               '服务必须先停止。恢复前备份当前文件，校验通过后恢复，不自动启动。',
+              p,
             )
           )
             return remote.restore(value.id, value.path);
@@ -470,16 +631,17 @@ else {
             throw new AppError('只读服务器配置已导入，不能作为服务端管理配置编辑。');
           return remote.readConfig(id);
         },
+        'server:autostart': (p) => {
+          const id = pickId(p);
+          if (store.server(id).accessMode === 'readonly')
+            throw new AppError('只读服务器不提供开机启动状态。');
+          return remote.autostart(id);
+        },
         'server:apply': async (p) => {
           const id = pickId(p);
           if (store.server(id).accessMode === 'readonly')
             throw new AppError('只读服务器不可修改 FRP 服务端配置。');
-          if (
-            !(await yes(
-              '应用服务端配置？',
-              '将校验新配置、备份旧配置并替换文件。服务不会自动重启。',
-            ))
-          )
+          if (!(await yes('应用服务端配置？', '将校验新配置、备份旧配置、替换文件并重启服务。', p)))
             return;
           return remote.apply(id);
         },
@@ -491,6 +653,7 @@ else {
             !(await yes(
               '替换服务端版本？',
               '服务必须先停止。替换前备份程序及配置，不自动转换配置或启动服务。',
+              p,
             ))
           )
             return;
@@ -500,192 +663,63 @@ else {
           const item = instanceSchema.parse(p);
           if (item.mode === 'raw' && !item.rawConfig.trim())
             throw new AppError('高级客户端配置不能为空。');
-          if (processes.running(item.id)) throw new AppError('请先停止实例再修改配置。');
+          // 运行中保存配置：先记住状态，落盘后由渲染层统一重启，避免边写边跑读到半份配置。
+          const restartAfterSave = processes.running(item.id);
           if (item.mode === 'form') {
             for (const rule of item.proxies)
-              if (rule.type === 'http' || rule.type === 'https') {
-                console.log(rule.domains.filter(Boolean));
+              if (rule.type === 'http' || rule.type === 'https')
                 rule.domains = normalizeDomains(rule.domains.filter(Boolean));
-              }
-            validateRules(item.proxies);
-            const coveredDomains = (domains: string[]) =>
-              new Set(domains.map((domain) => domain.toLowerCase().replace(/\.$/, '')));
-            for (const rule of item.proxies) {
-              if (rule.type !== 'https' || rule.tlsMode !== 'terminate' || !rule.certificateId)
-                continue;
-              const certificate = store.data.certificates.find(
-                (candidate) => candidate.id === rule.certificateId,
+            const server = store.server(item.serverId);
+            if (server.httpsPort === 443) {
+              const localCerts = store.data.serverCertificates.filter(
+                (certificate) =>
+                  certificate.serverId === server.id &&
+                  certificate.location === 'local' &&
+                  certificate.tlsPlan !== 'server',
               );
-              if (!certificate) throw new AppError(`${rule.name} 关联的证书不存在。`);
-              const covered = coveredDomains(certificate.domains);
-              if (!rule.domains.every((domain) => covered.has(domain)))
-                throw new AppError(`${rule.name} 的域名未被关联证书全部覆盖。`);
+              for (const rule of item.proxies) {
+                if (rule.type !== 'https' || rule.certificateId || rule.certPath) continue;
+                const matched =
+                  localCerts.find((certificate) =>
+                    certificate.domains.some((domain) => rule.domains.includes(domain)),
+                  ) ?? localCerts[0];
+                if (!matched)
+                  throw new AppError(
+                    `服务器「${server.name}」的 HTTPS 入口是 443，请先为域名签发本机证书，再创建 HTTPS 规则。`,
+                  );
+                rule.tlsMode = 'terminate';
+                rule.certificateId = matched.localCertificateId ?? matched.id;
+              }
             }
+            validateRules(item.proxies);
           }
           await store.saveInstance(item);
           changed();
+          if (restartAfterSave) {
+            await processes.stop(item.id);
+            await processes.start(item.id);
+          }
+          return { restarted: restartAfterSave };
         },
         'instance:delete': async (p) => {
           const id = pickId(p);
           store.instance(id);
-          if (!(await yes('删除客户端实例？', '此实例的本机穿透将停止，配置将删除。'))) return;
+          if (!(await yes('删除客户端实例？', '此实例的本机穿透将停止，配置将删除。', p))) return;
           await processes.stop(id);
-          store.data.serverSites = store.data.serverSites.map((site) =>
-            site.instanceId === id ? { ...site, outOfSync: true } : site,
-          );
           store.dropSecrets(`instance:${id}:`);
           store.data.instances = store.data.instances.filter((i) => i.id !== id);
           await store.persist();
           changed();
         },
-        'site:create': async (p) => {
-          const input = z
-            .object({
-              instanceId: idSchema,
-              ruleId: idSchema,
-              mainConfig: z.string().max(4096).optional(),
-            })
-            .parse(p);
-          const instance = store.instance(input.instanceId);
-          const server = store.server(instance.serverId);
-          if (server.accessMode === 'readonly')
-            throw new AppError('只读服务器不可修改 Nginx 站点。');
-          if (!remote.connected(server.id)) throw new AppError('请先连接目标服务器的 SSH。');
-          if (instance.mode !== 'form')
-            throw new AppError('高级配置实例无法自动读取 HTTP 域名，请使用表单模式。');
-          const rule = instance.proxies.find((item) => item.id === input.ruleId);
-          if (!rule || rule.type !== 'http' || !rule.domains.length)
-            throw new AppError('来源规则必须是含域名的 HTTP 规则。');
-          if (
-            store.data.serverSites.some(
-              (site) =>
-                site.serverId === server.id &&
-                site.domains.some((domain) => rule.domains.includes(domain)),
-            )
-          )
-            throw new AppError('该服务器已有站点使用这些域名。');
-          const taskId = randomBytes(12).toString('hex');
-          const progress = (step: string, message: string) =>
-            window?.webContents.send('server-site:progress', {
-              taskId,
-              status: step === '完成' ? 'completed' : 'running',
-              step,
-              message,
-              updatedAt: Date.now(),
-            });
-          return remote.locked(server.id, async () => {
-            progress('检测权限', '确认 root 或免密 sudo 权限');
-            const admin = remote.nginxAdmin(server.id);
-            await admin.run('command -v nginx >/dev/null && nginx -t');
-            progress('发现配置', '读取 Nginx 主配置路径');
-            const dump = await admin.run('nginx -T 2>&1');
-            const detected = /^nginx: the configuration file (\S+) syntax is ok/m.exec(dump)?.[1];
-            const mainConfig = input.mainConfig || detected;
-            if (!mainConfig || !mainConfig.startsWith('/'))
-              throw new AppError('无法从 nginx -T 定位主配置。可再次创建并填写主配置绝对路径。');
-            const info = await remote.detect(server.id);
-            const root = `${info.home}/.local/share/intranet-frp`;
-            const site = {
-              id: randomBytes(12).toString('hex'),
-              name: rule.name,
-              domains: rule.domains,
-              upstreamPort: server.httpPort,
-              acmeRoot: `${root}/acme/http01`,
-            };
-            progress('备份并写入', '保存 Nginx 配置备份并生成站点');
-            await admin.run(
-              `mkdir -p -- ${quote(`${root}/vhost/nginx`)} ${quote(`${root}/acme/http01/.well-known/acme-challenge`)} ${quote(`${root}/backups`)}`,
-            );
-            const applied = await applyNginxSite(admin, mainConfig, site);
-            const record = {
-              ...site,
-              serverId: server.id,
-              instanceId: instance.id,
-              ruleId: rule.id,
-              configPath: applied.configPath,
-              mainConfig,
-              includeCreatedByApp: applied.includeCreatedByApp,
-              createdAt: Date.now(),
-              outOfSync: false,
-            };
-            await store.saveServerSite(record);
-            progress('完成', 'Nginx 语法检查与重载成功');
-            changed();
-            return record;
-          });
-        },
-        'site:delete': async (p) => {
-          const { id } = z.object({ id: idSchema }).parse(p);
-          const site = store.data.serverSites.find((item) => item.id === id);
-          if (!site) throw new AppError('站点记录不存在。');
-          if (store.server(site.serverId).accessMode === 'readonly')
-            throw new AppError('只读服务器不可删除 Nginx 站点。');
-          if (
-            !(await yes(
-              '删除 Nginx 站点？',
-              `${site.domains.join('、')}\n只删除应用创建的站点配置，并测试、重载 Nginx。`,
-            ))
-          )
-            return;
-          if (!remote.connected(site.serverId)) await remote.connect(site.serverId);
-          return remote.locked(site.serverId, async () => {
-            const admin = remote.nginxAdmin(site.serverId);
-            const path = site.configPath;
-            const content = await admin.read(path);
-            if (!content.includes('# 由穿透工作台管理；修改前请在应用中操作。'))
-              throw new AppError(
-                '站点配置已不再带有本应用标记，为避免删除用户修改后的文件，已停止操作。',
-              );
-            const backup = `${path}.intranet-backup-${Date.now()}`;
-            const remaining = store.data.serverSites.filter(
-              (item) => item.serverId === site.serverId && item.id !== id,
-            );
-            const mainConfig = site.mainConfig;
-            const includeRoot = path.split('/vhost/nginx/')[0];
-            const includePath = `${includeRoot}/vhost/nginx/*.conf`;
-            const removeInclude = !remaining.length && !!mainConfig && site.includeCreatedByApp;
-            const mainContent = removeInclude && mainConfig ? await admin.read(mainConfig) : '';
-            const mainMode = removeInclude && mainConfig ? await admin.mode(mainConfig) : '644';
-            const mainBackup = removeInclude
-              ? `${includeRoot}/backups/nginx-main-remove-${Date.now()}.conf`
-              : '';
-            if (removeInclude && mainConfig && (await admin.read(mainConfig)) !== mainContent)
-              throw new AppError('Nginx 主配置在操作期间发生变化，请重试以避免覆盖外部修改。');
-            await admin.run(
-              `${removeInclude && mainConfig ? `cp -p -- ${quote(mainConfig)} ${quote(mainBackup)} && ` : ''}cp -p -- ${quote(path)} ${quote(backup)} && rm -f -- ${quote(path)}`,
-            );
-            try {
-              if (removeInclude && mainConfig)
-                await admin.write(
-                  mainConfig,
-                  removeHttpInclude(mainContent, includePath),
-                  mainMode,
-                );
-              await admin.run('nginx -t && nginx -s reload');
-            } catch (error) {
-              await admin.write(path, content, '644').catch(() => {});
-              if (removeInclude && mainConfig)
-                await admin.write(mainConfig, mainContent, mainMode).catch(() => {});
-              await admin.run('nginx -t && nginx -s reload').catch(() => {});
-              throw error;
-            }
-            store.data.serverSites = store.data.serverSites.filter((item) => item.id !== id);
-            await store.persist();
-            changed();
-            return { note: 'Nginx 站点已删除。' };
-          });
-        },
         'instance:start': async (p) => {
           const id = pickId(p);
           await processes.start(id);
-          await certificates.instanceStarted(id);
         },
         'instance:stop': (p) => processes.stop(pickId(p)),
         'instance:restart': async (p) => {
           const id = pickId(p);
           await processes.stop(id);
           await processes.start(id);
-          await certificates.instanceStarted(id);
         },
         'instance:logs': (p) => processes.log(pickId(p)),
         'instance:logs:clear': async (p) => {
@@ -694,96 +728,10 @@ else {
             await yes(
               '清理客户端日志？',
               '只清除此实例在应用中保留的日志，不停止客户端；运行时产生的新日志会继续记录。',
+              p,
             )
           )
             return processes.clearLogs(id);
-        },
-        'certificate:import': async (p) => {
-          const value = z
-            .object({
-              name: z.string().max(100).default(''),
-              domains: z.array(z.string().max(253)).min(1).max(100),
-              certificatePath: z.string().min(1).max(4096),
-              privateKeyPath: z.string().min(1).max(4096),
-            })
-            .parse(p);
-          const certificate = await certificates.importManual(value);
-          changed();
-          return certificate;
-        },
-        'certificate:issue': async (p) => {
-          const value = z
-            .object({
-              taskId: idSchema,
-              name: z.string().max(100).default(''),
-              domains: z.array(z.string().max(253)).min(1).max(100),
-              provider: z.enum(['letsencrypt', 'litessl']),
-              email: z.string().email().max(254),
-              challenge: z.enum(['http-01', 'dns-01']),
-              termsAgreed: z.boolean(),
-              eabKid: z.string().max(4096).optional(),
-              eabHmac: z.string().max(4096).optional(),
-            })
-            .parse(p);
-          if (certificateIssueControllers.has(value.taskId))
-            throw new AppError('此证书签发任务已存在。');
-          const controller = new AbortController();
-          certificateIssueControllers.set(value.taskId, controller);
-          let currentStep = '校验域名与签发参数';
-          reportCertificateProgress(value.taskId, {
-            status: 'running',
-            step: currentStep,
-            message: '正在检查域名、验证方式和证书机构配置。',
-          });
-          try {
-            const domains = normalizeDomains(value.domains);
-            const assignments =
-              value.challenge === 'http-01'
-                ? resolveHttp01Assignments(store.data.instances, store.data.servers, domains)
-                : [];
-            const record = await certificates.issue({ ...value, domains }, assignments, undefined, {
-              taskId: value.taskId,
-              signal: controller.signal,
-              onProgress: (progress) => {
-                currentStep = progress.step;
-                reportCertificateProgress(value.taskId, progress);
-              },
-              promptDnsChallenge: (records) =>
-                new Promise<boolean>((resolve) => {
-                  const finish = (continueIssue: boolean) => {
-                    dnsChallengeWaiters.delete(value.taskId);
-                    controller.signal.removeEventListener('abort', onAbort);
-                    resolve(continueIssue);
-                  };
-                  const onAbort = () => finish(false);
-                  dnsChallengeWaiters.set(value.taskId, finish);
-                  controller.signal.addEventListener('abort', onAbort, { once: true });
-                  if (controller.signal.aborted) onAbort();
-                  else
-                    reportCertificateProgress(value.taskId, {
-                      status: 'waiting-user',
-                      step: currentStep,
-                      message: '请按下面的记录添加 DNS TXT；确认解析生效后继续。',
-                      dnsRecords: records,
-                    });
-                }),
-            });
-            changed();
-            return record;
-          } catch (error) {
-            const cancelled = controller.signal.aborted;
-            reportCertificateProgress(value.taskId, {
-              status: cancelled ? 'cancelled' : 'failed',
-              step: currentStep,
-              message: cancelled
-                ? '签发已取消；临时验证配置已开始清理。'
-                : redact(friendlyError(error), store.allSecrets()).slice(0, 1200),
-            });
-            throw error;
-          } finally {
-            dnsChallengeWaiters.delete(value.taskId);
-            certificateIssueControllers.delete(value.taskId);
-          }
         },
         'certificate:cancel': (p) => {
           const id = pickId(p);
@@ -805,69 +753,288 @@ else {
           answer(value.continueIssue);
           return value.continueIssue ? '已确认 DNS 记录，继续验证。' : '已取消签发。';
         },
-        'certificate:associate': async (p) => {
+        'instance:preview': (p) => processes.preview(instanceSchema.parse(p)),
+        [ACTIONS.versionCatalog]: (p) => {
+          const value =
+            typeof p === 'number'
+              ? { page: p, force: false }
+              : z
+                  .object({
+                    page: z.number().int().min(1).max(1000).default(1),
+                    force: z.boolean().default(false),
+                  })
+                  .parse(p ?? {});
+          return versions.catalog(value.page, { force: value.force });
+        },
+        // 只解析版本与架构，不联网、不下载；界面据此实时显示「为什么是这个版本」。
+        [ACTIONS.versionResolve]: (p) =>
+          versionResolver.resolve(
+            z
+              .object({
+                purpose: z.enum(['server', 'client']),
+                serverId: z.string().max(100).optional(),
+                version: z.string().max(50).optional(),
+                platform: z.string().max(30).optional(),
+                arch: z.string().max(30).optional(),
+              })
+              .parse(p ?? {}),
+          ),
+        // 命中已安装直接复用；否则自动下载 + 校验 + 解包，全程通过 download:progress 上报。
+        [ACTIONS.versionEnsure]: async (p) => {
           const value = z
             .object({
-              certificateId: idSchema,
-              targets: z
-                .array(z.object({ instanceId: idSchema, ruleId: idSchema }))
-                .min(1)
-                .max(100),
+              taskId: z.string().min(1).max(100),
+              purpose: z.enum(['server', 'client']),
+              serverId: z.string().max(100).optional(),
+              version: z.string().max(50).optional(),
+              platform: z.string().max(30).optional(),
+              arch: z.string().max(30).optional(),
+              refreshCatalog: z.boolean().optional(),
+              confirmed: z.boolean().optional(),
             })
             .parse(p);
-          return certificates.associate(value.certificateId, value.targets);
-        },
-        'certificate:auto-renew': async (p) => {
-          const value = z.object({ id: idSchema, enabled: z.boolean() }).parse(p);
-          return certificates.setAutoRenew(value.id, value.enabled);
-        },
-        'certificate:delete': async (p) => {
-          const id = pickId(p);
-          if (!(await yes('删除 SSL 证书？', '证书和私钥文件将从本机应用目录删除。'))) return;
-          await certificates.remove(id);
-        },
-        'instance:preview': (p) => processes.preview(instanceSchema.parse(p)),
-        'version:catalog': (p) =>
-          versions.catalog(
-            z
-              .number()
-              .int()
-              .min(1)
-              .max(1000)
-              .parse(p ?? 1),
-          ),
-        'version:install': async (p) => {
-          const request = await versions.resolveReleaseDigest(installSchema.parse(p));
-          if (
-            !request.digest &&
-            !(await yes(
-              '安装未经发布校验的程序？',
-              '未能取得发布方 SHA256，本次无法与官方摘要核对。请确认下载或导入来源可信；本机安装时仍会执行程序检查实际版本。',
-            ))
-          )
-            return;
-          const installed = await versions.install(request);
+          const result = await versionResolver.ensure(value);
           changed();
-          return installed;
+          return result;
+        },
+        [ACTIONS.versionInstall]: async (p) => {
+          const raw = (p && typeof p === 'object' ? p : {}) as Record<string, unknown>;
+          const parsed = installSchema.parse(p);
+          const taskId =
+            parsed.taskId ??
+            (typeof raw.taskId === 'string' ? raw.taskId : randomBytes(12).toString('hex'));
+          const version = parsed.version.replace(/^v/, '');
+          const key = versionKey(parsed);
+          const purpose: 'server' | 'client' | 'manual' =
+            raw.purpose === 'server' || raw.purpose === 'client' ? raw.purpose : 'manual';
+          const meta = {
+            purpose,
+            label: `${parsed.localPath ? '导入' : '下载'} FRP ${version} · ${parsed.platform}/${parsed.arch}`,
+          };
+          const send = (
+            status: DownloadProgress['status'],
+            message: string,
+            patch: Partial<DownloadProgress> = {},
+          ) =>
+            reportDownloadProgress(
+              progressEvent({ taskId, key, version }, { status, message, ...meta, ...patch }),
+            );
+          // 点击即刻上报，消除 resolveReleaseDigest 造成的静默期。
+          send('starting', '正在准备安装包。');
+          try {
+            const request = await versions.resolveReleaseDigest(parsed);
+            // 不再弹 Electron 原生框：抛特定 code 交给渲染层确认后带 confirmed 重试。
+            if (!request.digest && raw.confirmed !== true)
+              throw new AppError(
+                '未能取得 FRP 官方 SHA256 校验值，本次无法与官方摘要核对。请确认下载或导入来源可信后继续。',
+                CHECKSUM_UNAVAILABLE,
+              );
+            const installed = await versions.install(request, {
+              taskId,
+              onProgress: (progress) => reportDownloadProgress({ ...progress, ...meta }),
+            });
+            changed();
+            return installed;
+          } catch (error) {
+            // install() 内部已上报 failed；这里只补报进入下载之前的失败。
+            if (error instanceof AppError && error.code === CHECKSUM_UNAVAILABLE)
+              send('failed', friendlyError(error));
+            throw error;
+          }
         },
         'version:verify': async (p) => {
-          const installed = await versions.verifyInstalledRelease(z.string().parse(p));
+          const installed = await versions.verifyInstalledRelease(pickId(p));
           changed();
           return installed;
         },
         'version:delete': async (p) => {
-          const key = z.string().parse(p);
-          if (await yes('删除本机安装包？', '被实例或部署引用的版本不能删除。'))
+          const key = pickId(p);
+          if (await yes('删除本机安装包？', '被实例或部署引用的版本不能删除。', p))
             await versions.remove(key);
           changed();
         },
-        'settings:save': async (p) => {
-          const settings = settingsSchema.parse(p);
+        [ACTIONS.settingsSave]: async (p) => {
+          const raw = z
+            .object({
+              proxyUrl: z.string().max(2048).optional(),
+              dnsProvider: z.enum(['dnspod', 'aliyun', 'cloudflare']).optional(),
+              deployDefault: z.enum(['manual', 'auto']).optional(),
+              catalogCacheHours: z.number().int().min(1).max(720).optional(),
+              downloadRetries: z.number().int().min(0).max(10).optional(),
+              managedTlsEnabled: z.boolean().optional(),
+              confirmDangerous: z.boolean().optional(),
+              theme: z.enum(['light', 'dark', 'system']).optional(),
+              dnsCredentials: z.record(z.string().max(4096)).optional(),
+              acmeEmail: z.string().max(254).optional(),
+              eabKid: z.string().max(4096).optional(),
+              eabHmac: z.string().max(4096).optional(),
+            })
+            .parse(p ?? {});
+          // EAB 密钥只放系统安全存储；空字符串表示沿用已保存值。
+          if (raw.eabKid) store.putSecret('acme:litessl:eabKid', raw.eabKid);
+          if (raw.eabHmac) store.putSecret('acme:litessl:eabHmac', raw.eabHmac);
+          const savedSecret = (key: string) => {
+            try {
+              return store.secret(key);
+            } catch {
+              return '';
+            }
+          };
+          const eabConfigured = Boolean(
+            (raw.eabKid || savedSecret('acme:litessl:eabKid')) &&
+            (raw.eabHmac || savedSecret('acme:litessl:eabHmac')),
+          );
+          const settings = settingsSchema.parse({
+            ...store.data.settings,
+            ...raw,
+            litesslEabConfigured: eabConfigured,
+          });
+          // 凭据只放系统安全存储，绝不落到 state.json 明文。
+          if (raw.dnsCredentials) {
+            for (const [name, value] of Object.entries(raw.dnsCredentials))
+              store.putSecret(`dns:${settings.dnsProvider}:${name}`, value);
+          }
           await setProxy(settings.proxyUrl);
           versions.resetNetworkState();
           store.data.settings = settings;
           await store.persist();
           changed();
+        },
+        [ACTIONS.dnsAccountSave]: async (p) => {
+          const raw = z
+            .object({
+              id: z
+                .string()
+                .regex(/^[a-zA-Z0-9_-]{1,80}$/)
+                .optional(),
+              name: z.string().min(1).max(100),
+              provider: dnsAccountSchema.shape.provider,
+              secretId: z.string().max(512).optional(),
+              secretKey: z.string().max(512).optional(),
+              token: z.string().max(4096).optional(),
+              endpoint: z.string().max(512).optional(),
+            })
+            .parse(p ?? {});
+          const existing = raw.id
+            ? store.data.dnsAccounts.find((account) => account.id === raw.id)
+            : undefined;
+          const id = raw.id ?? randomUUID();
+          const account = dnsAccountSchema.parse({
+            id,
+            name: raw.name.trim(),
+            provider: raw.provider,
+            createdAt: existing?.createdAt ?? Date.now(),
+          });
+          // 空白凭据表示沿用已保存值；绝不把明文写进 state.json。
+          for (const [field, value] of [
+            ['secretId', raw.secretId],
+            ['secretKey', raw.secretKey],
+            ['token', raw.token],
+            ['endpoint', raw.endpoint],
+          ] as const)
+            if (value) store.putSecret(`dns:account:${id}:${field}`, value);
+          store.data.dnsAccounts = existing
+            ? store.data.dnsAccounts.map((item) => (item.id === id ? account : item))
+            : [...store.data.dnsAccounts, account];
+          await store.persist();
+          changed();
+          return account;
+        },
+        [ACTIONS.dnsAccountDelete]: async (p) => {
+          const id = z
+            .string()
+            .regex(/^[a-zA-Z0-9_-]{1,80}$/)
+            .parse(p);
+          store.data.dnsAccounts = store.data.dnsAccounts.filter((account) => account.id !== id);
+          store.dropSecrets(`dns:account:${id}:`);
+          await store.persist();
+          changed();
+        },
+        [ACTIONS.dnsAccountTest]: async (p) => {
+          const value = z
+            .object({
+              id: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
+              name: z.string().min(1).max(100),
+              provider: dnsAccountSchema.shape.provider,
+              secretId: z.string().max(512).optional(),
+              secretKey: z.string().max(512).optional(),
+              token: z.string().max(4096).optional(),
+              endpoint: z.string().max(512).optional(),
+            })
+            .parse(p ?? {}) as DnsAccountTestInput;
+          return serverCertificates.testAccount(value);
+        },
+        [ACTIONS.dnsDomains]: async (p) => {
+          const value = z
+            .object({
+              accountId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
+              provider: dnsAccountSchema.shape.provider,
+            })
+            .parse(p ?? {});
+          const account = store.data.dnsAccounts.find((item) => item.id === value.accountId);
+          if (!account) throw new AppError('DNS 账户不存在，请重新选择。');
+          return manageAdapterForAccount(account.provider, store, value.accountId).listDomains();
+        },
+        [ACTIONS.dnsRecords]: async (p) => {
+          const value = z
+            .object({
+              accountId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
+              provider: dnsAccountSchema.shape.provider,
+              domain: z.string().min(1).max(253),
+            })
+            .parse(p ?? {});
+          const account = store.data.dnsAccounts.find((item) => item.id === value.accountId);
+          if (!account) throw new AppError('DNS 账户不存在，请重新选择。');
+          return manageAdapterForAccount(account.provider, store, value.accountId).listRecords(
+            value.domain,
+          );
+        },
+        [ACTIONS.dnsRecordSave]: async (p) => {
+          const value = z
+            .object({
+              accountId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
+              provider: dnsAccountSchema.shape.provider,
+              domain: z.string().min(1).max(253),
+              recordId: z.string().max(120).optional(),
+              name: z.string().min(1).max(253),
+              type: z.string().min(1).max(20),
+              value: z.string().min(1).max(4096),
+              ttl: z.number().int().min(1).max(86400),
+              line: z.string().max(60).optional(),
+              priority: z.number().int().min(0).max(65535).optional(),
+              proxied: z.boolean().optional(),
+            })
+            .parse(p ?? {});
+          const account = store.data.dnsAccounts.find((item) => item.id === value.accountId);
+          if (!account) throw new AppError('DNS 账户不存在，请重新选择。');
+          const adapter = manageAdapterForAccount(account.provider, store, value.accountId);
+          const record = {
+            name: value.name,
+            type: value.type.toUpperCase(),
+            value: value.value,
+            ttl: value.ttl,
+            line: value.line,
+            priority: value.priority,
+            proxied: value.proxied,
+          };
+          if (value.recordId) await adapter.updateRecord(value.domain, value.recordId, record);
+          else await adapter.createRecord(value.domain, record);
+        },
+        [ACTIONS.dnsRecordDelete]: async (p) => {
+          const value = z
+            .object({
+              accountId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
+              provider: dnsAccountSchema.shape.provider,
+              domain: z.string().min(1).max(253),
+              recordId: z.string().min(1).max(120),
+            })
+            .parse(p ?? {});
+          const account = store.data.dnsAccounts.find((item) => item.id === value.accountId);
+          if (!account) throw new AppError('DNS 账户不存在，请重新选择。');
+          await manageAdapterForAccount(account.provider, store, value.accountId).deleteRecord(
+            value.domain,
+            value.recordId,
+          );
         },
         'file:pick': async (p) => {
           const purpose = z.enum(['key', 'archive', 'config', 'certificate']).parse(p);
@@ -900,6 +1067,247 @@ else {
           if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password)
             throw new AppError('仅允许打开 HTTP/HTTPS 地址。');
           await shell.openExternal(url.toString());
+        },
+        // ── 服务端证书：只读探测、签发、部署、环境复核、续期 ──
+        [ACTIONS.tlsPlan]: async (p) => {
+          const value = z.object({ serverId: idSchema }).parse(p);
+          return serverCertificates.plan(value.serverId);
+        },
+        [ACTIONS.certificateInspect]: async (p) => {
+          const value = z
+            .object({
+              serverId: idSchema,
+              domains: z.array(z.string().max(253)).max(100).optional(),
+            })
+            .parse(p);
+          const domains = value.domains?.length
+            ? value.domains
+            : store.data.serverCertificates
+                .filter((certificate) => certificate.serverId === value.serverId)
+                .flatMap((certificate) => certificate.domains);
+          const report = await siteInspector.inspect(value.serverId, domains);
+          await store.saveInspection(value.serverId, report);
+          changed();
+          return report;
+        },
+        [ACTIONS.certificateIssueServer]: async (p) => {
+          const value = z
+            .object({
+              taskId: idSchema,
+              serverId: idSchema,
+              name: z.string().max(100).default(''),
+              domains: z.array(z.string().max(253)).min(1).max(100),
+              provider: z.enum(['letsencrypt', 'litessl']),
+              email: z.string().email().max(254),
+              challenge: z.enum(['http-01', 'dns-01']),
+              dnsAutomation: z.enum(['api', 'cname', 'reuse', 'manual']).optional(),
+              dnsAccountId: z
+                .string()
+                .regex(/^[a-zA-Z0-9_-]{1,80}$/)
+                .optional(),
+              httpInstanceId: z
+                .string()
+                .regex(/^[a-zA-Z0-9_-]{1,80}$/)
+                .optional(),
+              certTarget: z.enum(['local', 'server']).optional(),
+              localCertificateId: z
+                .string()
+                .regex(/^[a-zA-Z0-9_-]{1,80}$/)
+                .optional(),
+              termsAgreed: z.boolean(),
+              eabKid: z.string().max(4096).optional(),
+              eabHmac: z.string().max(4096).optional(),
+              keySize: z.union([z.literal(2048), z.literal(3072), z.literal(4096)]).optional(),
+              ruleId: z
+                .string()
+                .regex(/^[a-zA-Z0-9_-]{1,80}$/)
+                .optional(),
+            })
+            .parse(p) as IssueServerInput;
+          if (certificateIssueControllers.has(value.taskId))
+            throw new AppError('此证书签发任务已存在。');
+          const controller = new AbortController();
+          certificateIssueControllers.set(value.taskId, controller);
+          try {
+            const record = await serverCertificates.issue(value, {
+              taskId: value.taskId,
+              signal: controller.signal,
+              onProgress: (progress) => reportCertificateProgress(value.taskId, progress),
+            });
+            // 方案 B 新增隐藏 HTTPS 伴随规则后，运行中的 frpc 需要重载才能暴露 443 入口。
+            if (record.instanceId && processes.running(record.instanceId)) {
+              await processes.stop(record.instanceId);
+              await processes.start(record.instanceId);
+            }
+            changed();
+            return record;
+          } catch (error) {
+            reportCertificateProgress(value.taskId, {
+              status: controller.signal.aborted ? 'cancelled' : 'failed',
+              step: '签发结束',
+              message:
+                error instanceof Error ? redact(error.message, store.allSecrets()) : String(error),
+            });
+            throw error;
+          } finally {
+            dnsChallengeWaiters.delete(value.taskId);
+            certificateIssueControllers.delete(value.taskId);
+          }
+        },
+        [ACTIONS.certificateReadPem]: async (p) => {
+          const value = z.object({ id: idSchema }).parse(p);
+          return localCertificates.readPem(value.id);
+        },
+        [ACTIONS.certificateImportPem]: async (p) => {
+          const value = z
+            .object({
+              instanceId: idSchema,
+              name: z.string().max(100).default(''),
+              domains: z.array(z.string().max(253)).min(1).max(100),
+              certPem: z.string().max(1048576).min(1),
+              keyPem: z.string().max(1048576).min(1),
+            })
+            .parse(p);
+          const instance = store.instance(value.instanceId);
+          if (instance.mode !== 'form')
+            throw new AppError('高级原始配置实例不能通过表单启用证书。');
+          const record = await localCertificates.importPemText({
+            name: value.name || value.domains[0],
+            domains: value.domains,
+            certPem: value.certPem,
+            keyPem: value.keyPem,
+          });
+          const wasRunning = processes.running(instance.id);
+          await serverCertificates.enableLocalCertificate(
+            value.instanceId,
+            value.domains,
+            record.id,
+          );
+          if (wasRunning) {
+            await processes.stop(instance.id);
+            await processes.start(instance.id);
+          }
+          changed();
+          return record;
+        },
+        [ACTIONS.certificateRemove]: async (p) => {
+          const value = z.object({ instanceId: idSchema, ruleId: idSchema }).parse(p);
+          const wasRunning = processes.running(value.instanceId);
+          const outcome = await serverCertificates.removeForRule(value.instanceId, value.ruleId);
+          if (wasRunning) {
+            await processes.stop(value.instanceId);
+            await processes.start(value.instanceId);
+          }
+          changed();
+          return outcome;
+        },
+        [ACTIONS.certificateDeploy]: async (p) => {
+          const value = z
+            .object({
+              certificateId: idSchema,
+              level: z.enum(['L0', 'L1', 'L2']),
+              target: z.string().max(4096).optional(),
+              confirmed: z.boolean().default(false),
+            })
+            .parse(p);
+          const outcome = await serverCertificates.deploy(
+            value.certificateId,
+            value.level,
+            value.target,
+            value.confirmed,
+          );
+          changed();
+          return outcome;
+        },
+        [ACTIONS.certificateRefreshEnv]: async (p) => {
+          const value = z
+            .object({ serverId: idSchema, certificateId: idSchema.optional() })
+            .parse(p);
+          const outcome = await serverCertificates.refreshEnvironment(value.serverId);
+          changed();
+          return outcome;
+        },
+        [ACTIONS.certificateRenewNow]: async (p) => {
+          const value = z
+            .object({
+              certificateId: idSchema,
+              serverId: idSchema.optional(),
+              confirmed: z.boolean().optional(),
+            })
+            .parse(p);
+          const taskId = `renew-${value.certificateId}`.slice(0, 80);
+          const record = await serverCertificates.renewNow(value.certificateId, {
+            taskId,
+            signal: new AbortController().signal,
+            onProgress: (progress) => reportCertificateProgress(taskId, progress),
+          });
+          changed();
+          return record;
+        },
+        [ACTIONS.certificateDnsTest]: async (p) => {
+          const value = z
+            .object({
+              provider: z.string().max(64),
+              domain: z.string().max(253).optional(),
+              secretId: z.string().max(512).optional(),
+              secretKey: z.string().max(512).optional(),
+              token: z.string().max(4096).optional(),
+              endpoint: z.string().max(512).optional(),
+            })
+            .parse(p) as DnsTestInput;
+          return serverCertificates.testDns(value);
+        },
+        // ── 托管 TLS 实例：隔离安装 / 启停 / 让位 / 一键卸载 ──
+        [ACTIONS.tlsProxyStatus]: async (p) => {
+          const value = z.object({ serverId: idSchema }).parse(p);
+          const status = await tlsProxy.status(value.serverId);
+          changed();
+          return status;
+        },
+        [ACTIONS.tlsProxyInstall]: async (p) => {
+          const status = await tlsProxy.install(tlsInput.parse(p), reportTlsProxyProgress);
+          changed();
+          return status;
+        },
+        [ACTIONS.tlsProxyStart]: async (p) => {
+          const status = await tlsProxy.start(tlsInput.parse(p), reportTlsProxyProgress);
+          changed();
+          return status;
+        },
+        [ACTIONS.tlsProxyStop]: async (p) => {
+          const status = await tlsProxy.stop(tlsInput.parse(p), reportTlsProxyProgress);
+          changed();
+          return status;
+        },
+        [ACTIONS.tlsProxyYield]: async (p) => {
+          const status = await tlsProxy.yieldPorts(tlsInput.parse(p), reportTlsProxyProgress);
+          changed();
+          return status;
+        },
+        [ACTIONS.tlsProxyUninstall]: async (p) => {
+          const result = await tlsProxy.uninstall(tlsInput.parse(p), reportTlsProxyProgress);
+          changed();
+          return result;
+        },
+        // ── 版本库：启动秒开缓存 / 取消 / 断点重试 ──
+        [ACTIONS.versionCatalogCached]: () => versions.cachedCatalog(),
+        [ACTIONS.versionDownloadCancel]: (p) => {
+          const value = z
+            .object({
+              taskId: z.string().max(100),
+              key: z.string().max(300).optional(),
+              discard: z.boolean().optional(),
+            })
+            .parse(p);
+          return versions.cancelDownload(value.taskId, value.discard ?? false);
+        },
+        [ACTIONS.versionDownloadRetry]: async (p) => {
+          const value = z
+            .object({ taskId: z.string().max(100), key: z.string().max(300).optional() })
+            .parse(p);
+          const installed = await versions.retryDownload(value.taskId);
+          changed();
+          return installed;
         },
         'app:quit': () => app.quit(),
       };
@@ -1038,7 +1446,6 @@ else {
     });
 }
 app.on('before-quit', (event) => {
-  if (certificateRenewalTimer) clearInterval(certificateRenewalTimer);
   for (const controller of certificateIssueControllers.values()) controller.abort();
   if (quitting || !processes) return;
   event.preventDefault();

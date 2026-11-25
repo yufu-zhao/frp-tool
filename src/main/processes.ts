@@ -79,8 +79,15 @@ export class Processes {
         );
   }
   private certificatePaths() {
+    const localServerCerts = this.store.data.serverCertificates
+      .filter((certificate) => certificate.location === 'local')
+      .map((certificate) => ({
+        id: certificate.localCertificateId ?? certificate.id,
+        certPath: certificate.certPath,
+        keyPath: certificate.keyPath,
+      }));
     return Object.fromEntries(
-      this.store.data.certificates.map((certificate) => [
+      [...this.store.data.certificates, ...localServerCerts].map((certificate) => [
         certificate.id,
         { certPath: certificate.certPath, keyPath: certificate.keyPath },
       ]),
@@ -276,11 +283,8 @@ export class Processes {
           throw new AppError(
             `实例「${instance.name}」使用高级原始配置，无法临时添加 HTTP-01 验证规则。`,
           );
-        const serverInfo = this.store.server(instance.serverId);
-        if (serverInfo.httpPort !== 80)
-          throw new AppError(
-            `服务器「${serverInfo.name}」的 FRP HTTP 入口不是公网 80 端口，无法进行 HTTP-01 验证。`,
-          );
+        // 若 frps 直接监听 80，CA 的 challenge 请求会由 frps 按 Host 路由到这条临时规则；
+        // 若服务端 80 已被占用，则由该持有者反代到 frps 的 vhost HTTP 端口。
         await this.start(assignment.instanceId, { domains: assignment.domains, localPort: port });
         started.push(assignment.instanceId);
       }

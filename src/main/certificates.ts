@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createPrivateKey, createPublicKey, randomUUID, X509Certificate } from 'node:crypto';
 import acme from 'acme-client';
 import { AppError, redact } from '../shared/errors';
-import type { CertificateIssueProgress, CertificateRecord } from '../shared/types';
+import type { CertificateIssueProgress, CertificateRecord, DnsAutomation } from '../shared/types';
 import { certificateSchema } from '../shared/types';
 import { Store } from './store';
 
@@ -17,6 +17,14 @@ export interface HttpChallengeResponder {
   port: number;
   set(token: string, value: string): void;
   remove(token: string): void;
+}
+
+// 引擎内部的响应器：远程临时响应器需要把 token 写到服务端，set/remove 允许异步。
+// 同步响应器（本机 frpc 机制）天然可赋值给此类型，故旧路径无需改动。
+export interface AcmeHttpResponder {
+  port: number;
+  set(token: string, value: string): void | Promise<void>;
+  remove(token: string): void | Promise<void>;
 }
 
 export interface HttpChallengeAssignment {
@@ -33,6 +41,7 @@ export interface IssueCertificateInput {
   termsAgreed: boolean;
   eabKid?: string;
   eabHmac?: string;
+  keySize?: 2048 | 3072 | 4096;
 }
 
 export type CertificateIssueProgressUpdate = Omit<CertificateIssueProgress, 'taskId' | 'updatedAt'>;
@@ -50,11 +59,13 @@ export type HttpChallengeRunner = <T>(
   signal?: AbortSignal,
 ) => Promise<T>;
 
-function throwIfCancelled(signal?: AbortSignal) {
+// ─────────────────────────── 通用工具 ───────────────────────────
+
+export function throwIfCancelled(signal?: AbortSignal) {
   if (signal?.aborted) throw new AppError('用户已取消证书签发。', 'CANCELLED');
 }
 
-function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+export function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return operation;
   throwIfCancelled(signal);
   return new Promise<T>((resolve, reject) => {
@@ -117,6 +128,280 @@ export function validateCertificateMaterial(certPem: string, keyPem: string, dom
   return certificate;
 }
 
+// ───────────────────── 签发引擎（与存储位置解耦） ─────────────────────
+// 只负责「向 CA 申请并校验证书材料」，返回 PEM，不落盘、不写 store。
+// 签发引擎由服务端证书库（ServerCertificates）使用；本机证书库仅保留为历史数据兼容，
+// 差别只在把材料写到哪里、写哪张记录。
+
+export interface AcmeMaterial {
+  certPem: string;
+  keyPem: string;
+  certificate: X509Certificate;
+}
+
+export interface AcmeChallengeHooks {
+  // dns-01：自动放置 TXT（A1/A2/A3）。不提供时引擎回退到手动弹窗（A4）。
+  createDnsRecord?(record: DnsChallengeRecord): Promise<void>;
+  // dns-01：验证结束后清理 TXT（A1/A2/A3）。
+  removeDnsRecord?(record: DnsChallengeRecord): Promise<void>;
+  // dns-01：手动兜底弹窗（A4）。优先用 hooks.promptDnsChallenge。
+  promptDnsChallenge?(records: DnsChallengeRecord[]): Promise<boolean>;
+  // http-01：用临时响应器包裹整个 ACME auto 调用；实现方须在 finally 立即释放。
+  withHttpResponder?<T>(
+    operation: (responder: AcmeHttpResponder) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T>;
+  // 覆盖 acme-client 的本地预校验（远程响应器 / DNS 解析未就绪时置 true）。
+  skipChallengeVerification?: boolean;
+  // 当前 DNS-01 自动化级别，仅用于进度回显。
+  dnsAutomation?: DnsAutomation;
+}
+
+function installCancelableTransport(
+  acmeClient: typeof acme,
+  hooks: CertificateIssueHooks | undefined,
+  currentStep: () => string,
+): () => void {
+  const library = acmeClient as any;
+  const axios = library.axios;
+  const signal = hooks?.signal;
+  if (!axios || !signal) return () => {};
+  const originalRequest = axios.request;
+  const retrySettings = axios.defaults?.acmeSettings;
+  const originalRetryCount = retrySettings?.retryMaxAttempts;
+  if (retrySettings) retrySettings.retryMaxAttempts = 0;
+  axios.request = async function (this: unknown, config: Record<string, unknown>) {
+    let attempt = 0;
+    while (true) {
+      throwIfCancelled(signal);
+      try {
+        return await originalRequest.call(this, { ...config, signal });
+      } catch (error) {
+        throwIfCancelled(signal);
+        const response = (error as { response?: { status?: number } }).response;
+        const code = (error as { code?: string }).code;
+        const retryable =
+          code !== 'ECONNABORTED' &&
+          code !== 'ERR_NOCK_NO_MATCH' &&
+          (!response || response.status === 429 || (response.status ?? 0) >= 500);
+        if (!retryable || attempt >= 4) throw error;
+        attempt += 1;
+        const detail = error instanceof Error ? error.message : String(error);
+        hooks?.onProgress({
+          status: 'retrying',
+          step: currentStep(),
+          attempt,
+          message: `请求失败，${Math.min(attempt * 2, 8)} 秒后重试（${attempt}/4）：${detail.slice(0, 240)}`,
+        });
+        await waitForRetry(Math.min(attempt * 2000, 8000), signal);
+      }
+    }
+  };
+  return () => {
+    axios.request = originalRequest;
+    if (retrySettings) retrySettings.retryMaxAttempts = originalRetryCount;
+  };
+}
+
+export async function issueAcmeMaterial(
+  store: Store,
+  input: IssueCertificateInput,
+  hooks: CertificateIssueHooks | undefined,
+  challenge: AcmeChallengeHooks,
+  acmeClient: typeof acme = acme,
+): Promise<AcmeMaterial> {
+  const domains = normalizeDomains(input.domains);
+  if (!input.termsAgreed) throw new AppError('请先确认已阅读并同意所选证书机构的服务条款。');
+  if (input.challenge === 'dns-01' && input.eabKid && !input.eabHmac)
+    throw new AppError('填写 EAB KID 后还需要填写 EAB HMAC 密钥。');
+  const signal = hooks?.signal;
+  const progress = (value: CertificateIssueProgressUpdate) => hooks?.onProgress(value);
+  let currentStep = '准备签发';
+  try {
+    throwIfCancelled(signal);
+    currentStep = '准备 ACME 账户';
+    progress({ status: 'running', step: currentStep, message: '正在准备 ACME 账户密钥。' });
+    const accountKeyId = `acme:${input.provider}:accountKey`;
+    let accountKey = store.secret(accountKeyId);
+    if (!accountKey) {
+      accountKey = (await acmeClient.crypto.createPrivateEcdsaKey()).toString();
+      store.putSecret(accountKeyId, accountKey);
+      await store.persist();
+    }
+    if (input.eabKid) store.putSecret(`acme:${input.provider}:eabKid`, input.eabKid);
+    if (input.eabHmac) store.putSecret(`acme:${input.provider}:eabHmac`, input.eabHmac);
+    const kid = input.eabKid || store.secret(`acme:${input.provider}:eabKid`);
+    const hmacKey = input.eabHmac || store.secret(`acme:${input.provider}:eabHmac`);
+    const directoryUrl =
+      input.provider === 'letsencrypt'
+        ? acmeClient.directory.letsencrypt.production
+        : 'https://acme.litessl.com/acme/v2/directory';
+    currentStep = '生成私钥与 CSR';
+    progress({
+      status: 'running',
+      step: currentStep,
+      message: `正在为 ${domains.length} 个域名生成 SAN 申请。`,
+    });
+    // acme-client 的 createCsr 内部按 keySize 生成 RSA 私钥；默认保持 2048。
+    const [certificateKey, csr] = await acmeClient.crypto.createCsr({
+      altNames: domains,
+      keySize: input.keySize ?? 2048,
+    });
+    throwIfCancelled(signal);
+    const client = new acmeClient.Client({
+      directoryUrl,
+      accountKey,
+      ...(kid && hmacKey ? { externalAccountBinding: { kid, hmacKey } } : {}),
+    });
+    const cleanupTransport = installCancelableTransport(acmeClient, hooks, () => currentStep);
+    let dnsPrompt = Promise.resolve();
+    const dnsRecords = new Map<string, DnsChallengeRecord>();
+    const originalLogger = (acmeClient as any).setLogger;
+    if (typeof originalLogger === 'function')
+      originalLogger((line: string) => {
+        const detail = String(line).slice(0, 400);
+        const retry = /retry(?:ing)?|backoff|attempt\s*#/i.test(detail);
+        if (retry) {
+          progress({ status: 'retrying', step: currentStep, message: detail });
+        } else if (/placing new certificate order/i.test(detail)) {
+          currentStep = '提交证书订单';
+          progress({
+            status: 'running',
+            step: currentStep,
+            message: '正在向证书机构提交域名订单。',
+          });
+        } else if (/checking account|registering account/i.test(detail)) {
+          currentStep = '注册 ACME 账户';
+          progress({
+            status: 'running',
+            step: currentStep,
+            message: '正在验证或注册 ACME 账户。',
+          });
+        }
+      });
+    const operation = async (responder?: AcmeHttpResponder): Promise<string> => {
+      throwIfCancelled(signal);
+      currentStep = '连接证书机构';
+      progress({
+        status: 'running',
+        step: currentStep,
+        message: `正在连接 ${input.provider === 'letsencrypt' ? 'Let’s Encrypt' : 'LiteSSL'}。`,
+      });
+      return client.auto({
+        csr,
+        email: input.email,
+        termsOfServiceAgreed: input.termsAgreed,
+        challengePriority: [input.challenge],
+        skipChallengeVerification:
+          challenge.skipChallengeVerification ?? input.challenge === 'dns-01',
+        challengeCreateFn: async (authorization, acmeChallenge, keyAuthorization) => {
+          if (acmeChallenge.type === 'http-01') {
+            throwIfCancelled(signal);
+            if (!responder) throw new AppError('HTTP-01 验证代理未启动。');
+            currentStep = `配置 HTTP-01：${authorization.identifier.value}`;
+            progress({
+              status: 'running',
+              step: currentStep,
+              message: '正在通过临时验证通道提供域名验证响应。',
+              dnsAutomation: challenge.dnsAutomation,
+            });
+            await Promise.resolve(responder.set(acmeChallenge.token, keyAuthorization));
+          } else if (acmeChallenge.type === 'dns-01') {
+            const record: DnsChallengeRecord = {
+              domain: authorization.identifier.value,
+              record: `_acme-challenge.${authorization.identifier.value}`,
+              value: keyAuthorization,
+            };
+            dnsRecords.set(acmeChallenge.token, record);
+            dnsPrompt = dnsPrompt.then(async () => {
+              if (challenge.createDnsRecord) {
+                currentStep = `写入 DNS-01：${record.domain}`;
+                progress({
+                  status: 'running',
+                  step: currentStep,
+                  message: '正在自动写入 TXT 记录。',
+                  dnsAutomation: challenge.dnsAutomation,
+                });
+                await abortable(challenge.createDnsRecord!(record), signal);
+              } else {
+                currentStep = `等待 DNS-01：${record.domain}`;
+                progress({
+                  status: 'waiting-user',
+                  step: currentStep,
+                  message: '请添加 TXT 记录；添加完成后点击“已添加，继续验证”。',
+                  dnsRecords: [record],
+                  dnsAutomation: challenge.dnsAutomation,
+                });
+                const prompt = hooks?.promptDnsChallenge ?? challenge.promptDnsChallenge;
+                if (!prompt) throw new AppError('DNS-01 缺少 TXT 记录处理逻辑。');
+                if (!(await abortable(prompt([record]), signal)))
+                  throw new AppError('用户取消了 DNS-01 验证。');
+              }
+            });
+            await dnsPrompt;
+            throwIfCancelled(signal);
+            currentStep = `等待 CA 验证：${record.domain}`;
+            progress({
+              status: 'running',
+              step: currentStep,
+              message: 'TXT 已就绪，正在等待证书机构查询 DNS 并验证。',
+              dnsAutomation: challenge.dnsAutomation,
+            });
+          } else throw new AppError('ACME 服务返回了未支持的验证方式。');
+        },
+        challengeRemoveFn: async (_authorization, acmeChallenge) => {
+          if (acmeChallenge.type === 'http-01') {
+            await Promise.resolve(responder?.remove(acmeChallenge.token));
+          } else if (acmeChallenge.type === 'dns-01') {
+            const record = dnsRecords.get(acmeChallenge.token);
+            if (record && challenge.removeDnsRecord)
+              await challenge.removeDnsRecord(record).catch(() => {});
+            dnsRecords.delete(acmeChallenge.token);
+          }
+        },
+      });
+    };
+    let certPem: string;
+    try {
+      if (input.challenge === 'http-01') {
+        if (!challenge.withHttpResponder)
+          throw new AppError('HTTP-01 需要临时验证通道（响应器或现有反代链路）。');
+        currentStep = '准备 HTTP-01 临时通道';
+        progress({
+          status: 'running',
+          step: currentStep,
+          message: '正在启动临时验证通道并等待其就绪。',
+        });
+        certPem = await challenge.withHttpResponder((responder) => operation(responder), signal);
+      } else {
+        certPem = await operation();
+      }
+    } finally {
+      cleanupTransport();
+      if (typeof originalLogger === 'function') originalLogger(() => {});
+    }
+    throwIfCancelled(signal);
+    currentStep = '校验证书与域名';
+    progress({
+      status: 'running',
+      step: currentStep,
+      message: '正在校验证书有效期、SAN 域名和私钥匹配。',
+    });
+    const certificate = validateCertificateMaterial(certPem, certificateKey.toString(), domains);
+    if (certPem.length > 1024 * 1024) throw new AppError('签发机构返回的证书文件超过 1 MB。');
+    return { certPem, keyPem: certificateKey.toString(), certificate };
+  } catch (error) {
+    if (signal?.aborted) throw new AppError('用户已取消证书签发。', 'CANCELLED');
+    throw new AppError(
+      redact(error instanceof Error ? error.message : String(error), store.allSecrets()).slice(
+        0,
+        1200,
+      ),
+    );
+  }
+}
+
+// ───── 本机证书库：仅为历史数据兼容与签发引擎回归测试保留，运行时不再实例化 ─────
 export class Certificates {
   private readonly directory: string;
   private issuing = new Set<string>();
@@ -236,6 +521,65 @@ export class Certificates {
     return record;
   }
 
+  /** 直接粘贴 KEY / PEM 文本导入本机证书库；域名与材料一致性由 validateCertificateMaterial 校验。 */
+  async importPemText(input: { name: string; domains: string[]; certPem: string; keyPem: string }) {
+    const domains = normalizeDomains(input.domains);
+    const certPem = input.certPem.trim();
+    const keyPem = input.keyPem.trim();
+    if (certPem.length > 1024 * 1024 || keyPem.length > 1024 * 1024)
+      throw new AppError('证书或私钥内容超过 1 MB。');
+    const certificate = validateCertificateMaterial(certPem, keyPem, domains);
+    const id = randomUUID();
+    const record = await this.saveMaterial(id, certPem, keyPem, undefined, {
+      name: input.name.trim() || domains[0],
+      domains,
+      provider: 'manual',
+      expiresAt: new Date(certificate.validTo).toISOString(),
+    });
+    await this.store.saveCertificate(record);
+    this.changed();
+    return record;
+  }
+
+  /** 读取本机证书 PEM 内容，供规则 SSL 面板回填文本框。 */
+  async readPem(id: string): Promise<{ certPem: string; keyPem: string }> {
+    const record = this.store.data.certificates.find((item) => item.id === id);
+    if (!record) throw new AppError('证书不存在或已被删除。');
+    const [certPem, keyPem] = await Promise.all([
+      readFile(record.certPath, 'utf8'),
+      readFile(record.keyPath, 'utf8'),
+    ]);
+    return { certPem, keyPem };
+  }
+
+  /** 供服务端证书签发流程复用：把 ACME 材料落到本机证书库，供 frpc https2http 引用。 */
+  async saveIssued(
+    input: {
+      id?: string;
+      name: string;
+      domains: string[];
+      provider: 'letsencrypt' | 'litessl';
+      email?: string;
+      challenge?: 'http-01' | 'dns-01';
+      dnsAccountId?: string;
+    },
+    material: AcmeMaterial,
+    existing?: CertificateRecord,
+  ) {
+    const id = input.id ?? existing?.id ?? randomUUID();
+    const record = await this.saveMaterial(id, material.certPem, material.keyPem, existing, {
+      name: input.name,
+      domains: input.domains,
+      provider: input.provider,
+      email: input.email,
+      challenge: input.challenge,
+      dnsAccountId: input.dnsAccountId,
+    });
+    await this.store.saveCertificate(record);
+    this.changed();
+    return record;
+  }
+
   async issue(
     input: IssueCertificateInput,
     assignments: HttpChallengeAssignment[] = [],
@@ -243,184 +587,49 @@ export class Certificates {
     hooks?: CertificateIssueHooks,
   ) {
     const domains = normalizeDomains(input.domains);
-    if (!input.termsAgreed) throw new AppError('请先确认已阅读并同意所选证书机构的服务条款。');
     const signature = `${input.provider}:${domains.join(',')}`;
     if (this.activeTask && this.activeTask !== hooks?.taskId)
       throw new AppError('已有证书签发任务正在运行，请等待当前任务完成。');
     if (this.issuing.has(signature)) throw new AppError('相同域名的证书正在签发。');
     if (input.challenge === 'http-01' && !assignments.length)
       throw new AppError('HTTP-01 需要每个域名都能通过现有 FRP HTTP 规则映射到客户端实例。');
-    if (input.challenge === 'dns-01' && input.eabKid && !input.eabHmac)
-      throw new AppError('填写 EAB KID 后还需要填写 EAB HMAC 密钥。');
     this.issuing.add(signature);
     this.activeTask = hooks?.taskId ?? signature;
     const progress = (value: CertificateIssueProgressUpdate) => hooks?.onProgress(value);
-    let currentStep = '准备签发';
+    const id = existing?.id ?? randomUUID();
     try {
-      throwIfCancelled(hooks?.signal);
-      currentStep = '准备 ACME 账户';
-      progress({ status: 'running', step: currentStep, message: '正在准备本机 ACME 账户密钥。' });
-      const accountKeyId = `acme:${input.provider}:accountKey`;
-      let accountKey = this.store.secret(accountKeyId);
-      if (!accountKey) {
-        accountKey = (await this.acmeClient.crypto.createPrivateEcdsaKey()).toString();
-        this.store.putSecret(accountKeyId, accountKey);
-        await this.store.persist();
-      }
-      if (input.eabKid) this.store.putSecret(`acme:${input.provider}:eabKid`, input.eabKid);
-      if (input.eabHmac) this.store.putSecret(`acme:${input.provider}:eabHmac`, input.eabHmac);
-      const kid = input.eabKid || this.store.secret(`acme:${input.provider}:eabKid`);
-      const hmacKey = input.eabHmac || this.store.secret(`acme:${input.provider}:eabHmac`);
-      const directoryUrl =
-        input.provider === 'letsencrypt'
-          ? this.acmeClient.directory.letsencrypt.production
-          : 'https://acme.litessl.com/acme/v2/directory';
-      currentStep = '生成私钥与 CSR';
-      progress({
-        status: 'running',
-        step: currentStep,
-        message: `正在为 ${domains.length} 个域名生成 SAN 申请。`,
-      });
-      const [certificateKey, csr] = await this.acmeClient.crypto.createCsr({ altNames: domains });
-      throwIfCancelled(hooks?.signal);
-      const client = new this.acmeClient.Client({
-        directoryUrl,
-        accountKey,
-        ...(kid && hmacKey ? { externalAccountBinding: { kid, hmacKey } } : {}),
-      });
-      const cleanupTransport = this.installCancelableTransport(client, hooks, () => currentStep);
-      const id = existing?.id ?? randomUUID();
-      let dnsPrompt = Promise.resolve();
-      const originalLogger = (this.acmeClient as any).setLogger;
-      if (typeof originalLogger === 'function')
-        originalLogger((line: string) => {
-          const detail = String(line).slice(0, 400);
-          const retry = /retry(?:ing)?|backoff|attempt\s*#/i.test(detail);
-          if (retry) {
-            progress({
-              status: 'retrying',
-              step: currentStep,
-              message: detail,
-            });
-          } else if (/placing new certificate order/i.test(detail)) {
-            currentStep = '提交证书订单';
+      const material = await issueAcmeMaterial(
+        this.store,
+        { ...input, domains },
+        hooks,
+        {
+          withHttpResponder: <T>(
+            operation: (responder: AcmeHttpResponder) => Promise<T>,
+            signal?: AbortSignal,
+          ): Promise<T> => {
             progress({
               status: 'running',
-              step: currentStep,
-              message: '正在向证书机构提交域名订单。',
+              step: '准备 HTTP-01 临时通道',
+              message: '正在启动临时验证通道并等待客户端连接。',
             });
-          } else if (/checking account|registering account/i.test(detail)) {
-            currentStep = '注册 ACME 账户';
-            progress({
-              status: 'running',
-              step: currentStep,
-              message: '正在验证或注册 ACME 账户。',
-            });
-          }
-        });
-      const operation = async (responder?: HttpChallengeResponder) => {
-        throwIfCancelled(hooks?.signal);
-        currentStep = '连接证书机构';
-        progress({
-          status: 'running',
-          step: currentStep,
-          message: `正在连接 ${input.provider === 'letsencrypt' ? 'Let’s Encrypt' : 'LiteSSL'}。`,
-        });
-        return client.auto({
-          csr,
-          email: input.email,
-          termsOfServiceAgreed: input.termsAgreed,
-          challengePriority: [input.challenge],
-          skipChallengeVerification: input.challenge === 'dns-01',
-          challengeCreateFn: async (authorization, challenge, keyAuthorization) => {
-            if (challenge.type === 'http-01') {
-              throwIfCancelled(hooks?.signal);
-              if (!responder) throw new AppError('HTTP-01 验证代理未启动。');
-              currentStep = `配置 HTTP-01：${authorization.identifier.value}`;
-              progress({
-                status: 'running',
-                step: currentStep,
-                message: '正在通过临时 FRP 规则提供域名验证响应。',
-              });
-              responder.set(challenge.token, keyAuthorization);
-            } else if (challenge.type === 'dns-01') {
-              const record = {
-                domain: authorization.identifier.value,
-                record: `_acme-challenge.${authorization.identifier.value}`,
-                value: keyAuthorization,
-              };
-              dnsPrompt = dnsPrompt.then(async () => {
-                currentStep = `等待 DNS-01：${record.domain}`;
-                progress({
-                  status: 'waiting-user',
-                  step: currentStep,
-                  message: '请添加 TXT 记录；添加完成后点击“已添加，继续验证”。',
-                  dnsRecords: [record],
-                });
-                const prompt = hooks?.promptDnsChallenge ?? this.promptDnsChallenge;
-                if (!(await abortable(prompt([record]), hooks?.signal)))
-                  throw new AppError('用户取消了 DNS-01 验证。');
-              });
-              await dnsPrompt;
-              throwIfCancelled(hooks?.signal);
-              currentStep = `等待 CA 验证：${record.domain}`;
-              progress({
-                status: 'running',
-                step: currentStep,
-                message: 'TXT 已确认，正在等待证书机构查询 DNS 并验证。',
-              });
-            } else throw new AppError('ACME 服务返回了未支持的验证方式。');
+            return this.runHttpChallenge(assignments, operation, signal);
           },
-          challengeRemoveFn: async (_authorization, challenge) => {
-            if (challenge.type === 'http-01') responder?.remove(challenge.token);
-          },
-        });
-      };
-      let certPem: string;
-      try {
-        if (input.challenge === 'http-01') {
-          currentStep = '准备 HTTP-01 临时通道';
-          progress({
-            status: 'running',
-            step: currentStep,
-            message: '正在启动临时验证通道并等待客户端连接。',
-          });
-        }
-        certPem =
-          input.challenge === 'http-01'
-            ? await this.runHttpChallenge(
-                assignments,
-                async (responder) => operation(responder),
-                hooks?.signal,
-              )
-            : await operation();
-      } finally {
-        cleanupTransport();
-        if (typeof originalLogger === 'function') originalLogger(() => {});
-      }
-      throwIfCancelled(hooks?.signal);
-      currentStep = '校验证书与域名';
+          promptDnsChallenge: hooks?.promptDnsChallenge ?? this.promptDnsChallenge,
+        },
+        this.acmeClient,
+      );
       progress({
         status: 'running',
-        step: currentStep,
-        message: '正在校验证书有效期、SAN 域名和私钥匹配。',
-      });
-      const certificate = validateCertificateMaterial(certPem, certificateKey.toString(), domains);
-      if (certPem.length > 1024 * 1024) throw new AppError('签发机构返回的证书文件超过 1 MB。');
-      throwIfCancelled(hooks?.signal);
-      currentStep = '保存证书';
-      progress({
-        status: 'running',
-        step: currentStep,
+        step: '保存证书',
         message: '验证通过，正在安全保存证书与私钥。',
       });
-      const record = await this.saveMaterial(id, certPem, certificateKey.toString(), existing, {
+      const record = await this.saveMaterial(id, material.certPem, material.keyPem, existing, {
         name: input.name.trim() || existing?.name || domains[0],
         provider: input.provider,
         email: input.email,
         domains,
         challenge: input.challenge,
-        expiresAt: new Date(certificate.validTo).toISOString(),
+        expiresAt: new Date(material.certificate.validTo).toISOString(),
       });
       await this.store.saveCertificate(record);
       this.changed();
@@ -442,52 +651,6 @@ export class Certificates {
       this.issuing.delete(signature);
       if (this.activeTask === (hooks?.taskId ?? signature)) this.activeTask = undefined;
     }
-  }
-
-  private installCancelableTransport(
-    client: any,
-    hooks: CertificateIssueHooks | undefined,
-    currentStep: () => string,
-  ) {
-    const library = this.acmeClient as any;
-    const axios = library.axios;
-    const signal = hooks?.signal;
-    if (!axios || !signal) return () => {};
-    const originalRequest = axios.request;
-    const retrySettings = axios.defaults?.acmeSettings;
-    const originalRetryCount = retrySettings?.retryMaxAttempts;
-    if (retrySettings) retrySettings.retryMaxAttempts = 0;
-    axios.request = async function (this: unknown, config: Record<string, unknown>) {
-      let attempt = 0;
-      while (true) {
-        throwIfCancelled(signal);
-        try {
-          return await originalRequest.call(this, { ...config, signal });
-        } catch (error) {
-          throwIfCancelled(signal);
-          const response = (error as { response?: { status?: number } }).response;
-          const code = (error as { code?: string }).code;
-          const retryable =
-            code !== 'ECONNABORTED' &&
-            code !== 'ERR_NOCK_NO_MATCH' &&
-            (!response || response.status === 429 || (response.status ?? 0) >= 500);
-          if (!retryable || attempt >= 4) throw error;
-          attempt += 1;
-          const detail = error instanceof Error ? error.message : String(error);
-          hooks?.onProgress({
-            status: 'retrying',
-            step: currentStep(),
-            attempt,
-            message: `请求失败，${Math.min(attempt * 2, 8)} 秒后重试（${attempt}/4）：${detail.slice(0, 240)}`,
-          });
-          await waitForRetry(Math.min(attempt * 2000, 8000), signal);
-        }
-      }
-    };
-    return () => {
-      axios.request = originalRequest;
-      if (retrySettings) retrySettings.retryMaxAttempts = originalRetryCount;
-    };
   }
 
   async renewDue(

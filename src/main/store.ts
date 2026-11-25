@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   serverSchema,
@@ -7,6 +7,7 @@ import {
   certificateSchema,
   serverSiteSchema,
   serverCertificateSchema,
+  dnsAccountSchema,
   terminalFavoriteSchema,
   type Server,
   type Instance,
@@ -15,7 +16,13 @@ import {
   type CertificateRecord,
   type ServerSite,
   type ServerCertificate,
+  type DnsAccount,
   type TerminalFavorite,
+  type Catalog,
+  type DownloadRecord,
+  type SiteInspection,
+  type ManagedTlsStatus,
+  type WebIncludeRecord,
 } from '../shared/types';
 import { AppError } from '../shared/errors';
 
@@ -25,7 +32,7 @@ export interface CryptoProvider {
   decrypt(value: Buffer): string;
 }
 interface DiskState {
-  schema: 1;
+  schema: 4;
   servers: Server[];
   instances: Instance[];
   versions: InstalledVersion[];
@@ -33,24 +40,41 @@ interface DiskState {
   certificates: CertificateRecord[];
   serverSites: ServerSite[];
   serverCertificates: ServerCertificate[];
+  dnsAccounts: DnsAccount[];
   terminalFavorites: TerminalFavorite[];
   secrets: Record<string, string>;
+  // 版本列表缓存、断点记录、站点检查与托管实例都随 state 持久化。
+  catalog: Catalog | null;
+  downloads: DownloadRecord[];
+  siteInspections: Record<string, SiteInspection>;
+  managedTls: ManagedTlsStatus | null;
+  webIncludes: Record<string, WebIncludeRecord>;
+}
+
+function emptyDiskState(): DiskState {
+  return {
+    schema: 4,
+    servers: [],
+    instances: [],
+    versions: [],
+    settings: settingsSchema.parse({}),
+    certificates: [],
+    serverSites: [],
+    serverCertificates: [],
+    dnsAccounts: [],
+    terminalFavorites: [],
+    secrets: {},
+    catalog: null,
+    downloads: [],
+    siteInspections: {},
+    managedTls: null,
+    webIncludes: {},
+  };
 }
 
 // 明文凭据只在会话内存在；安全存储不可用时绝不落盘。
 export class Store {
-  data: DiskState = {
-    schema: 1,
-    servers: [],
-    instances: [],
-    versions: [],
-    settings: { proxyUrl: '' },
-    certificates: [],
-    serverSites: [],
-    serverCertificates: [],
-    terminalFavorites: [],
-    secrets: {},
-  };
+  data: DiskState = emptyDiskState();
   private writes: Promise<void> = Promise.resolve();
   private sessionSecrets = new Map<string, string>();
   constructor(
@@ -65,7 +89,7 @@ export class Store {
     try {
       const raw = JSON.parse(await readFile(path.join(this.root, 'state.json'), 'utf8'));
       if (
-        raw.schema !== 1 ||
+        ![1, 2, 3, 4].includes(raw.schema) ||
         !Array.isArray(raw.servers) ||
         !Array.isArray(raw.instances) ||
         !Array.isArray(raw.versions)
@@ -75,9 +99,42 @@ export class Store {
         .filter((item: unknown) => !!item && typeof item === 'object' && 'reverseProxies' in item)
         .map((item: { id?: unknown }) => item.id)
         .filter((id: unknown): id is string => typeof id === 'string');
+      // vhost 端口按服务器现状手填，80/443 不再强制迁移。
       raw.servers = raw.servers.map((item: unknown) => serverSchema.parse(item));
       raw.instances = raw.instances.map((item: unknown) => instanceSchema.parse(item));
-      raw.settings = settingsSchema.parse(raw.settings);
+      // schema 4：清除旧证书 / 规则引用 / 站点配置，全新适配双方案。
+      // schema 2 及更早来自旧证书体系；schema 3 来自本机 SSL MVP，都要重置。
+      const legacyCertReset = raw.schema !== 4;
+      if (legacyCertReset) {
+        raw.certificates = [];
+        raw.serverCertificates = [];
+        raw.serverSites = [];
+        raw.instances = (raw.instances as Instance[]).map((instance) =>
+          instance.mode === 'form'
+            ? {
+                ...instance,
+                proxies: instance.proxies.map((rule) => ({
+                  ...rule,
+                  type: rule.type === 'https' ? 'http' : rule.type,
+                  tlsMode: 'passthrough' as const,
+                  certificateId: undefined,
+                  certPath: '',
+                  keyPath: '',
+                  publicHttps: false,
+                  siteConfig: undefined,
+                  siteConfigFlavor: undefined,
+                  siteConfigUpdatedAt: undefined,
+                  siteConfigPath: undefined,
+                })),
+              }
+            : instance,
+        );
+      }
+      const rawSettings = raw.settings ?? {};
+      // 旧版单服务商标识可能是已移除的选项；归一到默认的 DNSPod，避免老 state 无法加载。
+      if (!['dnspod', 'aliyun', 'cloudflare'].includes(rawSettings.dnsProvider))
+        rawSettings.dnsProvider = 'dnspod';
+      raw.settings = settingsSchema.parse(rawSettings);
       raw.certificates = Array.isArray(raw.certificates)
         ? raw.certificates.map((item: unknown) => certificateSchema.parse(item))
         : [];
@@ -87,6 +144,26 @@ export class Store {
       raw.serverCertificates = Array.isArray(raw.serverCertificates)
         ? raw.serverCertificates.map((item: unknown) => serverCertificateSchema.parse(item))
         : [];
+      const supportedDnsProviders = ['dnspod', 'aliyun', 'cloudflare'];
+      const legacyDnsAccounts = Array.isArray(raw.dnsAccounts)
+        ? raw.dnsAccounts.filter(
+            (item: unknown) =>
+              !supportedDnsProviders.includes((item as { provider?: unknown })?.provider as string),
+          )
+        : [];
+      raw.dnsAccounts = Array.isArray(raw.dnsAccounts)
+        ? raw.dnsAccounts
+            .filter((item: unknown) =>
+              supportedDnsProviders.includes((item as { provider?: unknown })?.provider as string),
+            )
+            .map((item: unknown) => dnsAccountSchema.parse(item))
+        : [];
+      for (const account of legacyDnsAccounts as Array<{ id?: unknown }>) {
+        if (typeof account?.id !== 'string') continue;
+        const prefix = `dns:account:${account.id}:`;
+        for (const key of Object.keys(raw.secrets ?? {}))
+          if (key.startsWith(prefix)) delete raw.secrets[key];
+      }
       raw.terminalFavorites = Array.isArray(raw.terminalFavorites)
         ? raw.terminalFavorites.map((item: unknown) => terminalFavoriteSchema.parse(item))
         : [];
@@ -97,13 +174,37 @@ export class Store {
         Object.values(raw.secrets).some((value) => typeof value !== 'string')
       )
         throw new Error('凭据结构不正确');
-      this.data = raw;
+      const base = emptyDiskState();
+      this.data = {
+        ...base,
+        ...raw,
+        schema: 4,
+        catalog: raw.catalog && typeof raw.catalog === 'object' ? (raw.catalog as Catalog) : null,
+        downloads: Array.isArray(raw.downloads) ? (raw.downloads as DownloadRecord[]) : [],
+        siteInspections:
+          raw.siteInspections && typeof raw.siteInspections === 'object'
+            ? (raw.siteInspections as Record<string, SiteInspection>)
+            : {},
+        managedTls:
+          raw.managedTls && typeof raw.managedTls === 'object'
+            ? (raw.managedTls as ManagedTlsStatus)
+            : null,
+        webIncludes:
+          raw.webIncludes && typeof raw.webIncludes === 'object'
+            ? (raw.webIncludes as Record<string, WebIncludeRecord>)
+            : {},
+      };
       // 清理本机旧版站点记录和其 EAB 密钥；服务器上的配置文件不触碰。
       const legacyProxySecrets = Object.keys(this.data.secrets).filter((key) =>
         /^server:[^:]+:proxy:/.test(key),
       );
       for (const key of legacyProxySecrets) delete this.data.secrets[key];
-      if (legacySiteServers.length || legacyProxySecrets.length) await this.persist();
+      if (legacyCertReset)
+        await rm(path.join(this.root, 'certificates'), { recursive: true, force: true }).catch(
+          () => {},
+        );
+      if (legacySiteServers.length || legacyProxySecrets.length || legacyCertReset)
+        await this.persist();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
         throw new AppError(
@@ -179,6 +280,7 @@ export class Store {
     if (server.deployment) throw new AppError('此服务器已有本机管理的部署，不能转为只读检索记录。');
     this.putSecret(`server:${id}:token`, config.token);
     server.frpPort = config.frpPort;
+    // vhost 端口按探测到的现状保留：80/443 空闲时可直接占用，不再强制迁移到高端口。
     server.httpPort = config.httpPort;
     server.httpsPort = config.httpsPort;
     server.accessMode = 'readonly';
@@ -242,6 +344,36 @@ export class Store {
     ];
     await this.persist();
   }
+  async saveCatalog(catalog: Catalog) {
+    this.data.catalog = catalog;
+    await this.persist();
+  }
+  async saveDownload(record: DownloadRecord) {
+    this.data.downloads = [
+      ...this.data.downloads.filter((item) => item.key !== record.key),
+      record,
+    ];
+    await this.persist();
+  }
+  async dropDownload(key: string) {
+    this.data.downloads = this.data.downloads.filter((item) => item.key !== key);
+    await this.persist();
+  }
+  async saveInspection(serverId: string, inspection: SiteInspection) {
+    this.data.siteInspections = { ...this.data.siteInspections, [serverId]: inspection };
+    await this.persist();
+  }
+  async saveManagedTls(status: ManagedTlsStatus | null) {
+    this.data.managedTls = status;
+    await this.persist();
+  }
+  async saveWebInclude(serverId: string, record: WebIncludeRecord | null) {
+    const next = { ...this.data.webIncludes };
+    if (record) next[serverId] = record;
+    else delete next[serverId];
+    this.data.webIncludes = next;
+    await this.persist();
+  }
   async saveTerminalFavorite(item: TerminalFavorite) {
     const parsed = terminalFavoriteSchema.parse(item);
     this.data.terminalFavorites = [
@@ -284,11 +416,17 @@ export class Store {
       certificates: this.data.certificates,
       serverSites: this.data.serverSites,
       serverCertificates: this.data.serverCertificates,
+      dnsAccounts: this.data.dnsAccounts,
       terminalFavorites: this.data.terminalFavorites,
       settings: this.data.settings,
       secureStorage: this.secure,
       platform: process.platform === 'win32' ? 'windows' : process.platform,
       arch: process.arch === 'x64' ? 'amd64' : process.arch,
+      catalog: this.data.catalog,
+      downloads: this.data.downloads,
+      siteInspections: this.data.siteInspections,
+      managedTls: this.data.managedTls,
+      webIncludes: this.data.webIncludes,
     };
   }
   private readConfig(key: string) {

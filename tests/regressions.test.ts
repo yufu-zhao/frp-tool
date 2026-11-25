@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { notifyRenderer } from '../src/main/lifecycle';
@@ -113,6 +113,64 @@ describe('官方发布页面自动兜底', () => {
       const cached = await versions.catalog();
       expect(cached.cached).toBe(true);
       expect(cached.source).toBe('github-web');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it('升级到双方案时一次性清空旧证书记录与规则引用', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'intranet-ssl-reset-'));
+    try {
+      await writeFile(
+        path.join(root, 'state.json'),
+        JSON.stringify({
+          schema: 2,
+          servers: [],
+          instances: [],
+          versions: [],
+          settings: {},
+          certificates: [
+            {
+              id: 'old-local',
+              name: '旧本机证书',
+              provider: 'letsencrypt',
+              domains: ['old.example.com'],
+              certPath: '/tmp/old/fullchain.pem',
+              keyPath: '/tmp/old/private-key.pem',
+              createdAt: 1,
+            },
+          ],
+          serverSites: [],
+          serverCertificates: [
+            {
+              id: 'old-server',
+              serverId: 's1',
+              name: '旧服务端证书',
+              provider: 'letsencrypt',
+              domains: ['old.example.com'],
+              certPath: '/tmp/old/fullchain.pem',
+              keyPath: '/tmp/old/private-key.pem',
+              createdAt: 1,
+            },
+          ],
+          dnsAccounts: [],
+          terminalFavorites: [],
+          secrets: {},
+          catalog: null,
+          downloads: [],
+          siteInspections: {},
+          managedTls: null,
+        }),
+      );
+      const store = new Store(root, {
+        available: () => false,
+        encrypt: () => Buffer.alloc(0),
+        decrypt: () => '',
+      });
+      await store.load();
+      expect(store.data.certificates).toEqual([]);
+      expect(store.data.serverCertificates).toEqual([]);
+      const persisted = JSON.parse(await readFile(path.join(root, 'state.json'), 'utf8'));
+      expect(persisted.schema).toBe(4);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

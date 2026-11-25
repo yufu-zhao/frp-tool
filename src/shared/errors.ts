@@ -19,7 +19,36 @@ export function redact(value: string, secrets: string[] = []): string {
     '$1[已隐藏]',
   );
 }
+interface ZodIssueLike {
+  path?: Array<string | number>;
+  message?: string;
+  code?: string;
+  expected?: string;
+  received?: string;
+}
+
+// 用结构判断而不是 instanceof，避免 shared 层依赖具体 zod 实例。
+function zodIssues(error: unknown): ZodIssueLike[] | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const candidate = error as { name?: string; issues?: unknown };
+  if (candidate.name !== 'ZodError' || !Array.isArray(candidate.issues)) return undefined;
+  return candidate.issues.filter(
+    (issue): issue is ZodIssueLike => !!issue && typeof issue === 'object',
+  );
+}
+
+function zodIssueText(issue: ZodIssueLike): string {
+  const field = issue.path?.length ? issue.path.map(String).join('.') : '参数';
+  if (issue.code === 'invalid_type' && issue.received === 'undefined')
+    return `${field}：缺少必填参数`;
+  if (issue.received !== undefined && issue.expected)
+    return `${field}：期望 ${issue.expected}，实际收到 ${issue.received}`;
+  return issue.message ? `${field}：${issue.message}` : `${field}：格式不正确`;
+}
+
 export function friendlyError(error: unknown): string {
+  const issues = zodIssues(error);
+  if (issues?.length) return `参数校验失败：${issues.map(zodIssueText).join('；')}`;
   const message = error instanceof Error ? error.message : String(error);
   if (/ENOTFOUND|EAI_AGAIN/.test(message))
     return '无法解析地址，请检查网络、服务器地址或代理设置。';

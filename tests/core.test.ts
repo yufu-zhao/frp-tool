@@ -11,7 +11,8 @@ import { clientConfig, serverConfig, frpAdapter, validateRules } from '../src/ma
 import { accessAddress } from '../src/shared/address';
 import { normalizeReleases, chooseAsset, Versions, extractBinaries } from '../src/main/versions';
 import { Store, type CryptoProvider } from '../src/main/store';
-import { redact } from '../src/shared/errors';
+import { AppError, friendlyError, redact } from '../src/shared/errors';
+import type { ServerDeployProgressUpdate } from '../src/shared/types';
 import { execute, Processes } from '../src/main/processes';
 import {
   Remote,
@@ -55,7 +56,13 @@ root=yes
 sudo=no
 __PORTS_BEGIN__
 LISTEN 0 128 *:7000
-__PORTS_END__`;
+__PORTS_END__
+__WEB_BEGIN__
+port80=occupied|nginx
+port443=free|
+service=nginx|yes|yes
+service=caddy|yes|no
+__WEB_END__`;
 
 const server = serverSchema.parse({
   id: 'server1',
@@ -186,6 +193,34 @@ describe('已有 FRP 服务检索与连接配置导入', () => {
       state: 'active',
     });
   });
+  it('兼容 sh -c 包装、等号写法与多个 argv 的 ExecStart', () => {
+    expect(
+      parseSystemdFrpsCandidate(
+        'frp.service',
+        `ExecStart={ path=/bin/sh ; argv[]=/bin/sh -c 'exec /opt/frps -c "/etc/frp/frps.toml"' ; }\nActiveState=active`,
+      ),
+    ).toMatchObject({ binary: '/opt/frps', config: '/etc/frp/frps.toml', state: 'active' });
+    expect(
+      parseSystemdFrpsCandidate(
+        'frps.service',
+        'ExecStart={ path=/usr/local/bin/frps ; argv[]=/usr/local/bin/frps ; argv[]=--config=/etc/frp/frps.ini ; }\nActiveState=inactive',
+      ),
+    ).toMatchObject({ binary: '/usr/local/bin/frps', config: '/etc/frp/frps.ini' });
+  });
+  it('不把非 FRP 服务的 -c 参数误判为 FRP 配置', () => {
+    expect(
+      parseSystemdFrpsCandidate(
+        'nginx.service',
+        'ExecStart={ path=/usr/sbin/nginx ; argv[]=/usr/sbin/nginx -c /etc/nginx/nginx.conf ; }\nActiveState=active',
+      ),
+    ).toBeUndefined();
+    expect(
+      parseSystemdFrpsCandidate(
+        'frpc.service',
+        'ExecStart={ path=/opt/frpc ; argv[]=/opt/frpc -c /etc/frpc.toml ; }\nActiveState=active',
+      ),
+    ).toBeUndefined();
+  });
   it('服务名搜索使用固定安全命令，并只返回匹配的 FRP 单元', async () => {
     const store = new Store(root, noCrypto);
     await store.load();
@@ -205,6 +240,40 @@ describe('已有 FRP 服务检索与连接配置导入', () => {
     expect(exec.mock.calls[0][1]).toContain('list-unit-files');
     expect(exec.mock.calls[0][1]).not.toContain('frps');
     expect(exec.mock.calls[1][1]).toContain("'intranet-frps-a.service'");
+  });
+  it('单元名只叫 frp 的服务也能检出，并覆盖用户级 systemd', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const exec = vi
+      .spyOn(remote, 'exec')
+      .mockResolvedValueOnce('frp.service enabled\nnginx.service enabled')
+      .mockResolvedValueOnce(
+        'ExecStart={ path=/opt/frps ; argv[]=/opt/frps --config=/opt/frps.toml ; }\nActiveState=active',
+      )
+      .mockResolvedValue('');
+    const results = await remote.searchFrpsServices(server.id);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ service: 'frp.service', config: '/opt/frps.toml' });
+    expect(exec.mock.calls.some((call) => String(call[1]).includes('--user list-unit-files'))).toBe(
+      true,
+    );
+  });
+  it('不扫描 /proc 进程列表，避免把临时命令行误报为 frps 服务', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const exec = vi.spyOn(remote, 'exec').mockResolvedValue('');
+    expect(await remote.searchFrpsServices(server.id)).toEqual([]);
+    expect(exec.mock.calls.some((call) => String(call[1]).includes('/proc/'))).toBe(false);
   });
   it('令牌或配置端口无效时拒绝保存', () => {
     expect(() => parseDiscoveredFrpsConfig('bindPort = 0\n', '/etc/frps.toml')).toThrow('令牌');
@@ -266,11 +335,19 @@ describe('FRP 配置与输入边界', () => {
     expect(info.memoryAvailableKB).toBe(4096);
     expect(info.diskAvailableKB).toBe(500000);
     expect(info.ports).toContain(':7000');
+    expect(info.port80).toEqual({ state: 'occupied', owner: 'nginx' });
+    expect(info.port443).toEqual({ state: 'free', owner: '' });
+    expect(info.webServices).toEqual([
+      { name: 'nginx', installed: true, running: true },
+      { name: 'caddy', installed: true, running: false },
+    ]);
     const partial = parseHostInfo('platform=Linux\narch=aarch64\nserviceManager=unknown');
     expect(partial.arch).toBe('arm64');
     expect(partial.cpuModel).toBe('');
     expect(partial.memoryTotalKB).toBeNull();
     expect(partial.warning).toContain('CPU 型号');
+    expect(partial.port80.state).toBe('unknown');
+    expect(partial.webServices).toEqual([]);
   });
   it('按实际服务管理器和权限自动选择运行方式', () => {
     const info = parseHostInfo(hostInfoOutput);
@@ -406,6 +483,42 @@ describe('FRP 配置与输入边界', () => {
     );
     expect(() => normalizeDomains(['*.example.test'])).toThrow('域名格式无效');
   });
+  it('粘贴 PEM 文本导入本机证书库并校验域名与材料一致性', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    const certPem = await readFile(
+      new URL('./fixtures/certificates-test-cert.pem', import.meta.url),
+      'utf8',
+    );
+    const keyPem = await readFile(
+      new URL('./fixtures/certificates-test-key.pem', import.meta.url),
+      'utf8',
+    );
+    const certificates = new Certificates(
+      store,
+      () => {},
+      async () => true,
+      async (_assignments, operation) => operation({ port: 0, set() {}, remove() {} }),
+      () => false,
+    );
+    const record = await certificates.importPemText({
+      name: '粘贴证书',
+      domains: ['one.example.test'],
+      certPem,
+      keyPem,
+    });
+    expect(record.provider).toBe('manual');
+    expect(record.domains).toEqual(['one.example.test']);
+    expect((await certificates.readPem(record.id)).certPem).toBe(certPem.trim());
+    await expect(
+      certificates.importPemText({
+        name: '错误域名',
+        domains: ['missing.example.test'],
+        certPem,
+        keyPem,
+      }),
+    ).rejects.toThrow('不包含域名');
+  });
   it('通过模拟 ACME 适配器完成 LiteSSL DNS-01 SAN 签发与 EAB 绑定', async () => {
     const store = new Store(root, noCrypto);
     await store.load();
@@ -420,11 +533,15 @@ describe('FRP 配置与输入边界', () => {
     const prompts: Array<{ domain: string; record: string; value: string }> = [];
     let clientOptions: any;
     let challengeOptions: any;
+    let csrOptions: any;
     const fakeAcme = {
       directory: { letsencrypt: { production: 'https://letsencrypt.test/directory' } },
       crypto: {
         createPrivateEcdsaKey: async () => Buffer.from('account-key'),
-        createCsr: async () => [Buffer.from(keyPem), Buffer.from('csr')],
+        createCsr: async (options: any) => {
+          csrOptions = options;
+          return [Buffer.from(keyPem), Buffer.from('csr')];
+        },
       },
       Client: class {
         constructor(options: unknown) {
@@ -462,6 +579,11 @@ describe('FRP 配置与输入边界', () => {
       termsAgreed: true,
       eabKid: 'test-kid',
       eabHmac: 'test-hmac',
+      keySize: 4096,
+    });
+    expect(csrOptions).toMatchObject({
+      altNames: ['one.example.test', 'two.example.test'],
+      keySize: 4096,
     });
     expect(clientOptions.directoryUrl).toBe('https://acme.litessl.com/acme/v2/directory');
     expect(clientOptions.externalAccountBinding).toEqual({ kid: 'test-kid', hmacKey: 'test-hmac' });
@@ -543,11 +665,11 @@ describe('FRP 配置与输入边界', () => {
     await expect(issue).rejects.toThrow('用户已取消证书签发');
     expect(stages).toContain('waiting-user');
   });
-  it('HTTP-01 临时 FRP 规则限定域名和验证路径，恢复原实例配置', async () => {
+  it('高端口下 HTTP-01 临时 FRP 规则限定域名和验证路径，恢复原实例配置', async () => {
     const temporary = TOML.parse(
       clientConfig(
         instance,
-        { ...server, httpPort: 80 },
+        { ...server, httpPort: 8080 },
         't',
         {},
         { domains: ['one.example.test'], localPort: 43210 },
@@ -557,7 +679,7 @@ describe('FRP 配置与输入边界', () => {
     expect(temporary.proxies.at(-1).locations).toEqual(['/.well-known/acme-challenge/']);
     const store = new Store(root, noCrypto);
     await store.load();
-    store.data.servers = [{ ...server, httpPort: 80 }];
+    store.data.servers = [{ ...server, httpPort: 8080 }];
     store.data.instances = [instance];
     const processes = new Processes(store, () => {});
     const starts: unknown[] = [];
@@ -586,6 +708,10 @@ describe('FRP 配置与输入边界', () => {
       id: instance.id,
       challenge: { domains: ['one.example.test'], localPort: expect.any(Number) },
     });
+  });
+  it('FRP vhost 入口允许按服务器现状填写 80 / 443', () => {
+    expect(() => serverConfig({ ...server, httpPort: 80 }, 'token')).not.toThrow();
+    expect(() => serverConfig({ ...server, httpsPort: 443 }, 'token')).not.toThrow();
   });
   it('将手动证书复制到受限权限的本机证书库并拒绝删除仍被引用的证书', async () => {
     const store = new Store(root, noCrypto);
@@ -835,6 +961,23 @@ describe('存储、命令与日志保护', () => {
       JSON.parse(await readFile(path.join(root, 'state.json'), 'utf8')).secrets,
     ).not.toHaveProperty('server:server1:token');
   });
+  it('检索导入保留探测到的 80 / 443 入口端口，不强制迁移到高端口', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    await store.saveDiscoveredServerConfig(
+      server.id,
+      { frpPort: 7001, httpPort: 80, httpsPort: 443, token: 'remote-token' },
+      {
+        name: 'intranet-frps-server.service',
+        manager: 'systemd',
+        binary: '/opt/frps',
+        config: '/opt/frps.toml',
+      },
+    );
+    expect(store.server(server.id).httpPort).toBe(80);
+    expect(store.server(server.id).httpsPort).toBe(443);
+  });
   it('加密字段重启可恢复，普通编辑保留凭据', async () => {
     const key = randomBytes(32);
     const crypto: CryptoProvider = {
@@ -902,6 +1045,28 @@ describe('存储、命令与日志保护', () => {
     expect(output).not.toContain('abc');
     expect(output).not.toContain('def');
     expect(output).not.toContain('data');
+  });
+  it('Zod 校验错误转成可读中文，不再暴露原始 JSON 数组', () => {
+    const zodError = Object.assign(
+      new Error(
+        '[{"code":"invalid_type","expected":"string","received":"undefined","path":["domain"],"message":"Required"}]',
+      ),
+      {
+        name: 'ZodError',
+        issues: [
+          {
+            code: 'invalid_type',
+            expected: 'string',
+            received: 'undefined',
+            path: ['domain'],
+            message: 'Required',
+          },
+        ],
+      },
+    );
+    expect(friendlyError(zodError)).toBe('参数校验失败：domain：缺少必填参数');
+    expect(friendlyError(zodError)).not.toContain('invalid_type');
+    expect(friendlyError(new Error('普通错误'))).toBe('普通错误');
   });
   it('远程参数转义及路径拒绝', () => {
     expect(quote("a'b")).toBe("'a'\"'\"'b'");
@@ -1158,5 +1323,109 @@ describe('存储、命令与日志保护', () => {
     await expect(execute(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], 50)).rejects.toThrow(
       '超时',
     );
+  });
+  it('安装预检一次查清端口冲突、已有服务与安装目录残留', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const info = parseHostInfo(hostInfoOutput);
+    vi.spyOn(remote, 'detect').mockResolvedValue({ ...info, home: '/home/user' } as any);
+    vi.spyOn(remote, 'searchFrpsServices').mockResolvedValue([
+      {
+        service: 'frps.service',
+        manager: 'systemd',
+        state: 'active',
+        binary: '/usr/bin/frps',
+        config: '/etc/frps.toml',
+      },
+    ]);
+    vi.spyOn(remote, 'exec').mockResolvedValue('yes');
+    const result = await remote.installPrecheck(server.id);
+    expect(result.portConflicts).toContain(7000);
+    expect(result.existingServices).toHaveLength(1);
+    expect(result.installDirExists).toBe(true);
+    expect(result.managedDeployment).toBe(false);
+  });
+  it('安装预检逐阶段上报到安装步骤窗口', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const info = parseHostInfo(hostInfoOutput);
+    vi.spyOn(remote, 'detect').mockResolvedValue({ ...info, home: '/home/user' } as any);
+    vi.spyOn(remote, 'searchFrpsServices').mockResolvedValue([]);
+    vi.spyOn(remote, 'exec').mockResolvedValue('no');
+    const updates: ServerDeployProgressUpdate[] = [];
+    await remote.installPrecheck(server.id, (update) => updates.push(update));
+    expect(updates.map((item) => item.step)).toEqual([
+      '检查安装条件',
+      '系统探测完成',
+      '检查端口占用',
+      '检索已有 FRP 服务',
+      '检查安装目录',
+      '预检完成',
+    ]);
+    expect(updates.every((item) => item.status === 'running')).toBe(true);
+    expect(updates.at(-1)?.percent).toBe(100);
+  });
+  it('移除已有 FRP 服务时停服务、删单元并备份程序与配置', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    const info = parseHostInfo(hostInfoOutput);
+    vi.spyOn(remote, 'detect').mockResolvedValue({ ...info, home: '/home/user' } as any);
+    const commands: string[] = [];
+    vi.spyOn(remote, 'exec').mockImplementation(async (_id, command) => {
+      commands.push(command);
+      return 'yes';
+    });
+    const note = await remote.removeExistingFrps(server.id, {
+      service: 'frps.service',
+      manager: 'systemd',
+      state: 'active',
+      binary: '/usr/bin/frps',
+      config: '/etc/frps.toml',
+    });
+    expect(note).toContain('frps.service');
+    expect(commands.some((command) => command.includes('systemctl stop'))).toBe(true);
+    expect(commands.some((command) => command.includes('systemctl disable'))).toBe(true);
+    expect(commands.some((command) => command.includes('rm -f'))).toBe(true);
+    expect(commands.some((command) => command.includes('.bak-'))).toBe(true);
+  });
+  it('服务端安装分阶段上报进度，探测失败也留下可见阶段', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await store.saveServer(server);
+    const remote = new Remote(
+      store,
+      async () => false,
+      () => {},
+    );
+    vi.spyOn(remote, 'detect').mockRejectedValueOnce(new AppError('SSH 连接失败'));
+    const updates: ServerDeployProgressUpdate[] = [];
+    await expect(
+      remote.deploy(server.id, 'unused-key', (update) => updates.push(update)),
+    ).rejects.toThrow('SSH 连接失败');
+    expect(updates.map((item) => item.step)).toEqual(['检查服务器', '探测服务器系统']);
+    expect(updates[0]).toMatchObject({
+      serverId: server.id,
+      status: 'running',
+      percent: 5,
+    });
+    expect(updates.every((item) => item.serverId === server.id)).toBe(true);
   });
 });

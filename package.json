@@ -1,6 +1,6 @@
 {
   "name": "frp-desktop",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "private": true,
   "description": "跨平台 FRP 服务器与本机穿透管理工具",
   "main": "dist/main/index.js",
@@ -31,10 +31,16 @@
     "icons": "node scripts/icons.mjs"
   },
   "dependencies": {
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/legacy-modes": "^6.5.5",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
     "@iarna/toml": "^2.2.5",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "acme-client": "^5.4.0",
+    "ant-design-vue": "^4.2.6",
+    "codemirror": "^6.0.2",
     "ssh2": "^1.16.0",
     "tar": "^7.5.0",
     "vue": "^3.5.0",
@@ -71,10 +77,12 @@
       "!node_modules/cpu-features{,/**/*}",
       "!node_modules/ssh2/lib/protocol/crypto/build{,/**/*}",
       "assets/icons/tray*.png",
-      "assets/icons/256x256.png"
+      "assets/icons/256x256.png",
+      "assets/bin/tls-proxy-linux-*"
     ],
     "asarUnpack": [
-      "node_modules/ssh2/**/*"
+      "node_modules/ssh2/**/*",
+      "assets/bin/tls-proxy-linux-*"
     ],
     "mac": {
       "target": [

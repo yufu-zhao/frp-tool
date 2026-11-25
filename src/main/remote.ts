@@ -12,6 +12,8 @@ import {
   type FrpsServiceCandidate,
   type TerminalEvent,
   type TerminalHistory,
+  type ServerDeployProgressUpdate,
+  type InstallPrecheck,
 } from '../shared/types';
 import { serverConfig, frpAdapter } from './frp';
 import { hostInfoCommand, parseHostInfo } from './host-info';
@@ -283,7 +285,7 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
       this.busy.delete(id);
     }
   }
-  // 服务器站点操作只在 root 或免密 sudo 可用时执行，避免交互式 sudo 卡住 SSH。
+  // Nginx 管理操作只在 root 或免密 sudo 可用时执行，避免交互式 sudo 卡住 SSH。
   async adminExec(id: string, command: string, timeout = 30000) {
     if (this.rootUsers.has(id)) return this.exec(id, command, timeout);
     await this.exec(id, 'sudo -n true', 10000);
@@ -375,11 +377,28 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
       this.connection(id).sftp((e, sftp) => (e ? reject(e) : resolve(sftp))),
     );
   }
-  private async upload(id: string, local: string, destination: string) {
+  private async upload(
+    id: string,
+    local: string,
+    destination: string,
+    onProgress?: (received: number, total: number) => void,
+  ) {
     const sftp = await this.sftp(id);
     try {
+      // ssh2 step(totalTransferred, chunkLength, fileSize)：用它回报真实上传字节，
+      // 而不是只靠阶段百分比，用户能看到「已上传 x / 共 y」。
       await new Promise<void>((resolve, reject) =>
-        sftp.fastPut(local, remotePath(destination), (e) => (e ? reject(e) : resolve())),
+        sftp.fastPut(
+          local,
+          remotePath(destination),
+          onProgress
+            ? {
+                step: (transferred: number, _chunk: number, size: number) =>
+                  onProgress(transferred, size),
+              }
+            : {},
+          (e) => (e ? reject(e) : resolve()),
+        ),
       );
     } finally {
       sftp.end();
@@ -425,37 +444,53 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
       sftp.end();
     }
   }
-  // 扫描 systemd 服务单位，并核验 ExecStart 确实启动 frps。
+  // 扫描 systemd 系统/用户服务单位，并核验 ExecStart 确实启动 frps。
+  // 单元名按「frp」前缀筛选，再由实际命令行确认，避免 frp.service 这类命名被漏检。
   async searchFrpsServices(id: string, keyword = ''): Promise<FrpsServiceCandidate[]> {
     const term = keyword.trim().toLowerCase();
-    const listing = await this.exec(
-      id,
-      'systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null || true',
-    ).catch(() => '');
-    const units = [
-      ...new Set(
-        listing
-          .split(/\r?\n/)
-          .map((line) => line.trim().split(/\s+/)[0])
-          .filter((name) => name?.endsWith('.service')),
-      ),
-    ]
-      .filter((name) =>
-        term
-          ? name.toLowerCase().includes(term) || /frps/i.test(name)
-          : /frps|intranet/i.test(name),
-      )
-      .slice(0, 100);
     const candidates: FrpsServiceCandidate[] = [];
-    for (const service of units) {
-      const output = await this.exec(
-        id,
-        `systemctl show ${quote(service)} -p ExecStart -p ActiveState`,
-        10000,
-      ).catch(() => '');
-      const candidate = parseSystemdFrpsCandidate(service, output);
-      if (candidate && (!term || candidate.service.toLowerCase().includes(term)))
-        candidates.push(candidate);
+    const seen = new Set<string>();
+    const add = (candidate: FrpsServiceCandidate) => {
+      const key = `${candidate.manager}:${candidate.service}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push(candidate);
+    };
+    const scopes = [
+      {
+        prefix: '',
+        list: 'systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null || true',
+      },
+      {
+        prefix: '--user ',
+        list: 'systemctl --user list-unit-files --type=service --no-legend --no-pager 2>/dev/null || true',
+      },
+    ];
+    for (const scope of scopes) {
+      const listing = await this.exec(id, scope.list).catch(() => '');
+      const units = [
+        ...new Set(
+          listing
+            .split(/\r?\n/)
+            .map((line) => line.trim().split(/\s+/)[0])
+            .filter((name) => name?.endsWith('.service')),
+        ),
+      ]
+        .filter((name) =>
+          term
+            ? name.toLowerCase().includes(term) || /frp|intranet/i.test(name)
+            : /frp|intranet/i.test(name),
+        )
+        .slice(0, 100);
+      for (const service of units) {
+        const output = await this.exec(
+          id,
+          `systemctl ${scope.prefix}show ${quote(service)} -p ExecStart -p ActiveState`,
+          10000,
+        ).catch(() => '');
+        const candidate = parseSystemdFrpsCandidate(service, output);
+        if (candidate && (!term || candidate.service.toLowerCase().includes(term))) add(candidate);
+      }
     }
     // OpenRC 与 SysV 的应用服务同样可检索；只接受明确包含 FRP 程序和配置参数的启动脚本。
     if (!candidates.length) {
@@ -475,8 +510,8 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
             (name) =>
               name &&
               (term
-                ? name.toLowerCase().includes(term) || /frps|intranet/i.test(name)
-                : /frps|intranet/i.test(name)),
+                ? name.toLowerCase().includes(term) || /frp|intranet/i.test(name)
+                : /frp|intranet/i.test(name)),
           )
           .slice(0, 100);
         for (const service of services) {
@@ -487,11 +522,19 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
           const config = /(?:-c\s+|CONFIG=['"]?)(?:"([^"]+)"|'([^']+)'|(\S+?)(?:['"\s]|$))/m.exec(
             contents,
           );
-          if (!command || !config) continue;
+          // 脚本里提到 frps 还不够：必须确实由 frps 程序启动且配置是绝对路径，
+          // 否则注释或无关变量也会让一个普通服务被当成 FRP。
+          if (
+            !command ||
+            !/(^|[-_.])frps$/i.test(command.split('/').pop() ?? '') ||
+            !config ||
+            !config[1]?.startsWith('/')
+          )
+            continue;
           const state = await this.exec(id, `${quote(scriptPath)} status`)
             .then(() => 'active')
             .catch(() => 'inactive');
-          candidates.push({
+          add({
             service,
             manager,
             state,
@@ -501,28 +544,9 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
         }
       }
     }
-    // 如果 systemd 列表不可用，再扫描当前用户可见的 FRP 进程命令行。
-    if (!candidates.length) {
-      const processes = await this.exec(
-        id,
-        `for f in /proc/[0-9]*/cmdline; do test -r "$f" || continue; pid="\${f#/proc/}"; pid="\${pid%/cmdline}"; exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true); args=$(tr '\\0' ' ' < "$f" 2>/dev/null || true); case "$exe $args" in *frps*) printf '%s\\t%s\\t%s\\n' "$pid" "$exe" "$args";; esac; done`,
-        20000,
-      ).catch(() => '');
-      for (const line of processes.split(/\r?\n/)) {
-        const [pid, binary, ...rest] = line.split('\t');
-        if (!pid || !binary) continue;
-        const args = rest.join('\t');
-        const match = /(?:^|\s)(?:-c|--config)\s+(?:"([^"]+)"|(\S+))/.exec(args);
-        if (!match) continue;
-        candidates.push({
-          service: `frps (PID ${pid})`,
-          manager: 'process',
-          state: 'running',
-          binary,
-          config: match[1] ?? match[2],
-        });
-      }
-    }
+    // 不扫描 /proc 进程列表：按命令行子串匹配会把执行本检测的 shell 自身、
+    // docker 包装命令、临时调试命令都当成 frps 服务（曾误报「frps (PID xxx)」）。
+    // 进程方式启动的服务本来也无法安全移除或可靠读取配置，只认已注册的系统服务。
     return candidates.filter(
       (candidate) => !term || candidate.service.toLowerCase().includes(term),
     );
@@ -629,16 +653,187 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
     if (!value.trim()) throw new AppError('服务端配置为空。');
     return value;
   }
-  async deploy(id: string, key: string) {
+  /**
+   * 安装前预检：把端口占用、已有 FRP 服务、安装目录残留一次查清。
+   * 只读，不修改服务器，渲染层据此给出明确选择而不是中途报错终止。
+   */
+  async installPrecheck(
+    id: string,
+    onProgress?: (update: ServerDeployProgressUpdate) => void,
+  ): Promise<InstallPrecheck> {
+    // 预检全是 SSH 往返，最少也要几秒；分阶段上报，避免用户以为点了没反应。
+    const report = (
+      step: string,
+      message: string,
+      percent: number,
+      extra?: Partial<ServerDeployProgressUpdate>,
+    ) =>
+      onProgress?.({
+        serverId: id,
+        status: 'running',
+        step,
+        message,
+        percent,
+        ...extra,
+      });
+    report('检查安装条件', '正在核对 SSH 连接与服务器系统', 5);
+    const server = this.store.server(id);
+    const info = await this.detect(id);
+    report('系统探测完成', `${info.distribution} · linux/${info.arch}`, 20);
+    const portConflicts: number[] = [];
+    if (server.configMode === 'form' && info.supported) {
+      for (const port of [server.frpPort, server.httpPort, server.httpsPort]) {
+        if (info.ports.split('\n').some((line) => new RegExp(`:${port}(?:\\s|$)`).test(line)))
+          portConflicts.push(port);
+      }
+    }
+    report(
+      '检查端口占用',
+      portConflicts.length
+        ? `发现冲突端口 ${portConflicts.join('、')}`
+        : 'FRP / HTTP / HTTPS 入口端口可用',
+      40,
+    );
+    report('检索已有 FRP 服务', '正在扫描 systemd / init 系统服务', 60);
+    const existingServices = info.supported
+      ? await this.searchFrpsServices(id).catch(() => [])
+      : [];
+    report('检查安装目录', '正在核对本工具安装目录的残留程序', 80);
+    let installDirExists = false;
+    if (info.supported && info.home.startsWith('/')) {
+      const folder = remotePath(`${info.home}/.local/share/intranet-frp/${id}`);
+      const probe = await this.exec(
+        id,
+        `if test -e ${quote(`${folder}/frps`)}; then echo yes; else echo no; fi`,
+      ).catch(() => 'no');
+      installDirExists = probe.trim().includes('yes');
+    }
+    report(
+      '预检完成',
+      `${existingServices.length ? `发现 ${existingServices.length} 个已有 FRP 服务；` : '未发现已有 FRP 服务；'}${installDirExists ? '安装目录已有程序' : '安装目录为空'}`,
+      100,
+    );
+    return {
+      serverId: id,
+      arch: info.arch,
+      supported: info.supported,
+      distribution: info.distribution,
+      portConflicts,
+      ports: info.ports,
+      existingServices,
+      installDirExists,
+      managedDeployment: Boolean(server.deployment),
+      warning: info.warning,
+    };
+  }
+
+  /**
+   * 移除检索到的已有 FRP 服务：停服务 → 禁开机 → 备份程序与配置 → 删服务单元。
+   * 只动该服务自身的单元与文件，保留 .bak 备份可回滚；进程方式启动的服务不自动处理。
+   */
+  async removeExistingFrps(id: string, candidate: FrpsServiceCandidate) {
+    return this.locked(id, async () => {
+      const info = await this.detect(id);
+      if (!info.supported) throw new AppError('暂不支持此服务器系统，无法安全移除已有服务。');
+      if (candidate.manager === 'process')
+        throw new AppError('进程方式运行的 FRP 无法安全自动移除，请手动停止后再安装。');
+      const privilege = info.root ? '' : info.sudo ? 'sudo -n ' : '';
+      const stamp = Date.now();
+      const service = quote(candidate.service);
+      const actions: string[] = [];
+      if (candidate.manager === 'systemd') {
+        // 系统单元与用户单元都尝试；只删除可写的自定义位置，不碰 /usr/lib 系统自带单元。
+        for (const prefix of ['', '--user ']) {
+          await this.exec(id, `systemctl ${prefix}stop ${service} 2>/dev/null || true`).catch(
+            () => {},
+          );
+          await this.exec(id, `systemctl ${prefix}disable ${service} 2>/dev/null || true`).catch(
+            () => {},
+          );
+        }
+        for (const unit of [
+          `/etc/systemd/system/${candidate.service}`,
+          `${info.home}/.config/systemd/user/${candidate.service}`,
+        ]) {
+          const removed = await this.exec(
+            id,
+            `if test -f ${quote(unit)}; then ${privilege}rm -f -- ${quote(unit)} && echo yes; else echo no; fi`,
+          ).catch(() => 'no');
+          if (removed.trim().includes('yes')) actions.push(`删除服务单元 ${unit}`);
+        }
+        await this.exec(
+          id,
+          `${privilege}systemctl daemon-reload 2>/dev/null || systemctl --user daemon-reload 2>/dev/null || true`,
+        ).catch(() => {});
+      } else {
+        const script = quote(`/etc/init.d/${candidate.service}`);
+        if (candidate.manager === 'openrc') {
+          await this.exec(id, `${privilege}rc-service ${service} stop 2>/dev/null || true`).catch(
+            () => {},
+          );
+          await this.exec(
+            id,
+            `${privilege}rc-update del ${service} default 2>/dev/null || true`,
+          ).catch(() => {});
+        } else {
+          await this.exec(id, `${privilege}${script} stop 2>/dev/null || true`).catch(() => {});
+          await this.exec(
+            id,
+            `${privilege}update-rc.d -f ${service} remove 2>/dev/null || ${privilege}chkconfig --del ${service} 2>/dev/null || true`,
+          ).catch(() => {});
+        }
+        const removed = await this.exec(
+          id,
+          `if test -e ${script}; then ${privilege}rm -f -- ${script} && echo yes; else echo no; fi`,
+        ).catch(() => 'no');
+        if (removed.trim().includes('yes'))
+          actions.push(`删除启动脚本 /etc/init.d/${candidate.service}`);
+      }
+      // 程序与配置先改名备份，不直接删除，误判时可回滚。
+      for (const file of [candidate.binary, candidate.config]) {
+        try {
+          const safe = remotePath(file);
+          const backed = await this.exec(
+            id,
+            `if test -e ${quote(safe)}; then mv -- ${quote(safe)} ${quote(`${safe}.bak-${stamp}`)} && echo yes; else echo no; fi`,
+          ).catch(() => 'no');
+          if (backed.trim().includes('yes')) actions.push(`备份 ${safe} → ${safe}.bak-${stamp}`);
+        } catch {
+          // 相对路径或服务脚本里的变量不作为文件处理，只移除服务单元。
+        }
+      }
+      return `已移除已有 FRP 服务 ${candidate.service}（${candidate.manager}）。${actions.length ? actions.join('；') : '未发现可清理的文件'}`;
+    });
+  }
+
+  async deploy(
+    id: string,
+    key: string,
+    onProgress?: (update: ServerDeployProgressUpdate) => void,
+    overwrite = false,
+  ) {
+    // 阶段进度由调用方绑定 taskId 后上报；不传回调时行为与旧调用完全一致。
+    const report = (
+      step: string,
+      message: string,
+      percent: number | null,
+      status: ServerDeployProgressUpdate['status'] = 'running',
+      error?: string,
+      extra?: Partial<ServerDeployProgressUpdate>,
+    ) => onProgress?.({ serverId: id, status, step, message, percent, error, ...extra });
     return this.locked(id, async () => {
       const server = this.store.server(id);
       if (server.deployment) throw new AppError('已有部署，请使用切换版本或先解除管理。');
+      report('检查服务器', '正在核对已有部署状态', 5);
+      report('探测服务器系统', '正在读取系统信息与架构', 15);
       const info = await this.detect(id);
+      report('系统探测完成', `${info.distribution} · linux/${info.arch}`, 25);
       if (!info.supported)
         throw new AppError(`暂不支持此服务器系统：${info.distribution}。目前仅支持 Linux。`);
       const version = this.store.version(key);
       if (version.platform !== 'linux' || version.arch !== info.arch)
         throw new AppError(`请选择 Linux/${info.arch} 安装包。`);
+      report('校验安装包', `FRP ${version.version} · linux/${info.arch}`, 30);
       if (server.configMode === 'form' && !frpAdapter.supportsForm(version.version))
         throw new AppError('此版本只能使用原始配置部署。');
       const selection = selectServiceMode(info);
@@ -662,30 +857,47 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
         versionKey: key,
       };
       const content = this.config(id);
+      report('检查端口占用', '正在核对 FRP / HTTP / HTTPS 端口', 38);
       if (server.configMode === 'form') {
         for (const port of [server.frpPort, server.httpPort, server.httpsPort]) {
           if (info.ports.split('\n').some((line) => new RegExp(`:${port}(?:\\s|$)`).test(line)))
             throw new AppError(
-              `服务器端口 ${port} 已占用，请更换端口，或检索现有 FRP 服务并保存为只读连接。`,
+              `服务器端口 ${port} 已被占用，安装已终止。请在服务器配置中更换该端口后重试。`,
             );
         }
       }
       const privilege = d.mode === 'system' && !info.root ? 'sudo -n ' : '';
-      // 检查现有目录，避免覆盖先前失败部署或其他安装。
+      // 目录残留：用户确认覆盖时直接续装，否则拒绝，避免悄悄覆盖不明程序。
+      report('准备安装目录', '正在创建独立安装目录', 45);
       await this.exec(
         id,
-        `test ! -e ${quote(d.binary)} || { echo '安装目录已有程序，请检索现有 FRP 服务并保存为只读连接，或选择其他服务器配置'; exit 1; }; mkdir -p -- ${quote(folder)}; chmod 700 -- ${quote(folder)}`,
+        `if test -e ${quote(d.binary)} && test ${overwrite ? '0' : '1'} -eq 1; then echo '安装目录已有程序，未覆盖。请在预检确认中允许覆盖上传。'; exit 1; fi; mkdir -p -- ${quote(folder)}; chmod 700 -- ${quote(folder)}`,
       );
       let installedUnit = '';
       try {
-        await this.upload(id, path.join(version.directory, 'frps'), d.binary);
+        report('上传程序', '正在上传 frps 到服务器', 55);
+        await this.upload(id, path.join(version.directory, 'frps'), d.binary, (received, total) => {
+          const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`;
+          report(
+            '上传程序',
+            `已上传 ${mb(received)} / 共 ${mb(total)}`,
+            55 + (total > 0 ? Math.round((received / total) * 13) : 0),
+            'running',
+            undefined,
+            { received, total },
+          );
+        });
         await this.exec(id, `chmod 700 -- ${quote(d.binary)}`);
+        report('校验程序版本', '正在核对服务端实际版本', 70);
         const actual = await this.exec(id, `${quote(d.binary)} -v`);
         if (actual.trim().replace(/^v/, '') !== version.version)
           throw new AppError('服务端实际版本不匹配，部署已暂停，请检查安装目录。');
+        report('写入配置', '正在写入 frps 配置文件', 76);
         await this.write(id, d.config, content);
         if (frpAdapter.supportsForm(version.version))
           await this.exec(id, `${quote(d.binary)} verify -c ${quote(d.config)}`);
+        report('校验配置', '配置校验通过', 82);
+        report('安装服务', `正在写入 ${selection.manager} 服务单元`, 88);
         if (d.manager === 'systemd') {
           const unitPath = `${folder}/${d.service}`;
           const escapeUnit = (p: string) => p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -737,18 +949,35 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
         server.deployment = d;
         await this.store.persist();
         this.changed();
+        // 安装即启动：复用无锁控制方法，避免与 deploy 自身的 locked 重入。
+        report('启动服务', '正在启动 FRP 服务端', 95);
+        let startResult: string;
+        try {
+          const state = await this.controlUnlocked(id, 'start');
+          startResult = `服务已启动（${state}）`;
+          report('启动服务', startResult, 98);
+        } catch (error) {
+          const detail = redact(
+            error instanceof Error ? error.message : String(error),
+            this.store.allSecrets(),
+          ).slice(0, 300);
+          startResult = `服务端已安装，但自动启动失败：${detail}。请到服务器页手动启动或查看日志。`;
+          report('启动服务', startResult, 98, 'failed', detail);
+        }
         return {
           deployment: d,
-          note:
+          note: `${startResult}。${
             d.mode === 'process'
               ? '普通后台进程模式，不保证开机启动；低于 1024 的端口可能需要额外权限。'
               : d.mode === 'user'
                 ? '用户 systemd 服务，注销后运行取决于服务器 linger 配置。'
                 : d.manager === 'openrc' || d.manager === 'sysv'
-                  ? `${d.manager === 'openrc' ? 'OpenRC' : 'SysV'} 服务已安装，日志写入独立文件；服务保持停止，可单独开启开机启动。`
-                  : `systemd 服务已安装，日志写入${d.logMode === 'file' ? '可单独清理的文件' : '系统 journal（不能单独清理此服务日志）'}；可通过启用开机启动单独设置。`,
+                  ? `${d.manager === 'openrc' ? 'OpenRC' : 'SysV'} 服务，日志写入独立文件；可单独开启开机启动。`
+                  : `systemd 服务，日志写入${d.logMode === 'file' ? '可单独清理的文件' : '系统 journal（不能单独清理此服务日志）'}；可单独启用开机启动。`
+          }`,
         };
       } catch (error) {
+        report('失败回滚', '正在清理已写入的文件与服务单元', 92);
         server.deployment = undefined;
         if (installedUnit) {
           if (d.manager === 'systemd')
@@ -768,11 +997,39 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
           id,
           `rm -f -- ${[d.binary, d.config, `${folder}/${d.service}`, `${folder}/${d.service}.init`].map(quote).join(' ')}`,
         ).catch(() => {});
+        // 内存里清掉部署后必须落盘：否则重启读回旧 state 会误报「已有部署」而卡住重试。
+        await this.store.persist();
+        this.changed();
         throw error;
       }
     });
   }
-  async apply(id: string) {
+  /** 查询服务是否已设为开机启动；普通后台进程模式返回 null。 */
+  async autostart(id: string): Promise<boolean | null> {
+    const d = this.deployment(id);
+    const manager = deploymentManager(d);
+    if (manager === 'process') return null;
+    const privilege = d.mode === 'system' && !this.rootUsers.has(id) ? 'sudo -n ' : '';
+    if (manager === 'systemd') {
+      const prefix = d.mode === 'system' ? `${privilege}systemctl` : 'systemctl --user';
+      const output = await this.exec(
+        id,
+        `${prefix} is-enabled ${quote(d.service)} 2>/dev/null || true`,
+      );
+      const value = output.trim().split(/\s+/)[0] ?? '';
+      return ['enabled', 'enabled-runtime', 'static', 'indirect', 'alias'].includes(value);
+    }
+    if (manager === 'openrc') {
+      const output = await this.exec(id, `${privilege}rc-update show -v 2>/dev/null || true`);
+      return new RegExp(`^\\s*${d.service}\\s*\\|`, 'm').test(output);
+    }
+    const output = await this.exec(
+      id,
+      `test -n "$(ls -1 /etc/rc?.d/S*${d.service} 2>/dev/null | head -1)" && echo enabled || echo disabled`,
+    );
+    return output.trim() === 'enabled';
+  }
+  async apply(id: string, restart = true) {
     return this.locked(id, async () => {
       const d = this.deployment(id);
       const content = this.config(id);
@@ -792,7 +1049,10 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
       } finally {
         await this.exec(id, `rm -f -- ${quote(candidate)}`).catch(() => {});
       }
-      return '配置已应用并备份；正在运行的服务保持原配置，请明确点击重启。';
+      if (restart) await this.controlUnlocked(id, 'restart');
+      return restart
+        ? '配置已应用并重启服务。'
+        : '配置已应用并备份；正在运行的服务保持原配置，请明确点击重启。';
     });
   }
   async changeVersion(id: string, key: string) {
@@ -828,48 +1088,53 @@ if [ -r "$file" ]; then tail -n 1000 "$file"; else printf '__NO_HISTORY__\\n'; f
     });
   }
   async control(id: string, action: 'start' | 'stop' | 'restart' | 'enable' | 'disable') {
-    return this.locked(id, async () => {
-      const d = this.deployment(id);
-      const manager = deploymentManager(d);
-      if (manager !== 'process') {
-        await this.checkUnit(id, d);
-        await this.exec(id, this.serviceCommand(id, d, action));
-        try {
-          return await this.status(id);
-        } catch (error) {
-          const message = redact(
-            error instanceof Error ? error.message : String(error),
-            this.store.allSecrets(),
-          ).slice(0, 500);
-          this.serviceStates.set(id, { value: 'unknown', at: Date.now(), message });
-          this.changed();
-          return `服务操作命令已执行，但状态未确认：${message}`;
-        }
+    return this.locked(id, () => this.controlUnlocked(id, action));
+  }
+  // 无锁版本：部署流程已持有 locked，安装完成后的自动启动直接调用它，避免重入死锁。
+  private async controlUnlocked(
+    id: string,
+    action: 'start' | 'stop' | 'restart' | 'enable' | 'disable',
+  ) {
+    const d = this.deployment(id);
+    const manager = deploymentManager(d);
+    if (manager !== 'process') {
+      await this.checkUnit(id, d);
+      await this.exec(id, this.serviceCommand(id, d, action));
+      try {
+        return await this.status(id);
+      } catch (error) {
+        const message = redact(
+          error instanceof Error ? error.message : String(error),
+          this.store.allSecrets(),
+        ).slice(0, 500);
+        this.serviceStates.set(id, { value: 'unknown', at: Date.now(), message });
+        this.changed();
+        return `服务操作命令已执行，但状态未确认：${message}`;
       }
-      if (action === 'enable' || action === 'disable')
-        throw new AppError('普通进程模式不提供开机启动。');
-      const running = (await this.status(id)) === 'running';
-      if (!running) {
-        await this.exec(
-          id,
-          `if test -s ${quote(d.pidFile)}; then pid=$(cat ${quote(d.pidFile)}); case \"$pid\" in ''|*[!0-9]*) echo 'PID 文件无效，请人工检查'; exit 1;; esac; if kill -0 \"$pid\" 2>/dev/null; then echo 'PID 属于其他进程，已阻止操作'; exit 1; fi; fi`,
-        );
-      }
-      if ((action === 'stop' || action === 'restart') && running) {
-        await this.exec(
-          id,
-          `${this.checkedPid(d)} kill "$pid"; n=0; while kill -0 "$pid" 2>/dev/null && test "$n" -lt 10; do sleep 1; n=$((n+1)); done; if kill -0 "$pid" 2>/dev/null; then echo '进程未退出，请人工检查'; exit 1; fi; rm -f -- ${quote(d.pidFile)}`,
-        );
-      }
-      if (action === 'start' && running) return 'running';
-      if (action === 'start' || action === 'restart') {
-        await this.exec(
-          id,
-          `umask 077; nohup ${quote(d.binary)} -c ${quote(d.config)} >> ${quote(d.log)} 2>&1 < /dev/null & echo $! > ${quote(d.pidFile)}; sleep 1`,
-        );
-      }
-      return this.status(id);
-    });
+    }
+    if (action === 'enable' || action === 'disable')
+      throw new AppError('普通进程模式不提供开机启动。');
+    const running = (await this.status(id)) === 'running';
+    if (!running) {
+      await this.exec(
+        id,
+        `if test -s ${quote(d.pidFile)}; then pid=$(cat ${quote(d.pidFile)}); case \"$pid\" in ''|*[!0-9]*) echo 'PID 文件无效，请人工检查'; exit 1;; esac; if kill -0 \"$pid\" 2>/dev/null; then echo 'PID 属于其他进程，已阻止操作'; exit 1; fi; fi`,
+      );
+    }
+    if ((action === 'stop' || action === 'restart') && running) {
+      await this.exec(
+        id,
+        `${this.checkedPid(d)} kill "$pid"; n=0; while kill -0 "$pid" 2>/dev/null && test "$n" -lt 10; do sleep 1; n=$((n+1)); done; if kill -0 "$pid" 2>/dev/null; then echo '进程未退出，请人工检查'; exit 1; fi; rm -f -- ${quote(d.pidFile)}`,
+      );
+    }
+    if (action === 'start' && running) return 'running';
+    if (action === 'start' || action === 'restart') {
+      await this.exec(
+        id,
+        `umask 077; nohup ${quote(d.binary)} -c ${quote(d.config)} >> ${quote(d.log)} 2>&1 < /dev/null & echo $! > ${quote(d.pidFile)}; sleep 1`,
+      );
+    }
+    return this.status(id);
   }
   async logs(id: string) {
     const d = this.deployment(id);

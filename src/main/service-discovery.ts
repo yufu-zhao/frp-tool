@@ -119,6 +119,99 @@ export function parseDiscoveredFrpsConfig(content: string, filePath: string): Di
 }
 
 // 解析 systemctl 属性输出，兼容不支持 --value 的 CentOS 7。
+// ExecStart 常见写法差异很大：多个 argv[]、sh -c 包装、-c=/path、引号路径都要识别，
+// 否则检测出的服务会在「只读读取」和「移除」时因为路径不对而失败。
+function baseName(value: string) {
+  return value.split(/[\\/]/).pop()?.toLowerCase() ?? '';
+}
+function systemdArgv(start: string): string[] {
+  // argv[] 的值用 \; 转义分号，先按转义规则切出完整片段再还原。
+  const result: string[] = [];
+  const pattern = /argv\[\]=((?:\\.|[^;])*)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(start))) {
+    const value = match[1].replace(/\\([;"])/g, '$1').trim();
+    if (value) result.push(value);
+  }
+  return result;
+}
+/** 极简 POSIX 分词：只处理引号与反斜杠，不解释命令、变量或通配符。 */
+export function tokenizeShellCommand(command: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  let started = false;
+  for (const char of command) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      started = true;
+      continue;
+    }
+    if (char === '\\' && quote !== "'") {
+      escaped = true;
+      started = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (started) {
+        tokens.push(current);
+        current = '';
+        started = false;
+      }
+      continue;
+    }
+    current += char;
+    started = true;
+  }
+  if (started) tokens.push(current);
+  return tokens;
+}
+const shells = new Set(['sh', 'bash', 'dash', 'ash', 'zsh']);
+
+/** 从 ExecStart 参数里定位真正的 frps 程序与配置路径，兼容 sh -c 包装与等号写法。 */
+export function extractFrpsLaunch(
+  argv: string[],
+  allowFallback = false,
+): { binary: string; config: string } | undefined {
+  let tokens = argv.flatMap(tokenizeShellCommand);
+  if (tokens.length >= 3 && shells.has(baseName(tokens[0])) && tokens[1] === '-c') {
+    tokens = tokenizeShellCommand(tokens.slice(2).join(' '));
+  }
+  let binaryIndex = tokens.findIndex(
+    (token) => /(^|[-_.])frps$/.test(baseName(token)) && !/frpc/i.test(token),
+  );
+  if (binaryIndex < 0 && allowFallback) binaryIndex = tokens.findIndex((t) => t.startsWith('/'));
+  // 不放弃路径兜底时拒绝：避免把 nginx -c /etc/nginx/nginx.conf 误判成 FRP。
+  if (binaryIndex < 0) return undefined;
+  let config = '';
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    const equal = /^(?:--config|-c)=(.*)$/i.exec(token);
+    if (equal) {
+      config = unquote(equal[1]);
+      break;
+    }
+    if (/^(?:-c|--config)$/i.test(token) && tokens[index + 1]) {
+      config = unquote(tokens[index + 1]);
+      break;
+    }
+  }
+  if (!config || config.startsWith('-')) return undefined;
+  return { binary: tokens[binaryIndex], config };
+}
+
 export function parseSystemdFrpsCandidate(
   service: string,
   output: string,
@@ -128,18 +221,17 @@ export function parseSystemdFrpsCandidate(
     const separator = line.indexOf('=');
     if (separator > 0) values.set(line.slice(0, separator), line.slice(separator + 1));
   }
-  const start = values.get('ExecStart') ?? '';
-  if (!/frps(?:\s|$)/i.test(start) && !/intranet-frps/i.test(service)) return undefined;
-  const binary = /path=([^;]+?)\s*;/.exec(start)?.[1]?.trim();
-  const argv = /argv\[\]=(.+?)\s*;/.exec(start)?.[1] ?? '';
-  const config = /(?:^|\s)(?:-c|--config)\s+(?:"([^"]+)"|(\S+))/.exec(argv);
-  if (!binary || !config) return undefined;
+  const launch = extractFrpsLaunch(
+    systemdArgv(values.get('ExecStart') ?? ''),
+    /intranet-frps/i.test(service),
+  );
+  if (!launch) return undefined;
   return {
     service,
     manager: 'systemd',
     state: values.get('ActiveState') ?? 'unknown',
-    binary,
-    config: config[1] ?? config[2],
+    binary: launch.binary,
+    config: launch.config,
   };
 }
 

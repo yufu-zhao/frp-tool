@@ -11,18 +11,58 @@ import {
 } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
-import { Readable } from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import * as tar from 'tar';
 import yauzl from 'yauzl';
-import type { Asset, Catalog, Release, InstallRequest, InstalledVersion } from '../shared/types';
+import type {
+  Asset,
+  Catalog,
+  Release,
+  InstallRequest,
+  InstalledVersion,
+  DownloadProgress,
+} from '../shared/types';
 import { AppError, friendlyError } from '../shared/errors';
 import { Store } from './store';
 import { frpAdapter } from './frp';
+import { Downloader, emitProgress, progressEvent } from './downloader';
 
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
 const MAX_PACKAGE = 200 * 1024 * 1024;
+
+export interface CatalogOptions {
+  force?: boolean;
+}
+export interface InstallOptions {
+  taskId?: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: DownloadProgress) => void;
+}
+// 第二个参数既可以是完整 options，也可以直接是进度回调。
+export type InstallOptionsInput = InstallOptions | ((progress: DownloadProgress) => void);
+
+// 缓存是否仍在 catalogCacheHours 有效期内。
+function catalogFresh(catalog: Catalog | null | undefined, hours: number): boolean {
+  if (!catalog || !Array.isArray(catalog.releases) || !catalog.releases.length) return false;
+  const updated = Date.parse(catalog.updatedAt);
+  if (!Number.isFinite(updated)) return false;
+  const limit = (Number.isFinite(hours) && hours > 0 ? hours : 24) * 3600000;
+  return Date.now() - updated < limit;
+}
+
+// 翻页时把新一页合并进已持久化的列表，按版本去重并保留更完整的资源列表。
+function mergeCatalog(previous: Catalog | null, incoming: Catalog, page: number): Catalog {
+  if (!previous || page <= 1) return incoming;
+  const releases = new Map<string, Release>();
+  for (const release of previous.releases) releases.set(release.version, release);
+  for (const release of incoming.releases) {
+    const existing = releases.get(release.version);
+    if (!existing || release.assets.length > existing.assets.length)
+      releases.set(release.version, release);
+  }
+  return { ...incoming, releases: [...releases.values()], page, hasMore: incoming.hasMore };
+}
 export function normalizeReleases(input: unknown): Release[] {
   if (!Array.isArray(input))
     throw new AppError('版本接口返回了非列表内容，请检查代理或稍后重试。', 'BAD_RESPONSE');
@@ -230,11 +270,41 @@ export class Versions {
     this.apiWarning = '';
   }
   private installing = new Set<string>();
+  // 同一会话内是否已主动联网取回过列表：从 state.json 载入的旧缓存才直接命中，
+  // 会话内再次查询允许复核（限流/离线时自动回退到旧缓存），避免缓存永久不更新。
+  private refetchedInSession = false;
+  private downloadControllers = new Map<string, AbortController>();
+  private retryable = new Map<
+    string,
+    { request: InstallRequest; onProgress?: InstallOptions['onProgress'] }
+  >();
+  private downloader: Downloader;
   constructor(
     private store: Store,
     private fetcher: Fetcher,
     private checkBinary: (file: string) => Promise<string>,
-  ) {}
+  ) {
+    this.downloader = new Downloader(store, fetcher);
+  }
+  // 应用启动即刻读取已持久化的版本列表，不必等待网络。
+  cachedCatalog(): Catalog | null {
+    const saved = this.store.data.catalog;
+    if (!saved || !Array.isArray(saved.releases) || !saved.releases.length) return null;
+    return { ...saved, cached: true };
+  }
+  // version:download-cancel：默认暂停并保留断点；discard 则放弃并清理分片。
+  cancelDownload(taskId: string, discard = false): boolean {
+    const controller = this.downloadControllers.get(taskId);
+    if (!controller) return false;
+    controller.abort(discard ? 'discard' : 'pause');
+    return true;
+  }
+  // version:download-retry：用同一 taskId 重新发起，自动从 .part 断点继续。
+  async retryDownload(taskId: string): Promise<InstalledVersion> {
+    const saved = this.retryable.get(taskId);
+    if (!saved) throw new AppError('找不到该下载任务，请重新发起安装。');
+    return this.install(saved.request, { taskId, onProgress: saved.onProgress });
+  }
   private async apiCatalog(page: number): Promise<Catalog> {
     if (Date.now() < this.apiRetryAt) throw new AppError(this.apiWarning);
     const response = await this.fetcher(
@@ -320,7 +390,21 @@ export class Versions {
       hasMore: new RegExp(`[?&]page=${page + 1}(?:["'&]|&amp;)`).test(html),
     };
   }
-  async catalog(page = 1): Promise<Catalog> {
+  async catalog(page = 1, options: CatalogOptions = {}): Promise<Catalog> {
+    const saved = this.store.data.catalog;
+    const hours = this.store.data.settings?.catalogCacheHours ?? 24;
+    const savedPage = saved && typeof saved.page === 'number' ? saved.page : 1;
+    // 未过期且非强制：直接返回 state.json 中的持久化缓存，不联网。
+    if (
+      !options.force &&
+      !this.refetchedInSession &&
+      saved &&
+      savedPage === page &&
+      catalogFresh(saved, hours)
+    )
+      return { ...saved, cached: true, stale: false };
+
+    this.refetchedInSession = true;
     const cache = path.join(this.store.root, `releases-${page}.json`);
     let result: Catalog;
     try {
@@ -330,31 +414,51 @@ export class Versions {
         result = await this.webCatalog(page);
         result.warning = `${friendlyError(apiError)}，已自动切换到 GitHub 官方发布页面。${result.releases.some((release) => release.assetError) ? '部分版本安装包列表未取得，可刷新重试。' : ''}`;
       } catch (webError) {
-        try {
-          const saved = JSON.parse(await readFile(cache, 'utf8')) as Catalog;
-          if (!Array.isArray(saved.releases) || !saved.releases.length)
-            throw new Error('缓存不可用');
-          return {
-            ...saved,
-            cached: true,
-            warning: `${friendlyError(apiError)}；${friendlyError(webError)}`,
-          };
-        } catch {
-          throw new AppError(
-            `${friendlyError(apiError)}；${friendlyError(webError)} 当前没有可用缓存，请检查下载网络或导入本地安装包。`,
-            'CATALOG_FAILED',
-          );
-        }
+        return this.offlineCatalog(page, apiError, webError);
       }
     }
+    result = mergeCatalog(saved, result, page);
     // 缓存写入失败不能让已成功取得的版本列表变成失败。
     try {
       await writeFile(`${cache}.tmp`, JSON.stringify(result), { mode: 0o600 });
       await rename(`${cache}.tmp`, cache);
+      await this.store.saveCatalog({
+        source: result.source,
+        releases: result.releases,
+        updatedAt: result.updatedAt,
+        cached: true,
+        stale: false,
+        page: result.page,
+        hasMore: result.hasMore,
+      });
     } catch {
       result.warning = `${result.warning ?? ''} 版本列表已获取，但本地缓存未能保存。`;
     }
     return result;
+  }
+  // 两条网络路径都失败：优先回退 state.json 缓存，再回退旧版 releases-<page>.json。
+  private async offlineCatalog(
+    page: number,
+    apiError: unknown,
+    webError: unknown,
+  ): Promise<Catalog> {
+    const warning = `${friendlyError(apiError)}；${friendlyError(webError)}`;
+    const saved = this.store.data.catalog;
+    if (saved && Array.isArray(saved.releases) && saved.releases.length)
+      return { ...saved, cached: true, stale: true, warning };
+    try {
+      const file = JSON.parse(
+        await readFile(path.join(this.store.root, `releases-${page}.json`), 'utf8'),
+      ) as Catalog;
+      if (Array.isArray(file.releases) && file.releases.length)
+        return { ...file, cached: true, stale: true, warning };
+    } catch {
+      // 文件缓存缺失或损坏时继续抛出冷启动提示。
+    }
+    throw new AppError(
+      `${warning} 当前没有可用缓存，请检查下载网络或导入本地安装包。`,
+      'CATALOG_FAILED',
+    );
   }
   async resolveReleaseDigest(request: InstallRequest): Promise<InstallRequest> {
     if (request.digest || !request.url) return request;
@@ -407,47 +511,97 @@ export class Versions {
     await this.store.persist();
     return installed;
   }
-  async install(request: InstallRequest): Promise<InstalledVersion> {
+  async install(
+    request: InstallRequest,
+    options: InstallOptionsInput = {},
+  ): Promise<InstalledVersion> {
+    const opts: InstallOptions = typeof options === 'function' ? { onProgress: options } : options;
+    const taskId = opts.taskId ?? request.taskId ?? randomUUID();
+    const controller = new AbortController();
+    if (opts.signal) {
+      if (opts.signal.aborted) controller.abort(opts.signal.reason);
+      else
+        opts.signal.addEventListener('abort', () => controller.abort(opts.signal!.reason), {
+          once: true,
+        });
+    }
+    this.downloadControllers.set(taskId, controller);
+    this.retryable.set(taskId, { request, onProgress: opts.onProgress });
+    try {
+      return await this.runInstall(request, {
+        taskId,
+        signal: controller.signal,
+        onProgress: opts.onProgress,
+      });
+    } finally {
+      this.downloadControllers.delete(taskId);
+    }
+  }
+
+  private emitInstallProgress(
+    options: InstallOptions,
+    base: Pick<DownloadProgress, 'taskId' | 'key' | 'version'>,
+    status: DownloadProgress['status'],
+    message: string,
+    patch: Partial<DownloadProgress> = {},
+  ) {
+    emitProgress(options.onProgress, progressEvent(base, { status, message, ...patch }));
+  }
+
+  private async runInstall(
+    request: InstallRequest,
+    options: InstallOptions & { taskId: string },
+  ): Promise<InstalledVersion> {
     const key = versionKey(request);
     if (this.installing.has(key)) throw new AppError('此版本正在安装，请等待完成。');
     if (this.store.data.versions.some((v) => v.key === key)) throw new AppError('此版本已经安装。');
-    this.installing.add(key);
+    const part = this.downloader.partPath(key);
     const work = path.join(this.store.root, 'packages', `.install-${randomUUID()}`);
     const target = path.join(this.store.root, 'packages', key);
+    const base = { taskId: options.taskId, key, version: request.version.replace(/^v/, '') };
+    let totals = { received: 0, total: 0 };
+    const report = (
+      status: DownloadProgress['status'],
+      message: string,
+      patch: Partial<DownloadProgress> = {},
+    ) => this.emitInstallProgress(options, base, status, message, { ...totals, ...patch });
+
+    this.installing.add(key);
+    let checksumFailed = false;
     try {
       await mkdir(work, { recursive: true, mode: 0o700 });
       const archive = path.join(work, 'archive');
+      // 联网安装的 starting 由下载器上报；本地导入在这里上报，避免重复事件。
+      if (request.localPath) report('starting', '准备导入本地安装包。');
       if (request.localPath) {
-        if ((await stat(request.localPath)).size > MAX_PACKAGE) throw new AppError('安装包过大。');
+        const size = (await stat(request.localPath)).size;
+        if (size > MAX_PACKAGE) throw new AppError('安装包过大。');
+        totals = { received: size, total: size };
         await copyFile(request.localPath, archive);
       } else {
         if (!request.url || !/^https?:\/\//.test(request.url))
           throw new AppError('请输入 HTTP/HTTPS 下载地址，或选择本地安装包。');
-        const response = await this.fetcher(request.url, { signal: AbortSignal.timeout(120000) });
-        if (!response.ok)
-          throw new AppError(
-            `安装包下载失败（HTTP ${response.status}），可重试或改用离线导入。`,
-            'DOWNLOAD_FAILED',
-          );
-        if (!response.body || Number(response.headers.get('content-length') ?? 0) > MAX_PACKAGE)
-          throw new AppError('安装包为空或超过大小限制。');
-        let size = 0;
-        const stream = Readable.from(
-          (async function* () {
-            for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
-              size += chunk.length;
-              if (size > MAX_PACKAGE) throw new AppError('安装包超过大小限制。');
-              yield chunk;
-            }
-          })(),
-        );
-        await pipeline(stream, createWriteStream(archive, { mode: 0o600 }));
+        const result = await this.downloader.download({
+          key,
+          url: request.url,
+          taskId: options.taskId,
+          version: base.version,
+          digest: request.digest,
+          signal: options.signal,
+          onProgress: options.onProgress,
+        });
+        totals = { received: result.received, total: result.total };
+        await copyFile(result.partPath, archive);
       }
+      report('verifying', '正在校验安装包 SHA256。');
       const digest = await sha256(archive);
       if (request.digest && !/^(sha256:)?[a-fA-F0-9]{64}$/.test(request.digest))
         throw new AppError('SHA256 校验值格式不正确。');
-      if (request.digest && digest !== request.digest.replace(/^sha256:/, '').toLowerCase())
+      if (request.digest && digest !== request.digest.replace(/^sha256:/, '').toLowerCase()) {
+        checksumFailed = true;
         throw new AppError('安装包 SHA256 校验失败，未安装。', 'CHECKSUM_FAILED');
+      }
+      report('extracting', '正在解压安装包。');
       const unpacked = path.join(work, 'bin');
       await extractBinaries(archive, unpacked, request.platform);
       const localPlatform = process.platform === 'win32' ? 'windows' : process.platform;
@@ -479,9 +633,24 @@ export class Versions {
       };
       this.store.data.versions.push(item);
       await this.store.persist();
+      // 成功后清理断点记录与分片；失败/暂停时绝不在这里删除 .part。
+      await this.store.dropDownload(key);
+      if (!request.localPath) await rm(part, { force: true });
+      this.retryable.delete(options.taskId);
+      report('succeeded', '安装完成。', { percent: 100 });
       return item;
+    } catch (error) {
+      if (checksumFailed) {
+        await rm(part, { force: true });
+        await this.store.dropDownload(key);
+      }
+      // 下载器已自行上报 paused / failed / cancelled，这里只补报校验与解压阶段的错误。
+      const downloaderError = error instanceof AppError && error.code.startsWith('DOWNLOAD_');
+      if (!downloaderError) report('failed', friendlyError(error));
+      throw error;
     } finally {
       this.installing.delete(key);
+      // 只清理 packages 下的工作目录，downloads/*.part 必须保留以供续传。
       await rm(work, { recursive: true, force: true });
     }
   }

@@ -8,10 +8,18 @@ import { execFileSync } from 'node:child_process';
 
 // 测试始终使用独立用户目录，不读取或改写日常使用的应用配置。
 const data = await mkdtemp(path.join(tmpdir(), 'intranet-ui-'));
+// 受限 / 容器化环境中 Chromium 沙箱不可用，测试进程显式关闭它；
+// 同时清掉宿主可能注入的 ELECTRON_RUN_AS_NODE，避免以纯 Node 模式启动主进程。
+const childEnv = { ...process.env, INTRANET_TEST_DATA: data };
+delete childEnv.ELECTRON_RUN_AS_NODE;
 const application = await electron.launch({
   executablePath: process.env.INTRANET_ELECTRON_PATH || electronPath,
-  args: process.env.INTRANET_ELECTRON_PATH ? [] : ['.'],
-  env: { ...process.env, INTRANET_TEST_DATA: data },
+  args: [
+    ...(process.env.INTRANET_ELECTRON_PATH ? [] : ['.']),
+    '--no-sandbox',
+    '--disable-gpu-sandbox',
+  ],
+  env: childEnv,
 });
 let mainErrors = '';
 application.process().stderr?.on('data', (chunk) => {
@@ -30,33 +38,78 @@ try {
   await expect(page.getByText('从一台服务器开始')).toBeVisible();
   await page.getByRole('button', { name: '添加第一台服务器' }).click();
   await expect(page.locator('.modal h2')).toHaveText('服务器配置');
+  // 组件库 UI：状态徽标不应呈现按钮边框，表单下拉由 Ant Design Vue 承载。
+  const badgeStyle = await page.locator('.app-header__status').evaluate((el) => {
+    const style = getComputedStyle(el);
+    return {
+      border: style.borderTopWidth,
+      background: style.backgroundColor,
+      shadow: style.boxShadow,
+    };
+  });
+  if (
+    badgeStyle.border !== '0px' ||
+    badgeStyle.background !== 'rgba(0, 0, 0, 0)' ||
+    badgeStyle.shadow !== 'none'
+  )
+    throw new Error(`服务器状态徽标仍带按钮外观：${JSON.stringify(badgeStyle)}`);
+  await expect(page.locator('.modal .app-select.ant-select').first()).toBeVisible();
+  await expect(page.locator('.modal select')).toHaveCount(0);
   await page.getByLabel('名称', { exact: true }).fill('界面验证服务器');
   await page.getByLabel('SSH 管理地址').fill('127.0.0.1');
   await page.getByPlaceholder('支持直接输入绝对路径').fill('/tmp/test-key');
   await page.getByLabel('FRP 公网地址').fill('127.0.0.1');
+  // 回归：80/443 必须能直接保存（旧版渲染层曾硬拦截，导致保存不了）。
+  await page.getByLabel('HTTP 入口端口').fill('80');
+  await page.getByLabel('HTTPS 入口端口').fill('443');
   // 验证安全存储不可用的明确会话降级，不在测试中写入系统钥匙串。
   await application.evaluate(({ safeStorage }) => {
     safeStorage.isEncryptionAvailable = () => false;
   });
-  await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await page.getByRole('button', { name: '保存并应用', exact: true }).click();
   await expect(page.locator('.modal')).toHaveCount(0);
   await expect(page.locator('.item strong')).toHaveText('界面验证服务器');
-  await expect(page.getByRole('heading', { name: '检索已有 FRP 服务' })).toBeVisible();
-  await expect(page.getByRole('button', { name: '接管已有部署' })).toHaveCount(0);
-  await page.locator('nav button').filter({ hasText: '客户端实例' }).click();
+  const savedPorts = JSON.parse(await readFile(path.join(data, 'state.json'), 'utf8')).servers[0];
+  if (savedPorts.httpPort !== 80 || savedPorts.httpsPort !== 443)
+    throw new Error('服务器 HTTP/HTTPS 入口端口 80/443 未能保存');
+  console.log('服务器入口端口 80 / 443 保存验证通过。');
+  // 检索服务已内置到安装流程，页面不再保留独立的检索功能块。
+  await expect(page.getByRole('heading', { name: '检索已有 FRP 服务' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '安装服务端' })).toBeVisible();
+  await page.locator('.nav-item').filter({ hasText: '客户端实例' }).click();
   await page.getByRole('button', { name: '创建第一个实例' }).click();
-  await expect(page.locator('.rule-editor')).toHaveCount(1);
-  await page.getByRole('button', { name: '添加规则' }).click();
-  await expect(page.locator('.rule-editor')).toHaveCount(2);
+  // 规则 CRUD 已从实例表单抽出：实例弹窗只保留基础配置，规则在详情页独立管理。
+  await expect(page.locator('.rule-editor')).toHaveCount(0);
+  await expect(page.getByText('代理规则已移到实例详情页')).toBeVisible();
   await page.getByRole('button', { name: '取消', exact: true }).click();
-  await page.locator('nav button').filter({ hasText: '版本库' }).click();
-  await expect(page.getByText('在线获取，离线也有入口')).toBeVisible();
-  await page.getByRole('button', { name: '手动下载 / 离线导入' }).click();
-  await expect(page.locator('.modal h2')).toHaveText('手动安装与离线导入');
+  await page.locator('.nav-item').filter({ hasText: '版本库' }).click();
+  await expect(page.getByText('官方发布版本')).toBeVisible();
+  await page.getByRole('button', { name: '手动 / 离线导入' }).click();
+  await expect(page.locator('.modal h2')).toHaveText('手动下载 / 离线导入');
   await page.getByRole('button', { name: '关闭', exact: true }).click();
-  await page.locator('nav button').filter({ hasText: '设置与帮助' }).click();
+  await page.locator('.nav-item').filter({ hasText: '设置' }).click();
   await expect(page.getByText('下载网络', { exact: true })).toBeVisible();
-  await page.locator('nav button').first().click();
+  // DNS 账户已从设置迁到独立的「DNS 管理」页。
+  await page.locator('.nav-item').filter({ hasText: 'DNS 管理' }).click();
+  await expect(page.getByRole('heading', { name: 'DNS 管理' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '账户管理' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '域名解析管理' })).toBeVisible();
+  // 回归：新增/编辑 DNS 账户都走弹窗；空 ID/Key 点测试必须显示真实失败原因。
+  await expect(page.getByRole('button', { name: '新增账户', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '新增账户', exact: true }).click();
+  await expect(page.locator('.modal h2')).toHaveText('新增 DNS 账户');
+  await page.locator('.modal .app-select').first().click();
+  const providerOptions = await page
+    .locator('.ant-select-dropdown .ant-select-item-option')
+    .allInnerTexts();
+  expect(providerOptions).toEqual(['DNSPod', '阿里云 DNS', 'Cloudflare']);
+  await page.locator('.modal h2').click();
+  await page.getByRole('button', { name: '测试并保存凭据' }).click();
+  await expect(page.locator('.modal .hint--error')).toContainText('缺少 DNSPod ID/Token');
+  await expect(page.getByText('DNS 账户凭据验证通过。')).toHaveCount(0);
+  await expect(page.getByText('凭据验证通过并已安全保存。')).toHaveCount(0);
+  await page.locator('.modal .modal__close').click();
+  await page.locator('.nav-item').first().click();
   await mkdir('artifacts', { recursive: true });
   await page.screenshot({ path: 'artifacts/desktop-smoke.png', fullPage: true });
   await application.evaluate(({ BrowserWindow }) => {
