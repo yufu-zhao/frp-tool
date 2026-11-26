@@ -7,6 +7,7 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const packageInfo = JSON.parse(await readFile(path.join(projectRoot, 'package.json'), 'utf8'));
 const args = process.argv.slice(2);
 
+
 // 将 electron-builder 的目标平台别名统一映射为目录名。
 const platformOptions = new Map([
   ['--mac', 'mac'],
@@ -18,7 +19,18 @@ const platformOptions = new Map([
   ['--linux', 'linux'],
   ['-l', 'linux'],
 ]);
+const arcs = new Map([
+  ['amd64', 'amd64'],
+  ['--amd64', 'amd64'],
+  ['arm64', 'arm64'],
+  ['--arm64', 'arm64'],
+  ['x64', 'x64'],
+  ['--x64', 'x64'],
+  ['deb', 'deb'],
+  ['--deb', 'deb'],
+]);
 const requestedPlatforms = new Set();
+const requestedArches = new Set();
 for (const arg of args) {
   if (platformOptions.has(arg)) requestedPlatforms.add(platformOptions.get(arg));
   // electron-builder 也支持 -mwl 这样的组合短参数。
@@ -26,25 +38,28 @@ for (const arg of args) {
     for (const alias of arg.slice(1))
       requestedPlatforms.add({ m: 'mac', w: 'win', l: 'linux' }[alias]);
   }
+  if (arcs.has(arg)) requestedArches.add(arcs.get(arg));
 }
 
 if (requestedPlatforms.size > 1) {
   throw new Error('一次只能打包一个目标平台；请分别执行 mac、win 或 linux 打包命令。');
 }
-
+const arch = [...requestedArches][0] ?? process.arch;
 const hostPlatform = { darwin: 'mac', win32: 'win', linux: 'linux' }[process.platform];
+
 const platform = [...requestedPlatforms][0] ?? hostPlatform;
 if (!platform) throw new Error(`不支持在 ${process.platform} 上自动选择打包平台。`);
 if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(packageInfo.version))
   throw new Error(`package.json 版本号格式无效：${packageInfo.version}`);
 
-const outputDirectory = `release/${packageInfo.version}/${platform}`;
+const outputDirectory = `release/${packageInfo.version}/${platform}/${arch}`;
 const builder = path.join(
   projectRoot,
   'node_modules',
   '.bin',
   process.platform === 'win32' ? 'electron-builder.cmd' : 'electron-builder',
 );
+
 const child = spawn(builder, [...args, `--config.directories.output=${outputDirectory}`], {
   cwd: projectRoot,
   stdio: 'inherit',
