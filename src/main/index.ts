@@ -1195,25 +1195,59 @@ else {
         },
         [ACTIONS.certificateDetail]: async (p) => {
           const id = pickId(p);
-          const cert = store.data.serverCertificates.find((item) => item.id === id);
-          if (!cert) throw new AppError('证书不存在或已被删除。');
+          // 规则 SSL 面板在方案 B 下传的是本机证书 id（localCertificateId / 伴随规则 id），
+          // 不是服务端证书记录 id。先按签发记录的 localCertificateId 回查，再兜到本机证书库，
+          // 保证「存放位置」始终可读，而不是一律报「证书不存在或已被删除」。
+          const cert =
+            store.data.serverCertificates.find((item) => item.id === id) ??
+            store.data.serverCertificates.find((item) => item.localCertificateId === id);
+          // 路径是纯计算，不依赖文件是否仍存在；内容读取单独容错，避免一个文件读不到
+          // 就把「存放位置」也一起吞掉。
+          const readLocalPem = async (localId: string) => {
+            try {
+              return await localCertificates.readPem(localId);
+            } catch {
+              return { certPem: '', keyPem: '' };
+            }
+          };
+          if (!cert) {
+            const local = store.data.certificates.find((item) => item.id === id);
+            if (!local) throw new AppError('证书不存在或已被删除。');
+            const pem = await readLocalPem(id);
+            return {
+              id,
+              storage: 'local' as const,
+              certPath: local.certPath,
+              keyPath: local.keyPath,
+              certPem: pem.certPem,
+              keyPem: pem.keyPem,
+            };
+          }
           if (cert.tlsPlan === 'server') {
-            const admin = remote.nginxAdmin(cert.serverId);
-            const certPem = cert.serverCertPath ? await admin.read(cert.serverCertPath) : '';
-            const keyPem = cert.serverKeyPath ? await admin.read(cert.serverKeyPath) : '';
+            const certPath = cert.serverCertPath ?? '';
+            const keyPath = cert.serverKeyPath ?? '';
+            let certPem = '';
+            let keyPem = '';
+            try {
+              const admin = remote.nginxAdmin(cert.serverId);
+              if (certPath) certPem = await admin.read(certPath);
+              if (keyPath) keyPem = await admin.read(keyPath);
+            } catch {
+              // SSH 未连接或远端文件已移除时，仍返回已记录的存放位置。
+            }
             return {
               id: cert.id,
               storage: 'server' as const,
-              certPath: cert.serverCertPath ?? '',
-              keyPath: cert.serverKeyPath ?? '',
+              certPath,
+              keyPath,
               configPath: cert.serverConfigPath ?? '',
               certPem,
               keyPem,
             };
           }
           const localId = cert.localCertificateId ?? cert.id;
-          const pem = await localCertificates.readPem(localId);
           const paths = localCertificates.pathFor(localId);
+          const pem = await readLocalPem(localId);
           return {
             id: cert.id,
             storage: 'local' as const,

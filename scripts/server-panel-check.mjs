@@ -102,7 +102,13 @@ try {
   await page.getByRole('button', { name: '编辑配置' }).click();
   await expect(page.locator('.modal h2')).toHaveText('服务器配置');
   await expect(page.getByRole('button', { name: '保存并应用' })).toBeVisible();
-  await expect(page.getByText('部署路径（只读）')).toBeVisible();
+  // 部署路径是低频信息，默认折叠；展开后才展示程序与配置文件位置。
+  const pathSummary = page.locator('.modal .form-disclosure summary');
+  await expect(pathSummary).toHaveText('部署路径（只读）');
+  await expect(
+    page.getByText('/root/.local/share/intranet-frp/panel-check/frps', { exact: false }),
+  ).toBeHidden();
+  await pathSummary.click();
   await expect(
     page.getByText('/root/.local/share/intranet-frp/panel-check/frps', { exact: false }),
   ).toBeVisible();

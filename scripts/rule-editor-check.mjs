@@ -257,9 +257,10 @@ try {
   await expect(page.locator('.cm-content')).toContainText('server {');
   await expect(page.locator('.cm-content')).toContainText('127.0.0.1:80');
   await page.locator('.rule-side-tabs__item').filter({ hasText: 'SSL' }).click();
-  await expect(page.getByRole('button', { name: '保存并启用证书' })).toBeVisible();
+  // 方案 B 不再提供手动导入证书，只保留申请与移除；避免 PEM 粘贴框重新出现。
+  await expect(page.getByRole('button', { name: '保存并启用证书' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '申请证书' })).toBeVisible();
-  await expect(page.locator('.code-editor')).toHaveCount(2);
+  await expect(page.locator('.cert-panel .code-editor')).toHaveCount(0);
   // SSL 标签统一分区，并展示证书/私钥的实际存放位置。
   await expect(page.locator('.cert-panel__section h3').first()).toHaveText('当前方案');
   await expect(page.locator('.cert-location')).toContainText('证书存放位置');
@@ -356,7 +357,7 @@ try {
     'true',
   );
   await expect(page.getByText('还没有保存 DNS 账户')).toBeVisible();
-  await expect(page.getByRole('button', { name: '新增账户', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /新增账户/ })).toBeVisible();
 
   // 三档布局检查（含 DNS 管理页两个标签）
   for (const width of [1440, 1024, 900]) {

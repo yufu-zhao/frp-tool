@@ -391,6 +391,12 @@ label > textarea {
 .inline-fields button {
   white-space: nowrap;
 }
+/* 输入框固定 38px，同行按钮必须等高，否则出现高低不齐。 */
+.inline-fields > button {
+  height: 38px;
+  box-sizing: border-box;
+  flex: 0 0 auto;
+}
 label .inline-fields {
   margin: 0;
 }
@@ -563,6 +569,20 @@ label .inline-fields {
 .card + .card,
 .panel + .panel {
   margin-top: var(--sp-5);
+}
+/* grid 容器自带 gap，相邻卡片外边距必须清零：
+   否则纵向变成 gap + margin 双重间距，且第二列被 margin 顶下去造成高低不齐。 */
+.settings-grid > .card,
+.help-grid > .card,
+.help-page > .card,
+.compare-grid > .card,
+.split > .card,
+.level-cards > .card,
+.probe-grid > .card,
+.kv-grid > .card,
+.choice-cards > .card,
+.cert-grid > .card {
+  margin-top: 0;
 }
 .card--muted {
   background: var(--c-surface-2);
@@ -872,6 +892,13 @@ details p {
   font-size: var(--fs-sm);
   margin-top: var(--sp-3);
 }
+.form-grid > .form-disclosure {
+  margin: 0;
+  align-self: start;
+}
+.form-disclosure .path-info {
+  margin-top: var(--sp-3);
+}
 
 /* ---------- 列表 / 行 ---------- */
 .split {
@@ -948,8 +975,7 @@ details p {
   flex-wrap: wrap;
   gap: var(--sp-2);
   padding-bottom: var(--sp-4);
-  margin-bottom: var(--sp-4);
-  border-bottom: 1px solid var(--c-border);
+  /* 分隔统一交给下方 <hr>；这里再画一条会与 hr 叠成两条黑线。 */
 }
 .ui-btn--quiet {
   background: transparent;
@@ -2135,6 +2161,42 @@ details p {
   overflow-wrap: anywhere;
   font-size: var(--fs-xs);
 }
+/* DNS 账户：名称为主、服务商为副标签，操作按钮统一靠右，避免挤成一团。 */
+.dns-account-list {
+  display: grid;
+  gap: var(--sp-2);
+}
+.dns-account {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-surface);
+}
+.dns-account__main {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+}
+.dns-account__name {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--c-text);
+  overflow-wrap: anywhere;
+}
+.dns-account__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 0 0 auto;
+}
+.dns-account-add {
+  margin-top: var(--sp-4);
+}
 /* ---------- 版本库 / 设置 ---------- */
 .cache-bar {
   display: flex;
@@ -2199,17 +2261,17 @@ details p {
   flex-direction: column;
   justify-content: flex-start;
 }
-/* 卡片底部提示/开关沉到卡片底，避免上半部稀疏下半部空旷。 */
-.settings-grid .card__body > .hint:last-child,
-.settings-grid .card__body > .switch-row:last-child {
+/* 说明文字沉到卡片底即可；开关不要沉底，否则与上方控件之间出现大片空白。 */
+.settings-grid .card__body > .hint:last-child {
   margin-top: auto;
 }
+/* 开关项与 FormField 保持同一纵向节奏：标题/描述在上，控件在下。 */
 .switch-row {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
   gap: var(--sp-3);
-  padding: var(--sp-3) 0;
-  flex: 1 0 auto;
+  padding: var(--sp-3) 0 0;
 }
 .switch-row__text {
   display: flex;
@@ -2363,32 +2425,58 @@ details p {
 }
 .terminal-toolbar .inline-fields {
   margin: 0;
+  flex: 0 0 auto;
+}
+.terminal-toolbar .inline-fields > button {
+  height: 32px;
 }
 .terminal-tabs {
   display: flex;
+  align-items: center;
   gap: 6px;
   min-width: 0;
   overflow-x: auto;
   flex: 1;
 }
+/* 终端标签与全局分段标签统一：固定高度，避免 × 字号把标签撑得高低不齐。 */
 .terminal-tab {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: var(--sp-3);
+  gap: var(--sp-2);
+  height: 32px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-sm);
   white-space: nowrap;
+  font-size: var(--fs-sm);
+  background: var(--c-surface-2);
+  border-color: var(--c-border);
+  color: var(--c-text-2);
+}
+.terminal-tab:hover:not(.active) {
   background: var(--c-surface-3);
-  border-color: transparent;
+  border-color: var(--c-primary);
+  color: var(--c-primary-ink);
 }
 .terminal-tab.active {
-  background: var(--c-surface);
+  background: var(--c-primary-soft);
   border-color: var(--c-primary);
   color: var(--c-primary-ink);
   font-weight: 500;
 }
 .terminal-tab span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--r-xs);
   color: var(--c-text-3);
-  font-size: var(--fs-lg);
-  line-height: 12px;
+  font-size: var(--fs-sm);
+  line-height: 1;
+}
+.terminal-tab span:hover {
+  background: var(--c-surface-3);
+  color: var(--c-text);
 }
 .terminal-layout {
   display: grid;
@@ -2404,6 +2492,8 @@ details p {
   grid-template-columns: 46px minmax(0, 1fr);
 }
 .terminal-shortcuts {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
@@ -2415,6 +2505,22 @@ details p {
 .terminal-shortcuts .shortcut-list {
   max-height: 34vh;
   overflow-y: auto;
+}
+/* 记录区占满侧栏剩余高度，滚动条贴到底，不再在列表下方留一截空白。
+   守卫脚本注入的探针列表直接挂在 .terminal-shortcuts 下，仍走上面的限高规则。 */
+.terminal-shortcuts .history-section {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.terminal-shortcuts .history-section > .shortcut-heading {
+  flex: 0 0 auto;
+}
+.terminal-shortcuts .history-section > .shortcut-list {
+  flex: 1 1 auto;
+  max-height: none;
+  min-height: 0;
 }
 .terminal-layout.collapsed .terminal-shortcuts {
   overflow: hidden;
@@ -2494,16 +2600,18 @@ details p {
   gap: 1px;
 }
 .shortcut-actions button {
-  width: 23px;
-  height: 25px;
+  width: 28px;
+  height: 28px;
   padding: 0;
   border: 0;
+  border-radius: var(--r-xs);
   background: transparent;
   color: var(--c-text-3);
+  font-size: var(--fs-sm);
 }
 .shortcut-actions button:hover:not(:disabled) {
   color: var(--c-primary-ink);
-  background: transparent;
+  background: var(--c-primary-soft);
 }
 .history-command {
   padding: 7px 6px;
@@ -2743,6 +2851,52 @@ details p {
 .tabs__item span {
   color: var(--c-text-3);
   margin-left: 4px;
+}
+/* 规则列表标签：分段控件式，选中态有底色与边框，比单纯下划线更易识别。 */
+.rule-tabs {
+  display: inline-flex;
+  gap: 2px;
+  width: fit-content;
+  padding: 3px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  background: var(--c-surface-2);
+  margin: var(--sp-3) 0 var(--sp-4);
+}
+.rule-tabs .tabs__item {
+  border-bottom: 0;
+  border-radius: calc(var(--r-sm) - 2px);
+  padding: var(--sp-1) var(--sp-4);
+  color: var(--c-text-2);
+  transition:
+    background var(--tr),
+    color var(--tr);
+}
+.rule-tabs .tabs__item:hover {
+  background: var(--c-surface-3);
+}
+.rule-tabs .tabs__item--active {
+  background: var(--c-surface);
+  color: var(--c-primary-ink);
+  box-shadow: var(--sh-1);
+  font-weight: 500;
+}
+.rule-tabs .tabs__count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 2px;
+  border-radius: 9px;
+  background: var(--c-surface-3);
+  color: var(--c-text-3);
+  font-size: var(--fs-xs);
+}
+.rule-tabs .tabs__item--active .tabs__count {
+  background: var(--c-primary-soft);
+  color: var(--c-primary-ink);
 }
 .table-wrap {
   overflow-x: auto;
@@ -3125,6 +3279,45 @@ details p {
   font-size: var(--fs-sm);
   font-weight: 400;
   word-break: break-all;
+}
+/* 抽屉宽度有限，标签与长路径改成上下两行，避免两列互相挤压。 */
+.cert-detail__meta {
+  display: grid;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-4);
+}
+.cert-detail__meta-row {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.cert-detail__meta dt {
+  font-size: var(--fs-xs);
+  color: var(--c-muted);
+}
+.cert-detail__meta dd {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--c-text);
+  font-weight: 500;
+  word-break: break-all;
+  line-height: 1.6;
+}
+.cert-detail__meta dd.cert-detail__path {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  color: var(--c-text-2);
+}
+.cert-detail__fold {
+  margin: var(--sp-3) 0 0;
+}
+.cert-detail__fold .code-block {
+  margin-top: var(--sp-3);
+  max-height: 200px;
+}
+.cert-detail__fold[open] summary {
+  margin-bottom: 0;
 }
 .code-block {
   max-height: 220px;

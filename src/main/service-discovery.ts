@@ -266,5 +266,14 @@ export function parseShellHistory(shell: string, output: string) {
       if (line.trim()) commands.push(line);
     }
   }
-  return { shell: shellName || shell, available: true, commands: commands.slice(-500).reverse() };
+  // 最近的 history 往往被大量重复的 history/ll/pwd 刷屏。按命令去重、保留最近一次，
+  // 让「记录」面板真正用于快速重放最近用过的不同命令，而不是重复项占满列表。
+  const recent = commands.slice(-500).reverse();
+  const seen = new Set<string>();
+  const deduped = recent.filter((command) => {
+    if (seen.has(command)) return false;
+    seen.add(command);
+    return true;
+  });
+  return { shell: shellName || shell, available: true, commands: deduped };
 }

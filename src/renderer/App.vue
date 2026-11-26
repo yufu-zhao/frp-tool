@@ -1500,45 +1500,6 @@ async function submitCertApply() {
       });
   }
 }
-async function saveRuleCert() {
-  const rule = ruleDraft.value;
-  if (!rule || ruleKind.value !== 'web') return;
-  const certPem = rule.certPem?.trim() ?? '';
-  const keyPem = rule.keyPem?.trim() ?? '';
-  if (!certPem || !keyPem) {
-    toastWarning('请填写证书 PEM 与私钥 KEY，或先点击「申请证书」。');
-    return;
-  }
-  try {
-    const record = await rpc<{ id: string }>(ACTIONS.certificateImportPem, {
-      instanceId: ruleInstanceId.value,
-      name: rule.name,
-      domains: rule.domains,
-      certPem,
-      keyPem,
-    });
-    toastSuccess('证书已保存，已创建隐藏 HTTPS 伴随规则；原 HTTP 规则保持不变。');
-    await refresh();
-    const target = state.value.instances.find((item) => item.id === ruleInstanceId.value);
-    const companion = target?.proxies.find(
-      (item) => item.hidden && item.sourceRuleId === rule.id && item.certificateId === record.id,
-    );
-    if (companion) {
-      rule.certificateId = record.id;
-      try {
-        const pem = await rpc<{ certPem: string; keyPem: string }>(ACTIONS.certificateReadPem, {
-          id: record.id,
-        });
-        rule.certPem = pem.certPem;
-        rule.keyPem = pem.keyPem;
-      } catch {
-        // 证书文件读取失败不影响已创建的伴随规则。
-      }
-    }
-  } catch (e) {
-    toastError((e as Error).message);
-  }
-}
 async function removeRuleCertificate() {
   const rule = ruleDraft.value;
   if (!rule || ruleKind.value !== 'web' || ruleCertRemoving.value) return;
@@ -1614,14 +1575,6 @@ function serviceRules(target: Instance) {
 }
 function currentRules(target: Instance) {
   return ruleListTab.value === 'site' ? siteRules(target) : serviceRules(target);
-}
-function currentRuleAddresses(target: Instance) {
-  return currentRules(target).flatMap((rule) =>
-    addresses(rule, target).map((url) => ({
-      url,
-      web: rule.type === 'http' || rule.type === 'https',
-    })),
-  );
 }
 
 /* ---------------- 证书签发进度 ---------------- */
@@ -3367,16 +3320,12 @@ function resizeActiveTerminal() {
                     连接 SSH
                   </button>
                   <StatusBadge v-else tone="success" label="SSH 已连接" />
-                  <button
-                    class="ui-btn ui-btn--sm"
-                    type="button"
-                    @click="openTerminalForServer(server.id)"
-                  >
+                  <button class="ui-btn" type="button" @click="openTerminalForServer(server.id)">
                     打开终端
                   </button>
                   <button
                     v-if="runtime.ssh[server.id] === 'connected'"
-                    class="ui-btn ui-btn--sm"
+                    class="ui-btn"
                     type="button"
                     :disabled="busy"
                     @click="detectServer"
@@ -3385,7 +3334,7 @@ function resizeActiveTerminal() {
                   </button>
                   <button
                     v-if="runtime.ssh[server.id] === 'connected'"
-                    class="ui-btn ui-btn--sm ui-btn--quiet"
+                    class="ui-btn ui-btn--quiet"
                     type="button"
                     :disabled="busy"
                     @click="disconnectServer"
@@ -3976,7 +3925,7 @@ function resizeActiveTerminal() {
                 </p>
                 <template v-if="instance.mode === 'form'">
                   <div class="rule-list-head">
-                    <h3>代理与访问地址</h3>
+                    <h3>代理规则</h3>
                     <button
                       class="ui-btn ui-btn--sm ui-btn--primary"
                       type="button"
@@ -3986,14 +3935,14 @@ function resizeActiveTerminal() {
                       ＋ 新增{{ ruleListTab === 'site' ? '站点' : '服务' }}
                     </button>
                   </div>
-                  <div class="tabs">
+                  <div class="tabs rule-tabs">
                     <button
                       class="tabs__item"
                       :class="{ 'tabs__item--active': ruleListTab === 'site' }"
                       type="button"
                       @click="ruleListTab = 'site'"
                     >
-                      站点 <span>{{ siteRules(instance).length }}</span>
+                      站点 <span class="tabs__count">{{ siteRules(instance).length }}</span>
                     </button>
                     <button
                       class="tabs__item"
@@ -4001,7 +3950,7 @@ function resizeActiveTerminal() {
                       type="button"
                       @click="ruleListTab = 'service'"
                     >
-                      服务 <span>{{ serviceRules(instance).length }}</span>
+                      服务 <span class="tabs__count">{{ serviceRules(instance).length }}</span>
                     </button>
                   </div>
                   <div class="table-wrap">
@@ -4067,31 +4016,6 @@ function resizeActiveTerminal() {
                         </tr>
                       </tbody>
                     </table>
-                  </div>
-                  <div v-if="currentRuleAddresses(instance).length" class="address-summary">
-                    <strong>访问地址</strong>
-                    <div
-                      v-for="item in currentRuleAddresses(instance)"
-                      :key="item.url"
-                      class="address"
-                    >
-                      <code>{{ item.url }}</code>
-                      <button
-                        class="ui-btn ui-btn--sm"
-                        type="button"
-                        @click="act('clipboard', item.url, '访问地址已复制。')"
-                      >
-                        复制
-                      </button>
-                      <button
-                        v-if="item.web"
-                        class="ui-btn ui-btn--sm"
-                        type="button"
-                        @click="act('link:open', item.url)"
-                      >
-                        打开
-                      </button>
-                    </div>
                   </div>
                 </template>
                 <p v-else class="hint">
@@ -4465,17 +4389,17 @@ function resizeActiveTerminal() {
                 <div v-if="!state.dnsAccounts.length" class="notice notice--info">
                   还没有保存 DNS 账户。添加后即可在下方查询与维护域名解析。
                 </div>
-                <div v-else class="resource-list">
-                  <div v-for="account in state.dnsAccounts" :key="account.id" class="resource-row">
-                    <StatusBadge
-                      tone="neutral"
-                      :label="dnsProviderLabel(account.provider)"
-                      :dot="false"
-                    />
-                    <div>
-                      <strong>{{ account.name }}</strong>
+                <div v-else class="dns-account-list">
+                  <div v-for="account in state.dnsAccounts" :key="account.id" class="dns-account">
+                    <div class="dns-account__main">
+                      <strong class="dns-account__name">{{ account.name }}</strong>
+                      <StatusBadge
+                        tone="neutral"
+                        :label="dnsProviderLabel(account.provider)"
+                        :dot="false"
+                      />
                     </div>
-                    <div class="inline-fields" style="margin: 0">
+                    <div class="dns-account__actions">
                       <button
                         class="ui-btn ui-btn--sm"
                         type="button"
@@ -4484,7 +4408,7 @@ function resizeActiveTerminal() {
                         编辑
                       </button>
                       <button
-                        class="ui-btn ui-btn--sm ui-btn--danger"
+                        class="ui-btn ui-btn--sm ui-btn--danger-link"
                         type="button"
                         :disabled="busy"
                         @click="deleteDnsAccount(account)"
@@ -4494,14 +4418,14 @@ function resizeActiveTerminal() {
                     </div>
                   </div>
                 </div>
-                <div class="inline-fields" style="margin-top: var(--sp-4)">
+                <div class="dns-account-add">
                   <button
                     class="ui-btn ui-btn--primary"
                     type="button"
                     :disabled="busy"
                     @click="openDnsAccountModal()"
                   >
-                    新增账户
+                    ＋ 新增账户
                   </button>
                 </div>
                 <p v-if="!state.secureStorage" class="notice notice--warning">
@@ -4896,17 +4820,6 @@ function resizeActiveTerminal() {
                 />
               </FormField>
             </template>
-            <FormField
-              v-if="serverDraft.deployment"
-              label="部署路径（只读）"
-              full
-              hint="由服务端安装记录生成，程序与配置文件位置"
-            >
-              <div class="path-info">
-                程序：{{ serverDraft.deployment.binary }}<br />
-                配置：{{ serverDraft.deployment.config }}
-              </div>
-            </FormField>
             <FormField label="FRP 公网地址" hint="留空使用 SSH 地址"
               ><input v-model="serverDraft.publicHost"
             /></FormField>
@@ -4979,6 +4892,14 @@ function resizeActiveTerminal() {
                 ></textarea>
               </FormField>
             </template>
+            <details v-if="serverDraft.deployment" class="full form-disclosure">
+              <summary>部署路径（只读）</summary>
+              <div class="path-info">
+                程序：{{ serverDraft.deployment.binary }}<br />
+                配置：{{ serverDraft.deployment.config }}
+                <p class="hint">由服务端安装记录生成，程序与配置文件位置。</p>
+              </div>
+            </details>
           </div>
         </form>
         <template #footer>
@@ -5301,35 +5222,6 @@ function resizeActiveTerminal() {
                 </div>
                 <div v-else class="notice notice--info">
                   该规则尚未启用 HTTPS，可先申请或导入证书。
-                </div>
-              </div>
-              <div v-if="ruleTlsPlan?.mode !== 'server'" class="cert-panel__section">
-                <h3>手动导入证书</h3>
-                <FormField label="证书 PEM（含证书链）" full>
-                  <textarea
-                    v-model="ruleDraft.certPem"
-                    class="code-editor"
-                    rows="7"
-                    placeholder="-----BEGIN CERTIFICATE-----"
-                  ></textarea>
-                </FormField>
-                <FormField label="私钥 KEY" full>
-                  <textarea
-                    v-model="ruleDraft.keyPem"
-                    class="code-editor"
-                    rows="7"
-                    placeholder="-----BEGIN PRIVATE KEY-----"
-                  ></textarea>
-                </FormField>
-                <div class="actions-row">
-                  <button
-                    class="ui-btn ui-btn--primary"
-                    type="button"
-                    :disabled="busy"
-                    @click="saveRuleCert"
-                  >
-                    保存并启用证书
-                  </button>
                 </div>
               </div>
               <div class="cert-panel__section">
@@ -5941,32 +5833,32 @@ function resizeActiveTerminal() {
               :dot="false"
             />
           </div>
-          <div class="kv-grid">
-            <div class="kv">
-              <small>存放位置</small>
-              <strong>{{
-                certDetail.storage === 'server' ? '服务器托管目录' : '本机证书库'
-              }}</strong>
+          <dl class="cert-detail__meta">
+            <div class="cert-detail__meta-row">
+              <dt>存放位置</dt>
+              <dd>{{ certDetail.storage === 'server' ? '服务器托管目录' : '本机证书库' }}</dd>
             </div>
-            <div class="kv">
-              <small>证书文件</small>
-              <strong class="cert-detail__path">{{ certDetail.certPath || '未记录' }}</strong>
+            <div class="cert-detail__meta-row">
+              <dt>证书文件</dt>
+              <dd class="cert-detail__path">{{ certDetail.certPath || '未记录' }}</dd>
             </div>
-            <div class="kv">
-              <small>私钥文件</small>
-              <strong class="cert-detail__path">{{ certDetail.keyPath || '未记录' }}</strong>
+            <div class="cert-detail__meta-row">
+              <dt>私钥文件</dt>
+              <dd class="cert-detail__path">{{ certDetail.keyPath || '未记录' }}</dd>
             </div>
-            <div v-if="certDetail.configPath" class="kv">
-              <small>站点配置</small>
-              <strong class="cert-detail__path">{{ certDetail.configPath }}</strong>
+            <div v-if="certDetail.configPath" class="cert-detail__meta-row">
+              <dt>站点配置</dt>
+              <dd class="cert-detail__path">{{ certDetail.configPath }}</dd>
             </div>
-          </div>
-          <FormField label="证书内容（含证书链）" full>
+          </dl>
+          <details class="cert-detail__fold">
+            <summary>证书内容（含证书链）</summary>
             <pre class="code-block">{{ certDetail.certPem || '未读取到证书内容' }}</pre>
-          </FormField>
-          <FormField label="私钥内容" full hint="私钥敏感，请勿外泄">
+          </details>
+          <details class="cert-detail__fold">
+            <summary>私钥内容 · 敏感，请勿外泄</summary>
             <pre class="code-block">{{ certDetail.keyPem || '未读取到私钥内容' }}</pre>
-          </FormField>
+          </details>
         </template>
         <EmptyState v-else icon="◇" title="暂无详情" compact />
         <template #footer>

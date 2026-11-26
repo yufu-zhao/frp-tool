@@ -3,12 +3,40 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { notifyRenderer } from '../src/main/lifecycle';
+import { parseShellHistory } from '../src/main/service-discovery';
 import { releaseAssets, releaseTags, Versions } from '../src/main/versions';
 import { Store } from '../src/main/store';
 
 const assets =
   '<a href="/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_darwin_amd64.tar.gz">包</a>';
 const page = `<a href="/fatedier/frp/releases/tag/v0.71.0">v0.71.0</a>${assets}<a href="/fatedier/frp/releases?page=2">下一页</a>`;
+
+describe('终端历史记录解析', () => {
+  it('去重重复命令并保留最近一次，顺序仍是最近的在前', () => {
+    const output = [
+      '__TERMINAL_SHELL__bash',
+      'pwd',
+      'll',
+      'history',
+      'll',
+      'history',
+      'cat a.log',
+    ].join('\n');
+    expect(parseShellHistory('bash', output).commands).toEqual([
+      'cat a.log',
+      'history',
+      'll',
+      'pwd',
+    ]);
+  });
+  it('无 history 文件时仍返回不可用空列表', () => {
+    expect(parseShellHistory('bash', '__TERMINAL_SHELL__bash\n__NO_HISTORY__')).toEqual({
+      shell: 'bash',
+      available: false,
+      commands: [],
+    });
+  });
+});
 
 describe('退出时的异步状态通知', () => {
   it('正常运行时发送，开始退出后不再访问窗口对象', () => {

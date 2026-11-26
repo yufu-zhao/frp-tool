@@ -96,8 +96,8 @@ try {
     'true',
   );
   // 回归：新增/编辑 DNS 账户都走弹窗；空 ID/Key 点测试必须显示真实失败原因。
-  await expect(page.getByRole('button', { name: '新增账户', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '新增账户', exact: true }).click();
+  await expect(page.getByRole('button', { name: /新增账户/ })).toBeVisible();
+  await page.getByRole('button', { name: /新增账户/ }).click();
   await expect(page.locator('.modal h2')).toHaveText('新增 DNS 账户');
   await page.locator('.modal .app-select').first().click();
   const providerOptions = await page

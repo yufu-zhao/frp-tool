@@ -4,6 +4,17 @@
 
 - 先讨论、达成一致后再动代码；功能调整先评估能否复用现有实现，避免重复造。
 - 每次页面调整后覆盖桌面 1440 / 平板 1024 / 窄窗口 900 三档布局检查（Electron 桌面应用，无手机端）。
+- **用户要"全新 UI"时的底线**：必须真正从零设计一套，而不是在旧风格上打补丁；用户已明确表达过对"应付式优化"的不满（后续已否决重做，见下方「当前生效 UI」，视觉改动一律走原版定点修正）。
+- **实拍前必须重新构建**：Electron 回归脚本用 `loadFile(dist/renderer/index.html)`，改了 `src/renderer` 源码后不 `npm run build` 就截图会看到旧界面，容易误判"改动没生效"。
+
+## 当前生效 UI：src/renderer（2026-11-26 用户否决全新 UI 后回退）
+
+- `src/ui2/` 整套已被用户否决并物理删除（用户："还不如原来的"），`vite.config.ts` 的 root 已改回 `src/renderer`。下方「Graphite + Indigo」「终端页」等约定重新生效。
+- **不要再提"全新 UI / 重做一套"**：用户已明确表示这类改动是应付式换皮且观感更差。视觉相关只做原版上的定点修正，并先实拍确认问题真实存在再动手。
+- 曾适配 ui2 的回归脚本已全部还原到原版选择器（`.nav-item` 等），`scripts/visual-check-v2.mjs` / `artifacts/visual-v2/` 已删除。
+- 终端「记录」列表在 `parseShellHistory()` 按命令去重、保留最近一次（`src/main/service-discovery.ts`）；重复的 history/ll 不再刷屏。
+- 2026-11-26 已按用户 9 张截图完成原版定点修复（表单对齐/折叠路径/按钮统一/规则标签/SSL 面板/DNS 行卡片/证书抽屉/终端三处/卡片间距），详见当天日志。新增可复用实拍脚本 `scripts/visual-audit.mjs`（9 张，`artifacts/audit/`）与 `scripts/terminal-audit.mjs`（终端会话态 DOM 注入验证）；**别再把这些改动扩成整套 UI 重做**。
+- 界面文案改动后要同步 Electron 回归脚本断言：`electron-smoke.mjs` / `rule-editor-check.mjs` 的 DNS 按钮现已带「＋」前缀，`server-panel-check.mjs` 的部署路径默认折叠需先展开。
 
 ## 设计系统 Graphite + Indigo（2026-11-26 用户拍板，界面重构基线）
 
