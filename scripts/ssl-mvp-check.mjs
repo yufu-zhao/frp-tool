@@ -108,7 +108,7 @@ try {
   await expect(page.locator('h1.app-header__title')).toHaveText('证书管理');
   await expect(page.getByText('还没有证书')).toBeVisible();
   await expect(page.getByRole('button', { name: '申请并部署', exact: true })).toHaveCount(0);
-  await expect(page.getByText('请到「客户端实例 → Web 规则 → SSL」中操作')).toBeVisible();
+  await expect(page.getByText('这里可查看详情、下载与删除。')).toBeVisible();
 
   // 申请入口只在 Web 规则的 SSL 面板里。
   await page.locator('.nav-item').filter({ hasText: '客户端' }).click();

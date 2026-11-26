@@ -156,8 +156,22 @@ export function resolveTlsSiteConfig(input: {
       });
 }
 
-/** 方案 A 的 HTTP-01 验证 server 块：仅 challenge 路径交给本机，域名精确匹配。 */
-export function nginxHttp01ServerConfig(input: { domains: string[]; root: string }): string {
+// challenge 配置文件名必须以 '000-' 开头：nginx 对相同 server_name 取先定义的 server 块，
+// include 用 *.conf 按文件名序加载，规则配置名是 UUID（首位 0-9a-f，均 < h），
+// 若沿用 http01.conf 则规则块先加载、challenge 请求落到 proxy_pass，CA 拿到 404。
+// '000-' 的第 4 个字符是 '-'（ASCII 45），小于任何 hex 字符，确保 challenge 块最先定义。
+export const HTTP01_CONFIG_FILE = '000-http01.conf';
+
+/**
+ * 方案 A 的 HTTP-01 验证 server 块。
+ * 必须排在同域名站点 server 块之前（见 HTTP01_CONFIG_FILE），因此这里同时保留 location /
+ * 回源 frps，确保验证期间该域名的正常 HTTP 访问不受影响。
+ */
+export function nginxHttp01ServerConfig(input: {
+  domains: string[];
+  root: string;
+  httpPort: number;
+}): string {
   return [
     '# >>> intranet-frp http-01 challenge (managed) >>>',
     'server {',
@@ -165,6 +179,13 @@ export function nginxHttp01ServerConfig(input: { domains: string[]; root: string
     `    server_name ${input.domains.join(' ')};`,
     '    location = /.well-known/acme-challenge/ { return 404; }',
     `    location /.well-known/acme-challenge/ { root ${input.root}; }`,
+    '    location / {',
+    `        proxy_pass http://127.0.0.1:${input.httpPort};`,
+    '        proxy_set_header Host $host;',
+    '        proxy_set_header X-Real-IP $remote_addr;',
+    '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+    '        proxy_set_header X-Forwarded-Proto $scheme;',
+    '    }',
     '}',
     '# <<< intranet-frp http-01 challenge (managed) <<<',
     '',

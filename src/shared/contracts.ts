@@ -24,6 +24,8 @@ export const ACTIONS = {
   certificateChallengeResponse: 'certificate:challenge-response',
   certificateCancel: 'certificate:cancel',
   certificateReadPem: 'certificate:read-pem',
+  certificateDetail: 'certificate:detail',
+  certificateDelete: 'certificate:delete',
   certificateImportPem: 'certificate:import-pem',
   // 托管 TLS 实例
   tlsProxyStatus: 'tls-proxy:status',
@@ -59,6 +61,8 @@ export const ACTIONS = {
   dnsAccountSave: 'dns-account:save',
   dnsAccountDelete: 'dns-account:delete',
   dnsAccountTest: 'dns-account:test',
+  dnsAccountMasked: 'dns-account:masked',
+  acmeMasked: 'acme:masked',
   // DNS 管理：域名与解析记录
   dnsDomains: 'dns:domains',
   dnsRecords: 'dns:records',
@@ -187,6 +191,21 @@ export interface ManagedDnsRecordInput {
 }
 
 /** DNS 管理通用入参：账户决定服务商与凭据，域名与记录由界面传入。 */
+/** 证书详情：内容 + 实际存放路径；密钥只在明确打开详情时读取。 */
+export interface CertificateDetail {
+  id: string;
+  storage: 'server' | 'local';
+  certPath: string;
+  keyPath: string;
+  configPath?: string;
+  certPem: string;
+  keyPem: string;
+}
+/** 已保存凭据的脱敏回显，只用于输入框 placeholder，不含完整值。 */
+export interface MaskedCredentials {
+  [field: string]: string;
+}
+
 export interface DnsDomainQuery {
   accountId: string;
   provider: DnsProviderId;

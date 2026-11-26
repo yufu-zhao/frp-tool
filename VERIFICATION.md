@@ -569,3 +569,61 @@ Linux 默认交付 AppImage/tar.gz；DEB 需要正式项目主页及维护邮箱
 | `node scripts/server-panel-check.mjs` | 通过                                                |
 | `node scripts/rule-editor-check.mjs`  | 通过：DNS 管理页空态、三档 1440/1024/900 无横向溢出 |
 | 实机待验证                            | 真实服务商凭据下域名/记录列表读取与增删改生效       |
+
+## 2026-11-26 修复方案 A 用 LiteSSL 申请时 HTTP-01 验证失败（validation file not found or empty）
+
+- 现象：方案 A 下用 LiteSSL + 文件验证申请证书，CA 报「validation file not found or empty」——CA 从公网访问 `/.well-known/acme-challenge/<token>` 拿到 404/空。
+- 根因：HTTP-01 的 challenge server 块写在 `http01.conf`，而站点配置的 server 块写在 `<ruleId>.conf`；两者都是 `listen 80` + 相同 `server_name`。nginx 对重复 server_name 只取先定义的 server 块，而 include `*.conf` 按文件名序加载，ruleId 是 UUID（首位 0-9a-f < h），规则块一定先加载 → CA 的 challenge 请求落到规则的 `proxy_pass http://127.0.0.1:<httpPort>` → frps 无此路径 → 404。方案 A 下只要服务器已有站点配置就 100% 触发；方案 B 走 frpc 临时规则，不受影响。
+- 修复：
+  - `src/shared/web-include.ts` 新增 `HTTP01_CONFIG_FILE = '000-http01.conf'`，第 4 位 `-`（ASCII 45）小于任何 hex 字符，保证 challenge 文件在 `*.conf` 排序中最先加载、server 块先定义。
+  - `nginxHttp01ServerConfig()` 补 `location / { proxy_pass http://127.0.0.1:<httpPort>; ... }`，challenge 块接管该域名 80 的同时正常回源 frps，验证期间网站访问不受影响；`httpPort` 取自 `store.server(serverId).httpPort`。
+  - `src/main/web-include.ts` install 时清理旧 `http01.conf`、remove 时同时删新旧文件名，处理升级残留。
+- 回归：更新 challenge 模板单测（含 location / 回源），新增「challenge 文件名排在所有规则配置之前」用例。
+
+| 验证项                                | 结果                                                       |
+| ------------------------------------- | ---------------------------------------------------------- |
+| `npm test`                            | **136 项通过**（新增文件名排序一例）                       |
+| typecheck / format:check / build      | 通过                                                       |
+| `node scripts/electron-smoke.mjs`     | 通过                                                       |
+| `node scripts/ssl-mvp-check.mjs`      | 通过                                                       |
+| `node scripts/server-panel-check.mjs` | 通过                                                       |
+| `node scripts/rule-editor-check.mjs`  | 通过：三档 1440/1024/900 无横向溢出                        |
+| 实机待验证                            | 方案 A + LiteSSL 文件验证：重签后 CA 能读到 challenge 文件 |
+
+## LiteSSL EAB 与 ACME 账户绑定（The client lacks sufficient authorization）
+
+- 根因：`acme:litessl:accountKey` 是单一固定密钥，EAB 变更后仍复用旧 ACME 账户。LiteSSL 目录 `meta.externalAccountRequired=true`，CA 侧旧账户未绑定新 EAB，下单/验证阶段报 "The client lacks sufficient authorization"。同类问题在 Sectigo/Comodo 官方文档中亦有记载（客户端沿用旧账户而非新 EAB 注册的账户）。
+- 修复：
+  - `src/main/certificates.ts` 新增 `eabHash(kid, hmacKey)` 与 `acme:<provider>:accountKeyEab` 指纹；签发时若当前 EAB 指纹与账户记录不一致，自动生成新账户密钥并重新注册。EAB 不变则复用原账户。LiteSSL 缺少 EAB 时直接给出明确提示，不再静默发送无 EAB 的 newAccount。
+  - `src/main/index.ts` 的 `settings:save`：用户重新填写 EAB 并保存时 `dropSecrets('acme:litessl:accountKey')`，强制下次签发换账户；留空沿用不触发。
+  - `installCancelableTransport()` 记录失败的 ACME 端点与问题类型，错误提示附带端点/类型；LiteSSL 在 newAccount 失败时给出 EAB 排查提示。
+  - 设置页提示重新填写 EAB 会强制注册新账户。
+- 回归：`tests/core.test.ts` 新增「EAB 变更换账户、不变复用」与「LiteSSL 缺 EAB 明确提示」两例。
+
+| 验证项                                | 结果                                       |
+| ------------------------------------- | ------------------------------------------ |
+| `npm test`                            | **138 项通过**（新增 2 例 EAB 账户绑定）   |
+| typecheck / format:check / build      | 通过                                       |
+| `node scripts/electron-smoke.mjs`     | 通过                                       |
+| `node scripts/ssl-mvp-check.mjs`      | 通过                                       |
+| `node scripts/server-panel-check.mjs` | 通过                                       |
+| `node scripts/rule-editor-check.mjs`  | 通过：三档 1440/1024/900 无横向溢出        |
+| 实机待验证                            | 真实 LiteSSL EAB 下重签成功且 HTTPS 可访问 |
+
+## 界面收尾：规则类型、SSL 面板、证书管理、凭据脱敏、DNS 标签页
+
+- 规则类型：方案 B 的隐藏 HTTPS 伴随规则参与类型判定，列表仍一条但显示 `Web · HTTPS`；`typeLabel(rule, instance)` 统一判定。
+- 规则 SSL 标签：改为「当前方案 / 证书状态与存放位置 / 手动导入证书 / 证书操作」四个分区；切到 SSL 标签时按证书 ID 读取详情，展示本机证书库或服务器托管目录的真实证书/私钥路径。
+- 证书管理：卡片简化为名称、方案、域名、来源与到期；新增搜索（名称/域名/机构）、每页 8 条分页；详情用新的 `AppDrawer` 组件展示存放位置、证书与私钥内容，提供证书/私钥下载与删除（按证书 ID 回退 HTTP，方案 A 清服务器配置、方案 B 删隐藏规则）。
+- 凭据脱敏：新增 `acme:masked` / `dns-account:masked` IPC，主进程只回传 `前4****后4` 摘要；设置页 EAB 与 DNS 账户编辑表单把已保存值作为 placeholder 显示，输入框留空仍沿用。
+- DNS 管理：改为「域名解析管理」在前、「账户管理」在后的标签页；三档布局对两个标签分别检查。
+- 新增 IPC：`certificate:detail` / `certificate:delete`（兼容字符串与 `{id}` 入参）；`AppDrawer` 使用 AntD Drawer，层级与弹窗一致且低于确认框。
+
+| 验证项                                | 结果                                                                       |
+| ------------------------------------- | -------------------------------------------------------------------------- |
+| `npm test`                            | 138 项通过                                                                 |
+| typecheck / format:check / build      | 通过                                                                       |
+| `node scripts/electron-smoke.mjs`     | 通过：DNS 标签切换与账户弹窗                                               |
+| `node scripts/ssl-mvp-check.mjs`      | 通过                                                                       |
+| `node scripts/server-panel-check.mjs` | 通过                                                                       |
+| `node scripts/rule-editor-check.mjs`  | 通过：Web · HTTPS 类型、SSL 存放位置、证书抽屉/搜索/分页、三档双标签无溢出 |

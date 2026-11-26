@@ -128,9 +128,51 @@ const state = {
     proxyUrl: '',
     downloadConcurrency: 3,
   },
-  certificates: [],
+  certificates: [
+    {
+      id: 'cert-hidden',
+      name: '回归本机证书',
+      provider: 'letsencrypt',
+      domains: ['demo.example.com'],
+      certPath: path.resolve('tests/fixtures/certificates-test-cert.pem'),
+      keyPath: path.resolve('tests/fixtures/certificates-test-key.pem'),
+      createdAt: Date.now(),
+    },
+  ],
   serverSites: [],
-  serverCertificates: [],
+  serverCertificates: [
+    {
+      id: 'cert-hidden',
+      serverId: 'rule-check-server',
+      name: '回归本机证书',
+      provider: 'letsencrypt',
+      domains: ['demo.example.com'],
+      location: 'local',
+      localCertificateId: 'cert-hidden',
+      certPath: path.resolve('tests/fixtures/certificates-test-cert.pem'),
+      keyPath: path.resolve('tests/fixtures/certificates-test-key.pem'),
+      tlsPlan: 'local',
+      deployState: 'deployed',
+      instanceId: 'rule-check-instance',
+      ruleId: 'rule-web',
+      hiddenRuleId: 'rule-hidden-https',
+      createdAt: Date.now(),
+    },
+    ...Array.from({ length: 9 }, (_, index) => ({
+      id: `cert-extra-${index}`,
+      serverId: 'rule-check-server',
+      name: `回归证书 ${index + 1}`,
+      provider: 'manual',
+      domains: [`extra${index}.example.com`],
+      location: 'local',
+      localCertificateId: 'cert-hidden',
+      certPath: path.resolve('tests/fixtures/certificates-test-cert.pem'),
+      keyPath: path.resolve('tests/fixtures/certificates-test-key.pem'),
+      tlsPlan: 'local',
+      deployState: 'deployed',
+      createdAt: Date.now(),
+    })),
+  ],
   dnsAccounts: [],
   terminalFavorites: [],
   secrets: {},
@@ -185,6 +227,8 @@ try {
   await expect(page.locator('.data-table th').nth(3)).toHaveText('操作');
   await expect(page.locator('.data-table tbody tr')).toHaveCount(1);
   await expect(page.locator('.data-table tbody tr').first()).toContainText('web-demo');
+  // 方案 B 有隐藏 HTTPS 伴随规则时，列表仍一条且类型显示 Web · HTTPS。
+  await expect(page.locator('.data-table tbody tr').first()).toContainText('Web · HTTPS');
   await expect(page.locator('.data-table')).not.toContainText('web-demo-https');
   await page.locator('.tabs__item').filter({ hasText: '服务' }).click();
   await expect(page.locator('.data-table tbody tr').first()).toContainText('tcp-demo');
@@ -216,6 +260,10 @@ try {
   await expect(page.getByRole('button', { name: '保存并启用证书' })).toBeVisible();
   await expect(page.getByRole('button', { name: '申请证书' })).toBeVisible();
   await expect(page.locator('.code-editor')).toHaveCount(2);
+  // SSL 标签统一分区，并展示证书/私钥的实际存放位置。
+  await expect(page.locator('.cert-panel__section h3').first()).toHaveText('当前方案');
+  await expect(page.locator('.cert-location')).toContainText('证书存放位置');
+  await expect(page.locator('.cert-location')).toContainText('cert-hidden/fullchain.pem');
 
   // 申请证书弹窗字段
   await page.getByRole('button', { name: '申请证书' }).click();
@@ -273,23 +321,54 @@ try {
   await page.locator('.ant-modal-wrap:visible .modal__close').click();
   await page.waitForTimeout(200);
 
-  // DNS 管理：独立菜单、账户管理与域名解析管理两个区块、空态与新增账户弹窗
+  // 证书管理：简化卡片、搜索、分页与详情抽屉（含下载/删除入口）。
+  await page.locator('.nav-item').filter({ hasText: '证书管理' }).click();
+  await expect(page.getByRole('heading', { name: '证书管理', exact: true })).toBeVisible();
+  await expect(page.locator('.cert-card')).toHaveCount(8);
+  await expect(page.locator('.pager')).toContainText('1 / 2');
+  await page.getByRole('button', { name: '下一页' }).click();
+  await expect(page.locator('.cert-card')).toHaveCount(2);
+  await page.locator('input[aria-label="搜索证书"]').fill('extra3');
+  await expect(page.locator('.cert-card')).toHaveCount(1);
+  await expect(page.locator('.cert-card')).toContainText('extra3.example.com');
+  await page.locator('input[aria-label="搜索证书"]').fill('');
+  await page.locator('.cert-card').first().getByRole('button', { name: '查看详情' }).click();
+  await expect(page.locator('.drawer')).toBeVisible();
+  await expect(page.locator('.drawer')).toContainText('存放位置');
+  await expect(page.locator('.drawer')).toContainText('fullchain.pem');
+  await expect(page.getByRole('button', { name: '下载证书' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '下载私钥' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '删除证书' })).toBeVisible();
+  await page.getByRole('button', { name: '关闭抽屉' }).click();
+
+  // DNS 管理：独立菜单 + 两个标签页；域名解析在前，账户管理需切换标签。
   await page.locator('.nav-item').filter({ hasText: 'DNS 管理' }).click();
   await expect(page.getByRole('heading', { name: 'DNS 管理' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '账户管理' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '域名解析管理' })).toBeVisible();
+  await expect(page.getByRole('tab', { name: '域名解析管理' })).toBeVisible();
+  await expect(page.getByRole('tab', { name: '域名解析管理' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect(page.getByRole('button', { name: '新增记录' })).toBeDisabled();
+  await page.getByRole('tab', { name: '账户管理' }).click();
+  await expect(page.getByRole('tab', { name: '账户管理' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   await expect(page.getByText('还没有保存 DNS 账户')).toBeVisible();
   await expect(page.getByRole('button', { name: '新增账户', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: '新增记录' })).toBeDisabled();
 
-  // 三档布局检查（含 DNS 管理页）
+  // 三档布局检查（含 DNS 管理页两个标签）
   for (const width of [1440, 1024, 900]) {
     await page.setViewportSize({ width, height: 800 });
-    await page.waitForTimeout(150);
-    const overflow = await page.evaluate(
-      () => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
-    );
-    expect(overflow, `${width}px 横向溢出`).toBe(false);
+    for (const tab of ['账户管理', '域名解析管理']) {
+      await page.getByRole('tab', { name: tab }).click();
+      await page.waitForTimeout(120);
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+      );
+      expect(overflow, `${width}px ${tab} 横向溢出`).toBe(false);
+    }
   }
 
   expect(errors, `渲染层异常：${errors.join('; ')}`).toEqual([]);

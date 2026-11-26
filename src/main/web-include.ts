@@ -11,6 +11,7 @@ import {
   certDirFor,
   certFileName,
   hasManagedInclude,
+  HTTP01_CONFIG_FILE,
   HTTP01_ROOT,
   http01Marker,
   includeBlockFor,
@@ -38,6 +39,9 @@ import type { Store } from './store';
 
 const NGINX_PROBE = `if command -v nginx >/dev/null 2>&1; then nginx -T 2>&1 || true; elif command -v openresty >/dev/null 2>&1; then openresty -T 2>&1 || true; else printf '__NO_WEB__\\n'; fi`;
 const APACHE_PROBE = `if command -v apachectl >/dev/null 2>&1; then apachectl -V 2>&1 || true; elif command -v httpd >/dev/null 2>&1; then httpd -V 2>&1 || true; else printf '__NO_WEB__\\n'; fi`;
+
+/** 升级前的 challenge 文件名；新版本改用排序最前的 HTTP01_CONFIG_FILE，清理旧残留。 */
+const LEGACY_HTTP01_CONFIG_FILE = 'http01.conf';
 
 function parseNginxMain(output: string): string {
   return (
@@ -462,15 +466,19 @@ export class WebIncludeManager {
     const record = this.store.data.webIncludes[serverId];
     if (!record) throw new AppError('HTTP-01 需要服务器已注入 include。');
     if (record.flavor !== 'nginx') throw new AppError('HTTP-01 自动应答当前仅支持 Nginx。');
+    const httpPort = this.store.server(serverId).httpPort;
     return this.remote.locked(serverId, async () => {
       const admin = this.remote.nginxAdmin(serverId);
       const backupDir = `${record.managedDir}/backups`;
-      const configPath = `${record.managedDir}/http01.conf`;
+      const configPath = `${record.managedDir}/${HTTP01_CONFIG_FILE}`;
+      const legacyPath = `${record.managedDir}/${LEGACY_HTTP01_CONFIG_FILE}`;
       const root = HTTP01_ROOT;
-      const content = nginxHttp01ServerConfig({ domains, root });
+      const content = nginxHttp01ServerConfig({ domains, root, httpPort });
       await admin.run(
         `mkdir -p -- ${quote(backupDir)} ${quote(root)}/.well-known/acme-challenge && chmod 755 -- ${quote(record.managedDir)} ${quote(backupDir)} ${quote(root)}`,
       );
+      // 升级场景：旧版 challenge 文件若残留会与规则 server 块冲突且无法被 remove 清理。
+      await admin.run(`rm -f -- ${quote(legacyPath)}`).catch(() => {});
       await withNginxTransaction(
         admin,
         backupDir,
@@ -503,8 +511,9 @@ export class WebIncludeManager {
     if (!record) return;
     return this.remote.locked(serverId, async () => {
       const admin = this.remote.nginxAdmin(serverId);
-      const configPath = `${record.managedDir}/http01.conf`;
-      await admin.run(`rm -f -- ${quote(configPath)}`).catch(() => {});
+      const configPath = `${record.managedDir}/${HTTP01_CONFIG_FILE}`;
+      const legacyPath = `${record.managedDir}/${LEGACY_HTTP01_CONFIG_FILE}`;
+      await admin.run(`rm -f -- ${quote(configPath)} ${quote(legacyPath)}`).catch(() => {});
       await admin
         .run(commandsFor(record.flavor, record.serviceName).reload ?? 'true')
         .catch(() => {});

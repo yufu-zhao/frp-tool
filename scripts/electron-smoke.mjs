@@ -36,22 +36,14 @@ try {
   page.on('pageerror', (error) => errors.push(error.message));
   await expect(page.locator('h1')).toHaveText('服务器');
   await expect(page.getByText('从一台服务器开始')).toBeVisible();
-  await page.getByRole('button', { name: '添加第一台服务器' }).click();
+  await page.getByRole('button', { name: '添加服务器' }).click();
   await expect(page.locator('.modal h2')).toHaveText('服务器配置');
-  // 组件库 UI：状态徽标不应呈现按钮边框，表单下拉由 Ant Design Vue 承载。
-  const badgeStyle = await page.locator('.app-header__status').evaluate((el) => {
+  // 组件库 UI：状态徽标是信息标签，不应呈现按钮的边框与投影；表单下拉由 Ant Design Vue 承载。
+  const badgeStyle = await page.locator('.app-header__heading .ui-badge').evaluate((el) => {
     const style = getComputedStyle(el);
-    return {
-      border: style.borderTopWidth,
-      background: style.backgroundColor,
-      shadow: style.boxShadow,
-    };
+    return { border: style.borderTopWidth, shadow: style.boxShadow };
   });
-  if (
-    badgeStyle.border !== '0px' ||
-    badgeStyle.background !== 'rgba(0, 0, 0, 0)' ||
-    badgeStyle.shadow !== 'none'
-  )
+  if (badgeStyle.border !== '0px' || badgeStyle.shadow !== 'none')
     throw new Error(`服务器状态徽标仍带按钮外观：${JSON.stringify(badgeStyle)}`);
   await expect(page.locator('.modal .app-select.ant-select').first()).toBeVisible();
   await expect(page.locator('.modal select')).toHaveCount(0);
@@ -77,7 +69,7 @@ try {
   await expect(page.getByRole('heading', { name: '检索已有 FRP 服务' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '安装服务端' })).toBeVisible();
   await page.locator('.nav-item').filter({ hasText: '客户端实例' }).click();
-  await page.getByRole('button', { name: '创建第一个实例' }).click();
+  await page.getByRole('button', { name: '创建实例' }).click();
   // 规则 CRUD 已从实例表单抽出：实例弹窗只保留基础配置，规则在详情页独立管理。
   await expect(page.locator('.rule-editor')).toHaveCount(0);
   await expect(page.getByText('代理规则已移到实例详情页')).toBeVisible();
@@ -92,8 +84,17 @@ try {
   // DNS 账户已从设置迁到独立的「DNS 管理」页。
   await page.locator('.nav-item').filter({ hasText: 'DNS 管理' }).click();
   await expect(page.getByRole('heading', { name: 'DNS 管理' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '账户管理' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '域名解析管理' })).toBeVisible();
+  // DNS 管理改为标签页，域名解析在前；账户区块需切标签后才可见。
+  await expect(page.getByRole('tab', { name: '域名解析管理' })).toBeVisible();
+  await expect(page.getByRole('tab', { name: '域名解析管理' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await page.getByRole('tab', { name: '账户管理' }).click();
+  await expect(page.getByRole('tab', { name: '账户管理' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   // 回归：新增/编辑 DNS 账户都走弹窗；空 ID/Key 点测试必须显示真实失败原因。
   await expect(page.getByRole('button', { name: '新增账户', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '新增账户', exact: true }).click();

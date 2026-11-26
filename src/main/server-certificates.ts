@@ -732,6 +732,45 @@ export class ServerCertificates {
     return { instanceId, ruleId, plan, certificateId };
   }
 
+  /** 从证书管理页按证书 ID 删除：解析关联实例/规则后走统一的回退 HTTP 流程。 */
+  async removeById(id: string) {
+    const certificate = this.store.data.serverCertificates.find((item) => item.id === id);
+    if (!certificate) throw new AppError('证书不存在或已被删除。');
+    let instanceId = certificate.instanceId;
+    let ruleId = certificate.ruleId;
+    if (!instanceId || !ruleId) {
+      const companionId = certificate.hiddenRuleId;
+      for (const instance of this.store.data.instances) {
+        if (instance.serverId !== certificate.serverId) continue;
+        const hidden = companionId
+          ? instance.proxies.find((item) => item.id === companionId && item.hidden)
+          : instance.proxies.find(
+              (item) =>
+                item.hidden &&
+                (item.certificateId === id ||
+                  item.certificateId === certificate.localCertificateId),
+            );
+        const source = hidden?.sourceRuleId
+          ? instance.proxies.find((item) => item.id === hidden.sourceRuleId && !item.hidden)
+          : instance.proxies.find(
+              (item) =>
+                !item.hidden &&
+                item.domains.some((domain) =>
+                  certificate.domains.some((name) => name.toLowerCase() === domain.toLowerCase()),
+                ),
+            );
+        if (hidden && source) {
+          instanceId = instance.id;
+          ruleId = source.id;
+          break;
+        }
+      }
+    }
+    if (!instanceId || !ruleId)
+      throw new AppError('该证书没有可定位的关联规则，无法自动回退 HTTP；请在规则中移除证书。');
+    return this.removeForRule(instanceId, ruleId);
+  }
+
   async testDns(input: DnsTestInput): Promise<DnsTestResult> {
     return testDnsProvider(input, this.store);
   }

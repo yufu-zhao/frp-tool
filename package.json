@@ -23,6 +23,7 @@
     "dist:deb": "npm run dist -- --linux deb --publish never",
     "dist:all": "npm run dist:mac && npm run dist:win && npm run dist:lin && npm run dist:deb",
     "test:desktop": "npm run build && node scripts/electron-smoke.mjs",
+    "test:ui": "node scripts/terminal-layout-check.mjs && node scripts/visual-check.mjs",
     "test:remote": "tsup scripts/remote-smoke.ts --format cjs --out-dir dist/smoke --clean --config false && node dist/smoke/remote-smoke.js",
     "format": "prettier --write src tests scripts *.config.ts package.json tsconfig.json README.md VERIFICATION.md .prettierrc.json .github/workflows/ci.yml",
     "format:check": "prettier --check src tests scripts *.config.ts package.json tsconfig.json README.md VERIFICATION.md .prettierrc.json .github/workflows/ci.yml",

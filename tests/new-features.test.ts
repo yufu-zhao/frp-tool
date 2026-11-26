@@ -23,6 +23,7 @@ import {
   probePathFor,
   removeManagedInclude,
   siteConfigFileName,
+  HTTP01_CONFIG_FILE,
   nginxTlsServerConfig,
   nginxHttp01ServerConfig,
   resolveTlsSiteConfig,
@@ -805,15 +806,28 @@ describe('TLS 双方案', () => {
     expect(config).toContain('ssl_certificate /etc/intranet-frp/sites/nginx/certs/id.crt;');
   });
 
-  it('HTTP-01 challenge server 只绑定目标域名并限制 challenge 路径', () => {
+  it('HTTP-01 challenge server 绑定目标域名、限制 challenge 路径并回源 frps', () => {
     const config = nginxHttp01ServerConfig({
       domains: ['a.example.com'],
       root: '/etc/intranet-frp/acme',
+      httpPort: 8080,
     });
     expect(config).toContain('listen 80;');
     expect(config).toContain('server_name a.example.com;');
     expect(config).toContain('location /.well-known/acme-challenge/');
+    expect(config).toContain('location / {');
+    expect(config).toContain('proxy_pass http://127.0.0.1:8080;');
     expect(config).not.toContain('default_server');
+  });
+
+  it('challenge 配置文件名排在所有规则配置之前，避免 nginx 取到规则 server 块', () => {
+    // 规则配置名是 UUID（hex），首字符 0-9a-f；challenge 必须按 *.conf 文件名序最先加载。
+    const ruleIds = ['0abc1234', '9f8e7d6c', 'a1b2c3d4', 'ffffffff', '11111111'];
+    for (const id of ruleIds) {
+      const ruleFile = siteConfigFileName(id);
+      expect(HTTP01_CONFIG_FILE < ruleFile).toBe(true);
+    }
+    expect(HTTP01_CONFIG_FILE).toBe('000-http01.conf');
   });
 
   it('方案 A 的站点模板按 tlsMode=server 生成 ssl server 块', () => {

@@ -23,6 +23,7 @@ import {
 } from '../src/main/remote';
 import {
   Certificates,
+  issueAcmeMaterial,
   normalizeDomains,
   validateCertificateMaterial,
 } from '../src/main/certificates';
@@ -595,6 +596,72 @@ describe('FRP 配置与输入边界', () => {
     expect(record.domains).toEqual(['one.example.test', 'two.example.test']);
     expect(record.provider).toBe('litessl');
     expect(record.email).toBe('owner@example.test');
+  });
+  it('EAB 变更后重新注册 ACME 账户，EAB 不变时复用原账户', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    const certPem = await readFile(
+      new URL('./fixtures/certificates-test-cert.pem', import.meta.url),
+      'utf8',
+    );
+    const keyPem = await readFile(
+      new URL('./fixtures/certificates-test-key.pem', import.meta.url),
+      'utf8',
+    );
+    let generated = 0;
+    const fakeAcme = {
+      directory: { letsencrypt: { production: 'https://letsencrypt.test/directory' } },
+      crypto: {
+        createPrivateEcdsaKey: async () => `account-key-${++generated}`,
+        createCsr: async () => [Buffer.from(keyPem), Buffer.from('csr')],
+      },
+      Client: class {
+        constructor(_options: unknown) {}
+        async auto() {
+          return certPem;
+        }
+      },
+    };
+    const base = {
+      name: 'EAB 轮换',
+      domains: ['one.example.test'],
+      provider: 'litessl' as const,
+      email: 'owner@example.test',
+      challenge: 'dns-01' as const,
+      termsAgreed: true,
+      keySize: 2048 as const,
+    };
+    const issue = (eabKid: string, eabHmac: string) =>
+      issueAcmeMaterial(store, { ...base, eabKid, eabHmac }, undefined, {}, fakeAcme as any);
+    await issue('kid-1', 'hmac-1');
+    await issue('kid-1', 'hmac-1');
+    expect(generated).toBe(1);
+    const firstKey = store.secret('acme:litessl:accountKey');
+    const firstFingerprint = store.secret('acme:litessl:accountKeyEab');
+    await issue('kid-2', 'hmac-2');
+    expect(generated).toBe(2);
+    expect(store.secret('acme:litessl:accountKey')).not.toBe(firstKey);
+    expect(store.secret('acme:litessl:accountKeyEab')).not.toBe(firstFingerprint);
+  });
+  it('LiteSSL 缺少 EAB 时给出明确提示', async () => {
+    const store = new Store(root, noCrypto);
+    await store.load();
+    await expect(
+      issueAcmeMaterial(
+        store,
+        {
+          name: '无 EAB',
+          domains: ['one.example.test'],
+          provider: 'litessl',
+          email: 'owner@example.test',
+          challenge: 'dns-01',
+          termsAgreed: true,
+        },
+        undefined,
+        {},
+        {} as any,
+      ),
+    ).rejects.toThrow('LiteSSL 要求 EAB');
   });
   it('取消等待 DNS TXT 确认的签发任务并记录等待阶段', async () => {
     const store = new Store(root, noCrypto);

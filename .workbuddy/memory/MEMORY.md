@@ -5,6 +5,18 @@
 - 先讨论、达成一致后再动代码；功能调整先评估能否复用现有实现，避免重复造。
 - 每次页面调整后覆盖桌面 1440 / 平板 1024 / 窄窗口 900 三档布局检查（Electron 桌面应用，无手机端）。
 
+## 设计系统 Graphite + Indigo（2026-11-26 用户拍板，界面重构基线）
+
+- **中性 + 单一强调色**：中性石墨 N0–N900 承载信息层级；唯一品牌色靛蓝 `#5457E5`（dark `#6d70f0`，hover/按下/soft 四档），按钮/选中态/链接/进度只用它。语义色（success/warning/danger/info）刻意降饱和，不与强调色冲突。暖色（红/橙/绿）和青碧/亮紫已评估但未采用：前者与语义色打架，后者需额外明度/面积约束。
+- **硬规范**：字重只有 400 / 500（不用 600/650/700）；圆角 6（控件）/10（卡片）/14（面板）；间距 4 倍数；阴影更轻更扩散；扁平无渐变（进度条也用纯色）。`style.css` 的 `:root` token 与 `antdTheme`（App.vue）必须同步。
+- **导航**：菜单项少，`AppSidebar` 扁平平铺 8 项 + 内联线性 SVG 图标，禁止恢复分组折叠；窄窗口（≤1100px）与手动折叠都收成图标条。
+- **终端页**：`terminal-workspace` 固定 `calc(100vh - 168px)` + overflow hidden；快捷命令/记录 `.shortcut-list` `max-height:34vh` 内部滚动；输出区 `.terminal-main` `min-height:0`。任何内容区都不能把容器撑得无限高（`terminal-layout-check.mjs` 守卫）。
+- **交互收敛**：同一操作只保留一个入口（header 主按钮优先，EmptyState/页底不放重复按钮）；去掉纯说明性冗余提醒文案；DNS 各 tab 自带按钮，header 不放错位的主按钮。
+- **按钮分层**：详情页任一时刻只保留一个主色按钮，按连接/部署状态切换主次（未连接时连接类操作为主，已连接后部署/启停类操作为主，禁用态一律降为 soft）；无意义按钮按状态隐藏而非禁用占位；低频操作（读配置/备份等）收进 `details` 折叠区，危险操作单独置底。
+- **设计系统硬约束**：CSS 变量必须在 `:root` 定义后才能引用，禁止残留 `--color-*` / `--border-radius-*` 旧变量（曾导致 40+ 处样式静默失效）；全局 `label` 默认 `inline-flex/row`，只有 `.field` 容器内 label 才列向，避免内联开关文字竖排。状态徽标放标题旁同一基线、只显示一次（不在 header 和侧栏重复）。空态不显示空表头。页面调整必须做全页审计（间距/对齐/层级/组件用法），不能只改用户点名的元素。
+- **应用图标 A「链路 Nexus」**：母版 `assets/brand/logo.svg` / `glyph.svg`（靛蓝渐变方块 + 白色弧线贯通两端节点，终点薄荷绿）；`npm run icons` 从母版生成全尺寸 PNG/ICO/ICNS/三态托盘/preview，`icons.mjs` 用 `replaceAll` 处理多色节点。
+- 验证入口：`npm run test:ui` = 终端限高 + 三档×四页视觉巡检（截图 `artifacts/visual/`）；`scripts/electron-smoke.mjs` 等四个回归脚本随 UI 文案同步更新。
+
 ## TLS 方案判定与证书入口（2026-11-26 用户确认，取代此前按 Web 探测决定方案）
 
 - 方案只由服务端配置的 `vhostHTTPPort`（`server.httpPort`）决定：标准 80 → 方案 B（本机 frpc 终止）；非标端口 → 方案 A（服务器 Web 服务终止）。端口未知按 A 并阻止申请。
@@ -34,7 +46,7 @@
 
 - 证书申请：DNS-01 与 HTTP-01 两种都要。DNS-01 逐级自动化（选中 DNS 账户 API → CNAME 委派/acme-dns → 复用已有记录 → 手动 TXT 兜底），任一级失败自动降级并标明级别；手动 TXT 明确半自动。
 - **DNS 账户**：可保存多个账户，同一服务商也可多份 SecretID；凭据只存 `dns:account:<id>:*`，签发选账户、续期沿用 `dnsAccountId`。A1/A2/A3 优先读选中账户凭据。
-- **ACME 配置**：LiteSSL EAB KID/HMAC 与联系邮箱集中在设置；EAB 只存安全存储，邮箱首次签发后回写设置并自动读取。
+- **ACME 配置**：LiteSSL EAB KID/HMAC 与联系邮箱集中在设置；EAB 只存安全存储，邮箱首次签发后回写设置并自动读取。ACME 账户密钥必须绑定当前 EAB 指纹（`acme:<provider>:accountKeyEab`），EAB 变化即换密钥重新注册，否则 CA 报 "The client lacks sufficient authorization"；显式重填 EAB 保存时主动清除账户密钥强制重注册。
 - 证书实体：`serverCertificateSchema` / `serverCertificates` / `renewalManager`；`location: 'local' | 'server'`（默认 server）+ `localCertificateId` 区分证书落点，本机也允许持证书，不再限定「本机不持证书」。
 - **本机证书闭环（已落地）**：80/443 空闲（`httpsPort === 443 || httpPort === 80`）签发的证书落本机证书库（`Certificates.saveIssued()`），直接标 `deployed` / `deployTarget = 'local-frpc'`，无需部署到服务端；`instance:save` 在 `httpsPort === 443` 时自动关联到 HTTPS 规则并设 `tlsMode = 'terminate'`；frpc 用 `https2http` 插件引用本机证书（`processes.certificatePaths()` 同时读取 `certificates` 与 `serverCertificates` 中 `location === 'local'` 的记录）。续期沿用原落点，需关注对运行中 frpc 是否要重载。
 - 证书部署分级（仅针对 `location === 'server'` 的服务端证书；本机证书不部署）：L0 只落盘+给配置片段；L1 同路径覆盖已有证书文件；L2 在 include 目录写独立 conf（二次确认、快照 diff、失败回滚）。主配置绝不改、绝不 stop/restart。
@@ -67,8 +79,8 @@
 - 本工具**只有桌面端**，不做手机视口适配；窗口拖窄时只需保证不溢出（侧栏图标条 + 表单单列），不要再引入抽屉/汉堡/全屏弹窗。
 - 已移除的入口：服务器站点、本机证书（旧模式）、使用向导。后续不要再加回来。
 - HTTPS 规则的 TLS 终止位置按上方 2026-11-26 的 `vhostHTTPPort` 规则判定，不再按 Web 探测结果决定。
-- 证书管理页只保留证书列表 / 卡片；ACME 邮箱与 EAB 在设置页维护，签发弹窗只选已保存账户。
-- **DNS 管理（2026-11-26 用户确认）**：DNS 账户已从设置页移到独立的「DNS 管理」工作台菜单，页面含「账户管理」+「域名解析管理」两部分。解析管理做完整 CRUD（选账户→选域名→列/增/改/删记录），复用 `dns-automation.ts` 中 DNSPod/阿里云/Cloudflare 三家适配器；设置页不再有 DNS 账户入口。签发弹窗仍只选已保存账户。
+- 证书管理页只保留证书列表 / 卡片（已简化并支持搜索、分页）；详情用 `AppDrawer` 抽屉显示证书/私钥内容与真实存放位置，支持下载与删除。ACME 邮箱与 EAB 在设置页维护，签发弹窗只选已保存账户。已保存的 EAB / DNS 账户凭据只以脱敏摘要作为输入框 placeholder，明文绝不回渲染层。
+- **DNS 管理（2026-11-26 用户确认）**：DNS 账户已从设置页移到独立的「DNS 管理」工作台菜单，页面用标签页组织，**域名解析管理在前、账户管理在后**。解析管理做完整 CRUD（选账户→选域名→列/增/改/删记录），复用 `dns-automation.ts` 中 DNSPod/阿里云/Cloudflare 三家适配器；设置页不再有 DNS 账户入口。签发弹窗仍只选已保存账户。
 - 服务端证书与托管 TLS 依赖 `certificates.ts` 签发引擎和 `server-sites.ts` nginx 事务框架，删除其他功能时必须保留这两块。
 
 ## 版本管理方案（2026-11-24 用户确认）

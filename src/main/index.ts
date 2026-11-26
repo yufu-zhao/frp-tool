@@ -64,6 +64,21 @@ import {
   type ServerDeployProgressUpdate,
 } from '../shared/types';
 
+/** 已保存凭据只回传脱敏摘要，避免完整密钥出现在渲染层或 DOM。 */
+function maskCredential(value: string): string {
+  const clean = value.trim();
+  if (!clean) return '';
+  if (clean.length <= 8) return `${clean.slice(0, 1)}****${clean.slice(-1)}`;
+  return `${clean.slice(0, 4)}****${clean.slice(-4)}`;
+}
+function savedSecretOf(store: Store, key: string): string {
+  try {
+    return store.secret(key);
+  } catch {
+    return '';
+  }
+}
+
 const iconDirectory = path.join(__dirname, '../../assets/icons');
 let window: BrowserWindow | undefined;
 let tray: Tray | undefined;
@@ -873,6 +888,9 @@ else {
           // EAB 密钥只放系统安全存储；空字符串表示沿用已保存值。
           if (raw.eabKid) store.putSecret('acme:litessl:eabKid', raw.eabKid);
           if (raw.eabHmac) store.putSecret('acme:litessl:eabHmac', raw.eabHmac);
+          // 显式重新填写 EAB 时强制换 ACME 账户：CA 侧旧账户未绑定新 EAB 会报
+          // "The client lacks sufficient authorization"。留空沿用不触发。
+          if (raw.eabKid || raw.eabHmac) store.dropSecrets('acme:litessl:accountKey');
           const savedSecret = (key: string) => {
             try {
               return store.secret(key);
@@ -964,6 +982,23 @@ else {
             .parse(p ?? {}) as DnsAccountTestInput;
           return serverCertificates.testAccount(value);
         },
+        [ACTIONS.dnsAccountMasked]: async (p) => {
+          const id = z
+            .string()
+            .regex(/^[a-zA-Z0-9_-]{1,80}$/)
+            .parse(p);
+          const account = store.data.dnsAccounts.find((item) => item.id === id);
+          if (!account) return {};
+          const fields = ['secretId', 'secretKey', 'token', 'endpoint'] as const;
+          const result: Record<string, string> = {};
+          for (const field of fields)
+            result[field] = maskCredential(savedSecretOf(store, `dns:account:${id}:${field}`));
+          return result;
+        },
+        [ACTIONS.acmeMasked]: async () => ({
+          eabKid: maskCredential(savedSecretOf(store, 'acme:litessl:eabKid')),
+          eabHmac: maskCredential(savedSecretOf(store, 'acme:litessl:eabHmac')),
+        }),
         [ACTIONS.dnsDomains]: async (p) => {
           const value = z
             .object({
@@ -1157,6 +1192,45 @@ else {
         [ACTIONS.certificateReadPem]: async (p) => {
           const value = z.object({ id: idSchema }).parse(p);
           return localCertificates.readPem(value.id);
+        },
+        [ACTIONS.certificateDetail]: async (p) => {
+          const id = pickId(p);
+          const cert = store.data.serverCertificates.find((item) => item.id === id);
+          if (!cert) throw new AppError('证书不存在或已被删除。');
+          if (cert.tlsPlan === 'server') {
+            const admin = remote.nginxAdmin(cert.serverId);
+            const certPem = cert.serverCertPath ? await admin.read(cert.serverCertPath) : '';
+            const keyPem = cert.serverKeyPath ? await admin.read(cert.serverKeyPath) : '';
+            return {
+              id: cert.id,
+              storage: 'server' as const,
+              certPath: cert.serverCertPath ?? '',
+              keyPath: cert.serverKeyPath ?? '',
+              configPath: cert.serverConfigPath ?? '',
+              certPem,
+              keyPem,
+            };
+          }
+          const localId = cert.localCertificateId ?? cert.id;
+          const pem = await localCertificates.readPem(localId);
+          const paths = localCertificates.pathFor(localId);
+          return {
+            id: cert.id,
+            storage: 'local' as const,
+            certPath: paths.certPath,
+            keyPath: paths.keyPath,
+            certPem: pem.certPem,
+            keyPem: pem.keyPem,
+          };
+        },
+        [ACTIONS.certificateDelete]: async (p) => {
+          const outcome = await serverCertificates.removeById(pickId(p));
+          if (processes.running(outcome.instanceId)) {
+            await processes.stop(outcome.instanceId);
+            await processes.start(outcome.instanceId);
+          }
+          changed();
+          return outcome;
         },
         [ACTIONS.certificateImportPem]: async (p) => {
           const value = z

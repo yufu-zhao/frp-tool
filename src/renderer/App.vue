@@ -49,10 +49,13 @@ import {
   type SiteConfigReadResult,
   type ManagedDnsDomain,
   type ManagedDnsRecord,
+  type CertificateDetail,
+  type MaskedCredentials,
 } from '../shared/contracts';
 import ToastHost from './components/ToastHost.vue';
 import ConfirmDialog from './components/ConfirmDialog.vue';
 import AppModal from './components/AppModal.vue';
+import AppDrawer from './components/AppDrawer.vue';
 import ProgressPanel from './components/ProgressPanel.vue';
 import EmptyState from './components/EmptyState.vue';
 import StatusBadge from './components/StatusBadge.vue';
@@ -167,6 +170,9 @@ const ruleConfigLoading = ref(false);
 const ruleConfigDirty = ref(false);
 const ruleConfigProgrammatic = ref(false);
 const ruleCertRemoving = ref(false);
+const ruleCertDetail = ref<CertificateDetail>();
+const ruleCertDetailLoading = ref(false);
+const ruleCertDetailError = ref('');
 const ruleListTab = ref<'site' | 'service'>('site');
 // 当前规则所属服务器的 TLS 方案；由服务器探测 + include 探针判定，供配置模板与证书弹窗共用。
 const ruleTlsPlan = ref<TlsPlan>();
@@ -220,11 +226,20 @@ const serverDeploySteps = ref<
   Array<{ label: string; detail?: string; time?: number; tone?: string }>
 >([]);
 
-/* 证书管理：申请入口统一收敛到客户端实例的 Web 规则。 */
+/* 证书管理：申请入口统一收敛到客户端实例的 Web 规则；本页只读 + 下载/删除。 */
+const certSearch = ref('');
+const certPage = ref(1);
+const certPageSize = 8;
+const certDetailOpen = ref(false);
+const certDetail = ref<CertificateDetail>();
+const certDetailLoading = ref(false);
+const certDownloading = ref(false);
+const certDeleting = ref(false);
 const selectedCertServer = ref('');
 const dnsAutomation = ref<DnsAutomation>('api');
 const deployMode = ref<'manual' | 'auto'>('manual');
 const deployLevel = ref<'L0' | 'L1' | 'L2'>('L0');
+const acmeMasked = ref({ eabKid: '', eabHmac: '' });
 const settingsDraft = reactive({
   proxyUrl: '',
   acmeEmail: '',
@@ -247,8 +262,10 @@ const dnsAccountDraft = reactive({
 });
 const dnsAccountResult = ref('');
 const dnsAccountResultTone = ref<'success' | 'error'>('success');
+const dnsAccountMasked = ref<MaskedCredentials>({});
 
-// DNS 管理：域名与解析记录
+// DNS 管理：域名解析在前、账户管理在后
+const dnsTab = ref<'records' | 'accounts'>('records');
 const dnsManage = reactive({
   accountId: '',
   domain: '',
@@ -312,48 +329,16 @@ const descriptions: Record<PageKey, string> = {
   settings: 'ACME 邮箱与 EAB、部署默认值、下载策略与安全确认。',
   help: '端口约束、证书终止位置、托管实例隔离与常见问题。',
 };
-const navGroups = computed(() => [
-  {
-    key: 'infra',
-    label: '基础设施',
-    items: [
-      { key: 'servers', label: '服务器', icon: '▤', badge: state.value.servers.length },
-      { key: 'versions', label: '版本库', icon: '▦' },
-    ],
-  },
-  {
-    key: 'tunnel',
-    label: '穿透',
-    items: [
-      { key: 'clients', label: '客户端实例', icon: '⇄', badge: state.value.instances.length },
-    ],
-  },
-  {
-    key: 'security',
-    label: '证书',
-    items: [{ key: 'serverCerts', label: '证书管理', icon: '◇' }],
-  },
-  {
-    key: 'dns',
-    label: 'DNS',
-    items: [
-      {
-        key: 'dns',
-        label: 'DNS 管理',
-        icon: '◎',
-        badge: state.value.dnsAccounts.length,
-      },
-    ],
-  },
-  {
-    key: 'tools',
-    label: '工具',
-    items: [
-      { key: 'terminal', label: '终端', icon: '⌘' },
-      { key: 'settings', label: '设置', icon: '⚙' },
-      { key: 'help', label: '帮助', icon: '?' },
-    ],
-  },
+// 扁平导航：菜单项少，直接平铺，不再分组折叠。
+const navItems = computed(() => [
+  { key: 'servers', label: '服务器', icon: 'servers', badge: state.value.servers.length },
+  { key: 'versions', label: '版本库', icon: 'versions' },
+  { key: 'clients', label: '客户端实例', icon: 'clients', badge: state.value.instances.length },
+  { key: 'dns', label: 'DNS 管理', icon: 'dns', badge: state.value.dnsAccounts.length },
+  { key: 'serverCerts', label: '证书管理', icon: 'serverCerts' },
+  { key: 'terminal', label: '终端', icon: 'terminal' },
+  { key: 'settings', label: '设置', icon: 'settings' },
+  { key: 'help', label: '帮助', icon: 'help' },
 ]);
 const runtimeLabel = computed(() => {
   const running = Object.values(runtime.value.clients).filter((c) =>
@@ -462,6 +447,10 @@ async function refresh() {
   )
     selectedInstance.value = state.value.instances[0]?.id ?? '';
   await refreshRuntime();
+  await refreshAcmeMasked().catch(() => {});
+}
+async function refreshAcmeMasked() {
+  acmeMasked.value = await rpc<{ eabKid: string; eabHmac: string }>(ACTIONS.acmeMasked);
 }
 async function refreshRuntime() {
   runtime.value = await rpc('runtime');
@@ -989,8 +978,17 @@ function addProxy() {
 function kindOf(rule: ProxyRule): 'tcp' | 'udp' | 'web' {
   return rule.type === 'tcp' ? 'tcp' : rule.type === 'udp' ? 'udp' : 'web';
 }
-function typeLabel(rule: ProxyRule) {
+function typeLabel(rule: ProxyRule, instance?: Instance) {
   if (rule.type === 'http' && rule.publicHttps) return 'Web · HTTPS';
+  // 方案 B 的 HTTPS 是隐藏伴随规则，原 HTTP 规则仍一条；列表也应显示已启用 HTTPS。
+  if (
+    rule.type === 'http' &&
+    instance?.proxies.some(
+      (item) =>
+        item.hidden && item.sourceRuleId === rule.id && item.type === 'https' && item.certificateId,
+    )
+  )
+    return 'Web · HTTPS';
   return { tcp: 'TCP', udp: 'UDP', http: 'Web', https: 'Web · HTTPS' }[rule.type];
 }
 function openRuleCreate(kind: 'web' | 'service') {
@@ -1186,6 +1184,10 @@ function refreshRuleTlsPlan(serverId?: string) {
 
 async function switchRuleTab(tab: 'basic' | 'config' | 'ssl') {
   ruleTab.value = tab;
+  if (tab === 'ssl') {
+    void loadRuleCertDetail();
+    return;
+  }
   if (tab !== 'config') return;
   // 已有探测结果或 SSH 已连接时自动套用；否则给出检测按钮，不在打开弹窗时突然发起 SSH。
   const target = state.value.instances.find((item) => item.id === ruleInstanceId.value);
@@ -1672,6 +1674,116 @@ function certificateName(provider: string) {
       ? 'LiteSSL'
       : '手动证书';
 }
+
+/* ---------------- 证书管理：搜索 / 分页 / 详情 / 下载 / 删除 ---------------- */
+const filteredCerts = computed(() => {
+  const keyword = certSearch.value.trim().toLowerCase();
+  if (!keyword) return state.value.serverCertificates;
+  return state.value.serverCertificates.filter((cert) =>
+    [cert.name, certificateName(cert.provider), ...cert.domains].some((value) =>
+      value.toLowerCase().includes(keyword),
+    ),
+  );
+});
+const certTotalPages = computed(() =>
+  Math.max(1, Math.ceil(filteredCerts.value.length / certPageSize)),
+);
+const pagedCerts = computed(() =>
+  filteredCerts.value.slice((certPage.value - 1) * certPageSize, certPage.value * certPageSize),
+);
+watch(certSearch, () => {
+  certPage.value = 1;
+});
+watch(certTotalPages, (total) => {
+  if (certPage.value > total) certPage.value = total;
+});
+async function openCertDetail(cert: ServerCertificate) {
+  certDetailOpen.value = true;
+  certDetail.value = undefined;
+  certDetailLoading.value = true;
+  try {
+    certDetail.value = await rpc<CertificateDetail>(ACTIONS.certificateDetail, cert.id);
+  } catch (error) {
+    toastError(`读取证书详情失败：${(error as Error).message}`);
+    certDetailOpen.value = false;
+  } finally {
+    certDetailLoading.value = false;
+  }
+}
+function closeCertDetail() {
+  certDetailOpen.value = false;
+}
+function downloadCertMaterial(kind: 'cert' | 'key') {
+  const detail = certDetail.value;
+  if (!detail || certDownloading.value) return;
+  const content = kind === 'cert' ? detail.certPem : detail.keyPem;
+  if (!content.trim()) {
+    toastWarning('证书内容为空，无法下载。');
+    return;
+  }
+  certDownloading.value = true;
+  try {
+    const blob = new Blob([content], { type: 'application/x-pem-file' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${detail.id}-${kind === 'cert' ? 'fullchain.crt' : 'private.key'}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    toastSuccess(kind === 'cert' ? '证书链已下载。' : '私钥已下载，请妥善保管。');
+  } finally {
+    certDownloading.value = false;
+  }
+}
+function deleteCertFromPage() {
+  const detail = certDetail.value;
+  if (!detail || certDeleting.value) return;
+  const cert = state.value.serverCertificates.find((item) => item.id === detail.id);
+  askConfirm({
+    title: '删除证书',
+    level: 'danger',
+    message: `删除证书「${cert?.name ?? detail.id}」？`,
+    impacts: [
+      detail.storage === 'server'
+        ? '将删除服务器上的证书文件并恢复该站点 HTTP 配置'
+        : '将删除本机证书与隐藏 HTTPS 伴随规则，HTTP 规则保留',
+      '删除后使用该证书的 HTTPS 访问会立即失效',
+    ],
+    confirmLabel: '删除证书',
+    onConfirm: async () => {
+      certDeleting.value = true;
+      try {
+        await act(ACTIONS.certificateDelete, detail.id, '证书已删除。');
+        closeCertDetail();
+        await refresh();
+      } finally {
+        certDeleting.value = false;
+      }
+    },
+  });
+}
+async function loadRuleCertDetail() {
+  const id = ruleActiveCertificate.value?.certificateId;
+  if (ruleTab.value !== 'ssl' || !id) {
+    ruleCertDetail.value = undefined;
+    return;
+  }
+  ruleCertDetailLoading.value = true;
+  ruleCertDetailError.value = '';
+  try {
+    ruleCertDetail.value = await rpc<CertificateDetail>(ACTIONS.certificateDetail, id);
+  } catch (error) {
+    ruleCertDetailError.value = (error as Error).message;
+    ruleCertDetail.value = undefined;
+  } finally {
+    ruleCertDetailLoading.value = false;
+  }
+}
+watch([ruleTab, () => ruleActiveCertificate.value?.certificateId], () => {
+  void loadRuleCertDetail();
+});
 
 /* ---------------- 实例 ---------------- */
 function saveInstanceInstanceForm() {
@@ -2540,6 +2652,10 @@ const dnsCredentialFields: Record<DnsProviderId, DnsCredentialField[]> = {
   ],
 };
 const activeDnsCredentialFields = computed(() => dnsCredentialFields[dnsAccountDraft.provider]);
+function dnsFieldPlaceholder(field: DnsCredentialField) {
+  const saved = dnsAccountMasked.value[field.key];
+  return saved ? `已保存：${saved}（留空沿用）` : (field.placeholder ?? '留空表示沿用已保存值');
+}
 // 只保留服务商 API 自动化；保留函数供签发进度沿用同一显示字段。
 function dnsLevelForProvider(_provider?: DnsProviderId): DnsAutomation {
   return 'api';
@@ -2564,8 +2680,9 @@ function resetDnsAccountDraft() {
   dnsAccountResult.value = '';
   dnsAccountResultTone.value = 'success';
 }
-function openDnsAccountModal(account?: DnsAccount) {
+async function openDnsAccountModal(account?: DnsAccount) {
   resetDnsAccountDraft();
+  dnsAccountMasked.value = {};
   if (account)
     Object.assign(dnsAccountDraft, {
       id: account.id,
@@ -2575,6 +2692,13 @@ function openDnsAccountModal(account?: DnsAccount) {
   dnsAccountResult.value = account ? '凭据留空表示沿用已保存值。' : '';
   dnsAccountResultTone.value = 'success';
   openModal('dns-account');
+  if (account) {
+    try {
+      dnsAccountMasked.value = await rpc<MaskedCredentials>(ACTIONS.dnsAccountMasked, account.id);
+    } catch {
+      dnsAccountMasked.value = {};
+    }
+  }
 }
 function editDnsAccount(account: DnsAccount) {
   openDnsAccountModal(account);
@@ -2806,16 +2930,16 @@ const antdTheme = computed(() => {
   const dark = resolvedTheme.value === 'dark';
   return {
     token: {
-      colorPrimary: '#2f63dc',
-      colorSuccess: '#159a63',
-      colorWarning: '#c9820c',
-      colorError: '#d64545',
-      colorText: dark ? '#e6edf9' : '#1c2940',
-      colorTextSecondary: dark ? '#b6c4da' : '#4a5a72',
-      colorBgContainer: dark ? '#182237' : '#ffffff',
-      colorBgElevated: dark ? '#1e2a40' : '#ffffff',
-      colorBorder: dark ? '#2b3a53' : '#e3e9f2',
-      borderRadius: 7,
+      colorPrimary: dark ? '#6d70f0' : '#5457e5',
+      colorSuccess: '#16855c',
+      colorWarning: '#b26a08',
+      colorError: '#c63c3c',
+      colorText: dark ? '#e8ebf3' : '#161c2b',
+      colorTextSecondary: dark ? '#b1bacb' : '#3a4356',
+      colorBgContainer: dark ? '#181c26' : '#ffffff',
+      colorBgElevated: dark ? '#1e232f' : '#ffffff',
+      colorBorder: dark ? '#2a3040' : '#e2e6ed',
+      borderRadius: 6,
       fontSize: 14,
       controlHeight: 38,
       fontFamily:
@@ -2823,8 +2947,8 @@ const antdTheme = computed(() => {
     },
     components: {
       Select: {
-        optionSelectedBg: dark ? '#1e3157' : '#eaf1ff',
-        optionHoverBg: dark ? '#26344c' : '#f7f9fd',
+        optionSelectedBg: dark ? '#232655' : '#eef0ff',
+        optionHoverBg: dark ? '#262c3a' : '#f0f2f5',
       },
     },
   };
@@ -3106,13 +3230,11 @@ function resizeActiveTerminal() {
   <a-config-provider :theme="antdTheme">
     <div class="app-shell">
       <AppSidebar
-        :groups="navGroups"
+        :items="navItems"
         :active="page"
         :platform="state.platform"
         :arch="state.arch"
         :secure-storage="state.secureStorage"
-        :runtime-label="runtimeLabel"
-        :runtime-tone="runtimeTone"
         :collapsed="sidebarCollapsed"
         :logo="logoUrl"
         @navigate="navigatePage"
@@ -3123,14 +3245,13 @@ function resizeActiveTerminal() {
       <main class="app-main">
         <header class="app-header">
           <div class="app-header__meta">
-            <div class="app-header__eyebrow">FRP · WORKSPACE</div>
-            <h1 class="app-header__title">{{ titles[page] }}</h1>
+            <div class="app-header__heading">
+              <h1 class="app-header__title">{{ titles[page] }}</h1>
+              <StatusBadge :tone="runtimeTone" :label="runtimeLabel" />
+            </div>
             <p class="app-header__desc">{{ descriptions[page] }}</p>
           </div>
           <div class="app-header__actions">
-            <span class="app-header__status"
-              ><StatusBadge :tone="runtimeTone" :label="runtimeLabel"
-            /></span>
             <button
               v-if="page === 'servers'"
               class="ui-btn ui-btn--primary"
@@ -3156,15 +3277,6 @@ function resizeActiveTerminal() {
               @click="openModal('manual')"
             >
               手动 / 离线导入
-            </button>
-            <button
-              v-else-if="page === 'dns'"
-              class="ui-btn ui-btn--primary"
-              type="button"
-              :disabled="busy"
-              @click="openDnsAccountModal()"
-            >
-              ＋ 新增账户
             </button>
             <button
               v-else-if="page === 'settings'"
@@ -3194,14 +3306,8 @@ function resizeActiveTerminal() {
               v-if="!state.servers.length"
               icon="▤"
               title="从一台服务器开始"
-              description="支持 SSH 密码或密钥登录；安装服务端时自动预检并引导处理已有服务。"
-            >
-              <template #action
-                ><button class="ui-btn ui-btn--primary" type="button" @click="newServer">
-                  添加第一台服务器
-                </button></template
-              >
-            </EmptyState>
+              description="支持 SSH 密码或密钥登录。"
+            />
             <div v-else class="split">
               <div class="item-list">
                 <button
@@ -3227,50 +3333,64 @@ function resizeActiveTerminal() {
                   }}</small>
                 </button>
               </div>
-              <section v-if="server" class="panel">
+              <section v-if="server" class="panel server-panel">
                 <div class="panel-heading">
-                  <div>
+                  <div class="server-panel__identity">
                     <h2>{{ server.name }}</h2>
                     <p>{{ server.username }}@{{ server.host }}:{{ server.sshPort }}</p>
                   </div>
-                  <button
-                    v-if="server.accessMode !== 'readonly'"
-                    class="ui-btn ui-btn--soft"
-                    type="button"
-                    :disabled="busy"
-                    @click="editServer"
-                  >
-                    编辑配置
-                  </button>
-                  <StatusBadge v-else tone="info" label="只读连接" />
+                  <div class="server-panel__head-actions">
+                    <StatusBadge
+                      v-if="server.accessMode === 'readonly'"
+                      tone="info"
+                      label="只读连接"
+                    />
+                    <button
+                      v-if="server.accessMode !== 'readonly'"
+                      class="ui-btn ui-btn--sm ui-btn--soft"
+                      type="button"
+                      :disabled="busy"
+                      @click="editServer"
+                    >
+                      编辑配置
+                    </button>
+                  </div>
                 </div>
-                <div class="actions">
-                  <button class="ui-btn" type="button" @click="openTerminalForServer(server.id)">
-                    打开终端
-                  </button>
+                <div class="server-ops">
                   <button
+                    v-if="runtime.ssh[server.id] !== 'connected'"
                     class="ui-btn ui-btn--primary"
                     type="button"
-                    :disabled="busy || runtime.ssh[server.id] === 'connected'"
+                    :disabled="busy"
                     @click="connectServer"
                   >
                     连接 SSH
                   </button>
+                  <StatusBadge v-else tone="success" label="SSH 已连接" />
                   <button
-                    class="ui-btn"
+                    class="ui-btn ui-btn--sm"
                     type="button"
-                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                    @click="disconnectServer"
+                    @click="openTerminalForServer(server.id)"
                   >
-                    断开
+                    打开终端
                   </button>
                   <button
-                    class="ui-btn"
+                    v-if="runtime.ssh[server.id] === 'connected'"
+                    class="ui-btn ui-btn--sm"
                     type="button"
-                    :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                    :disabled="busy"
                     @click="detectServer"
                   >
                     刷新主机信息
+                  </button>
+                  <button
+                    v-if="runtime.ssh[server.id] === 'connected'"
+                    class="ui-btn ui-btn--sm ui-btn--quiet"
+                    type="button"
+                    :disabled="busy"
+                    @click="disconnectServer"
+                  >
+                    断开
                   </button>
                 </div>
                 <div v-if="hostInfo" class="info-box">
@@ -3404,17 +3524,9 @@ function resizeActiveTerminal() {
                   </div>
                 </template>
                 <template v-else>
-                  <h3>服务端部署</h3>
+                  <h3 class="server-section-title">服务端部署</h3>
                   <template v-if="!server.deployment">
-                    <p class="muted">
-                      点击「安装服务端」后会自动预检端口占用与已有 FRP
-                      服务，并按结果让你选择保存只读、移除重装或覆盖上传；版本与架构自动确定。
-                    </p>
                     <section class="panel version-auto">
-                      <h4>自动选择版本并安装</h4>
-                      <p class="muted">
-                        连接服务器后自动探测架构并选择版本；安装包未就绪会先下载，进度在右下角任务中心显示。
-                      </p>
                       <div class="kv-grid">
                         <div class="kv">
                           <small>目标架构</small>
@@ -3436,8 +3548,8 @@ function resizeActiveTerminal() {
                           />
                         </div>
                       </div>
-                      <p class="hint">
-                        {{ serverResolution?.note || '连接服务器后自动探测架构并选择版本。' }}
+                      <p v-if="serverResolution?.note" class="hint">
+                        {{ serverResolution.note }}
                       </p>
                       <div class="inline-fields">
                         <AppSelect v-model="deployVersionOverride" aria-label="选择服务端版本">
@@ -3451,7 +3563,12 @@ function resizeActiveTerminal() {
                           </option>
                         </AppSelect>
                         <button
-                          class="ui-btn ui-btn--primary"
+                          class="ui-btn"
+                          :class="
+                            runtime.ssh[server.id] === 'connected'
+                              ? 'ui-btn--primary'
+                              : 'ui-btn--soft'
+                          "
                           type="button"
                           :disabled="busy || !serverResolution?.version"
                           @click="deployServerWithPrepare"
@@ -3476,18 +3593,39 @@ function resizeActiveTerminal() {
                         :tone="serviceRunning(server.id) ? 'success' : 'warning'"
                         :label="`服务 ${serviceLabel(server.id)}`"
                       />
-                      <small v-if="runtime.serviceErrors?.[server.id]" class="muted">{{
-                        runtime.serviceErrors[server.id]
-                      }}</small>
-                      <span
-                        >{{ deploymentLabel(server.deployment) }} ·
-                        {{ server.deployment.managed ? '工具安装' : '外部服务记录' }}</span
+                      <label
+                        v-if="
+                          (server.deployment.manager ??
+                            (server.deployment.mode === 'process' ? 'process' : 'systemd')) !==
+                          'process'
+                        "
+                        class="autostart-toggle"
                       >
+                        <a-switch
+                          :checked="autostartEnabled === true"
+                          :disabled="
+                            busy ||
+                            autostartEnabled === null ||
+                            runtime.ssh[server.id] !== 'connected'
+                          "
+                          @change="toggleAutostart"
+                        />
+                        <span>开机启动</span>
+                      </label>
+                      <span v-else class="muted">后台进程模式不提供开机启动</span>
                     </div>
+                    <p v-if="runtime.serviceErrors?.[server.id]" class="hint hint--error">
+                      {{ runtime.serviceErrors[server.id] }}
+                    </p>
                     <div class="actions">
                       <button
                         v-if="!serviceRunning(server.id)"
-                        class="ui-btn ui-btn--primary"
+                        class="ui-btn"
+                        :class="
+                          runtime.ssh[server.id] === 'connected'
+                            ? 'ui-btn--primary'
+                            : 'ui-btn--soft'
+                        "
                         type="button"
                         :disabled="busy || runtime.ssh[server.id] !== 'connected'"
                         @click="act('server:control', { id: server.id, action: 'start' })"
@@ -3521,59 +3659,38 @@ function resizeActiveTerminal() {
                         查看日志
                       </button>
                     </div>
-                    <div class="actions">
-                      <button
-                        class="ui-btn"
-                        type="button"
-                        :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                        @click="readRemoteConfig"
-                      >
-                        读取远程配置
-                      </button>
-                      <button
-                        class="ui-btn"
-                        type="button"
-                        :disabled="busy || runtime.ssh[server.id] !== 'connected'"
-                        @click="loadBackups"
-                      >
-                        查看 / 恢复备份
-                      </button>
-                      <label
-                        v-if="
-                          (server.deployment.manager ??
-                            (server.deployment.mode === 'process' ? 'process' : 'systemd')) !==
-                          'process'
-                        "
-                        class="autostart-toggle"
-                      >
-                        <a-switch
-                          :checked="autostartEnabled === true"
-                          :disabled="
-                            busy ||
-                            autostartEnabled === null ||
-                            runtime.ssh[server.id] !== 'connected'
-                          "
-                          @change="toggleAutostart"
-                        />
-                        <span>开机启动</span>
-                      </label>
-                      <span v-else class="muted">后台进程模式不提供开机启动</span>
-                    </div>
+                    <details class="server-advanced">
+                      <summary>更多操作</summary>
+                      <div class="actions">
+                        <button
+                          class="ui-btn"
+                          type="button"
+                          :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                          @click="readRemoteConfig"
+                        >
+                          读取远程配置
+                        </button>
+                        <button
+                          class="ui-btn"
+                          type="button"
+                          :disabled="busy || runtime.ssh[server.id] !== 'connected'"
+                          @click="loadBackups"
+                        >
+                          查看 / 恢复备份
+                        </button>
+                      </div>
+                    </details>
                   </template>
                 </template>
-                <div class="actions">
+                <div class="server-panel__foot">
                   <button
-                    class="ui-btn ui-btn--danger-link"
+                    class="ui-btn ui-btn--sm ui-btn--danger-link"
                     type="button"
                     :disabled="busy"
                     @click="uninstallServer"
                   >
                     {{ server.accessMode === 'readonly' ? '移除只读配置' : '卸载' }}
                   </button>
-                </div>
-                <div class="hint">
-                  SSH 连接与 FRP 服务状态相互独立。请放行 FRP
-                  连接及代理入口端口；本工具不会自动修改防火墙。
                 </div>
               </section>
             </div>
@@ -3588,19 +3705,6 @@ function resizeActiveTerminal() {
                   · 列表更新于 {{ formatTime(catalogUpdatedAt) }}</template
                 >
                 <template v-else> · 尚未获取官方版本列表</template>
-                <small>
-                  已保存到本机，下次打开直接显示。本工具不会在启动时自动联网，需要新版本请手动刷新。
-                </small>
-              </span>
-              <span class="inline-fields" style="margin: 0">
-                <button
-                  class="ui-btn ui-btn--soft"
-                  type="button"
-                  :disabled="busy"
-                  @click="fetchCatalog(true)"
-                >
-                  {{ catalogUpdatedAt ? '检查更新 / 刷新列表' : '获取版本列表' }}
-                </button>
               </span>
             </div>
             <div
@@ -3772,14 +3876,8 @@ function resizeActiveTerminal() {
               v-if="!state.instances.length"
               icon="⇄"
               title="分享你的本地服务"
-              description="一个实例连接一台服务器，可包含多个网站或 TCP/UDP 服务。"
-            >
-              <template #action
-                ><button class="ui-btn ui-btn--primary" type="button" @click="newInstance">
-                  创建第一个实例
-                </button></template
-              >
-            </EmptyState>
+              description="使用右上角「创建实例」新建；一个实例可包含多个网站或 TCP/UDP 服务。"
+            />
             <div v-else class="split">
               <div class="item-list">
                 <button
@@ -3858,17 +3956,13 @@ function resizeActiveTerminal() {
                   >
                     查看日志
                   </button>
-                  <button
-                    class="ui-btn ui-btn--danger-link"
-                    type="button"
-                    :disabled="busy"
-                    @click="deleteInstance"
-                  >
-                    删除
-                  </button>
                 </div>
-                <div class="info-box">
-                  {{ runtime.clients[instance.id]?.message ?? '尚未启动' }}
+                <div class="instance-status">
+                  <StatusBadge
+                    :tone="clientTone(instance.id)"
+                    :label="statusLabel(clientStatus(instance.id))"
+                  />
+                  <span>{{ runtime.clients[instance.id]?.message ?? '尚未启动' }}</span>
                 </div>
                 <p
                   v-if="
@@ -3935,7 +4029,13 @@ function resizeActiveTerminal() {
                               runtime.clients[instance.id]?.proxies[rule.id] ?? '未启动'
                             }}</span>
                           </td>
-                          <td><StatusBadge tone="info" :label="typeLabel(rule)" :dot="false" /></td>
+                          <td>
+                            <StatusBadge
+                              tone="info"
+                              :label="typeLabel(rule, instance)"
+                              :dot="false"
+                            />
+                          </td>
                           <td>
                             <code>{{ rule.localIP }}:{{ rule.localPort }}</code>
                           </td>
@@ -3995,12 +4095,17 @@ function resizeActiveTerminal() {
                   </div>
                 </template>
                 <p v-else class="hint">
-                  高级配置的实际代理以 FRP
-                  日志为准，界面不会解析未知字段或显示旧表单地址。建议将日志输出设为
-                  console，以便查看连接状态。
+                  高级配置的实际代理以 FRP 日志为准，建议将日志输出设为 console。
                 </p>
-                <div class="hint">
-                  “已注册”表示服务器接受了规则；访问仍取决于本地服务、DNS、证书以及防火墙和云安全组。
+                <div class="server-panel__foot">
+                  <button
+                    class="ui-btn ui-btn--sm ui-btn--danger-link"
+                    type="button"
+                    :disabled="busy"
+                    @click="deleteInstance"
+                  >
+                    删除实例
+                  </button>
                 </div>
               </section>
             </div>
@@ -4010,71 +4115,73 @@ function resizeActiveTerminal() {
           <template v-if="page === 'serverCerts'">
             <div class="section-title">
               <h2>
-                证书管理 <span>{{ state.serverCertificates.length }}</span>
+                证书管理 <span>{{ filteredCerts.length }}</span>
               </h2>
             </div>
             <div class="notice notice--info">
-              此页只展示已签发的证书。申请、导入或移除证书请到「客户端实例 → Web 规则 →
-              SSL」中操作。
+              此页展示已签发的证书。申请与移除入口在「客户端实例 → Web 规则 →
+              SSL」；这里可查看详情、下载与删除。
+            </div>
+            <div class="cert-toolbar">
+              <input
+                v-model="certSearch"
+                class="cert-search"
+                type="search"
+                aria-label="搜索证书"
+                placeholder="搜索证书名称、域名或签发机构"
+              />
+              <span class="muted">{{ filteredCerts.length }} 张证书</span>
             </div>
             <EmptyState
-              v-if="!state.serverCertificates.length"
+              v-if="!filteredCerts.length"
               icon="◇"
-              title="还没有证书"
-              description="在客户端实例的 Web 规则中填写域名后，可在 SSL 标签申请证书。"
+              :title="state.serverCertificates.length ? '没有匹配的证书' : '还没有证书'"
+              :description="
+                state.serverCertificates.length
+                  ? '试试更换搜索关键词。'
+                  : '在客户端实例的 Web 规则中填写域名后，可在 SSL 标签申请证书。'
+              "
             />
             <div v-else class="cert-grid">
-              <article v-for="cert in state.serverCertificates" :key="cert.id" class="cert-card">
+              <article v-for="cert in pagedCerts" :key="cert.id" class="cert-card">
                 <div class="cert-card__head">
                   <strong>{{ cert.name }}</strong>
                   <StatusBadge
                     tone="success"
-                    :label="cert.tlsPlan === 'server' ? '已部署服务器' : '已部署本机'"
+                    :label="cert.tlsPlan === 'server' ? '服务器终止' : '本机终止'"
                   />
                 </div>
+                <p class="cert-card__domains">{{ cert.domains.join('、') }}</p>
                 <div class="cert-card__meta">
-                  <StatusBadge
-                    tone="neutral"
-                    :label="certificateName(cert.provider)"
-                    :dot="false"
-                  />
-                  <StatusBadge
-                    tone="info"
-                    :label="cert.challenge === 'http-01' ? 'HTTP-01' : 'DNS-01'"
-                    :dot="false"
-                  />
-                  <StatusBadge
-                    tone="info"
-                    :label="
-                      cert.tlsPlan === 'server' ? '服务器终止（方案 A）' : '本机终止（方案 B）'
-                    "
-                    :dot="false"
-                  />
+                  <span>{{ certificateName(cert.provider) }}</span>
+                  <span>{{ cert.tlsPlan === 'server' ? '服务器目录' : '本机证书库' }}</span>
+                  <span>到期 {{ cert.expiresAt ? formatTime(cert.expiresAt) : '未知' }}</span>
                 </div>
-                <div class="kv-grid">
-                  <div class="kv">
-                    <small>域名</small><strong>{{ cert.domains.join('、') }}</strong>
-                  </div>
-                  <div class="kv">
-                    <small>到期时间</small
-                    ><strong>{{ cert.expiresAt ? formatTime(cert.expiresAt) : '未知' }}</strong>
-                  </div>
-                  <div class="kv">
-                    <small>签发时间</small
-                    ><strong>{{
-                      cert.lastRenewedAt ? formatTime(cert.lastRenewedAt) : '未知'
-                    }}</strong>
-                  </div>
+                <div class="cert-card__actions">
+                  <button class="ui-btn ui-btn--sm" type="button" @click="openCertDetail(cert)">
+                    查看详情
+                  </button>
                 </div>
-                <div class="notice notice--info">
-                  {{
-                    cert.tlsPlan === 'server'
-                      ? '证书与私钥已写入服务器托管目录，由服务器 Web 服务终止 TLS。'
-                      : '证书由本机 frpc 使用，HTTPS 伴随规则已自动关联。'
-                  }}
-                </div>
-                <div v-if="cert.notes" class="hint">{{ cert.notes }}</div>
               </article>
+            </div>
+            <div v-if="certTotalPages > 1" class="pager">
+              <button
+                class="ui-btn ui-btn--sm"
+                type="button"
+                :disabled="certPage <= 1"
+                @click="certPage -= 1"
+              >
+                上一页
+              </button>
+              <span class="muted">{{ certPage }} / {{ certTotalPages }}</span>
+              <button
+                class="ui-btn ui-btn--sm"
+                type="button"
+                :disabled="certPage >= certTotalPages"
+                @click="certPage += 1"
+              >
+                下一页
+              </button>
             </div>
           </template>
 
@@ -4325,194 +4432,214 @@ function resizeActiveTerminal() {
                 </button>
               </template>
             </div>
-            <p v-if="terminalTabs.length" class="terminal-history-hint">
-              记录读取服务器登录用户的 shell history 文件；多数 shell
-              会在退出时写入新命令，因此刚执行的命令可能暂时不显示。
-            </p>
           </section>
 
           <!-- ============ DNS 管理 ============ -->
           <template v-if="page === 'dns'">
-            <SectionCard
-              title="账户管理"
-              description="可保存多个服务商账户；同一服务商也能配置不同 SecretID，签发与解析管理共用账户。"
-            >
-              <div v-if="!state.dnsAccounts.length" class="notice notice--info">
-                还没有保存 DNS 账户。添加后即可在下方查询与维护域名解析。
-              </div>
-              <div v-else class="resource-list">
-                <div v-for="account in state.dnsAccounts" :key="account.id" class="resource-row">
-                  <StatusBadge
-                    tone="neutral"
-                    :label="dnsProviderLabel(account.provider)"
-                    :dot="false"
-                  />
-                  <div>
-                    <strong>{{ account.name }}</strong>
-                  </div>
-                  <div class="inline-fields" style="margin: 0">
-                    <button
-                      class="ui-btn ui-btn--sm"
-                      type="button"
-                      @click="editDnsAccount(account)"
-                    >
-                      编辑
-                    </button>
-                    <button
-                      class="ui-btn ui-btn--sm ui-btn--danger"
-                      type="button"
-                      :disabled="busy"
-                      @click="deleteDnsAccount(account)"
-                    >
-                      删除
-                    </button>
+            <div class="tabs dns-tabs" role="tablist" aria-label="DNS 管理">
+              <button
+                class="tabs__item"
+                :class="{ 'tabs__item--active': dnsTab === 'records' }"
+                type="button"
+                role="tab"
+                :aria-selected="dnsTab === 'records'"
+                @click="dnsTab = 'records'"
+              >
+                域名解析管理
+              </button>
+              <button
+                class="tabs__item"
+                :class="{ 'tabs__item--active': dnsTab === 'accounts' }"
+                type="button"
+                role="tab"
+                :aria-selected="dnsTab === 'accounts'"
+                @click="dnsTab = 'accounts'"
+              >
+                账户管理
+              </button>
+            </div>
+            <div v-show="dnsTab === 'accounts'">
+              <SectionCard
+                description="可保存多个服务商账户；同一服务商也能配置不同 SecretID，签发与解析管理共用账户。"
+              >
+                <div v-if="!state.dnsAccounts.length" class="notice notice--info">
+                  还没有保存 DNS 账户。添加后即可在下方查询与维护域名解析。
+                </div>
+                <div v-else class="resource-list">
+                  <div v-for="account in state.dnsAccounts" :key="account.id" class="resource-row">
+                    <StatusBadge
+                      tone="neutral"
+                      :label="dnsProviderLabel(account.provider)"
+                      :dot="false"
+                    />
+                    <div>
+                      <strong>{{ account.name }}</strong>
+                    </div>
+                    <div class="inline-fields" style="margin: 0">
+                      <button
+                        class="ui-btn ui-btn--sm"
+                        type="button"
+                        @click="editDnsAccount(account)"
+                      >
+                        编辑
+                      </button>
+                      <button
+                        class="ui-btn ui-btn--sm ui-btn--danger"
+                        type="button"
+                        :disabled="busy"
+                        @click="deleteDnsAccount(account)"
+                      >
+                        删除
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-              <div class="inline-fields" style="margin-top: var(--sp-4)">
-                <button
-                  class="ui-btn ui-btn--primary"
-                  type="button"
-                  :disabled="busy"
-                  @click="openDnsAccountModal()"
-                >
-                  新增账户
-                </button>
-              </div>
-              <p v-if="!state.secureStorage" class="notice notice--warning">
-                系统安全存储不可用，DNS 凭据无法跨会话保存。
-              </p>
-            </SectionCard>
+                <div class="inline-fields" style="margin-top: var(--sp-4)">
+                  <button
+                    class="ui-btn ui-btn--primary"
+                    type="button"
+                    :disabled="busy"
+                    @click="openDnsAccountModal()"
+                  >
+                    新增账户
+                  </button>
+                </div>
+                <p v-if="!state.secureStorage" class="notice notice--warning">
+                  系统安全存储不可用，DNS 凭据无法跨会话保存。
+                </p>
+              </SectionCard>
+            </div>
 
-            <SectionCard
-              title="域名解析管理"
-              description="选择账户后读取其名下域名与解析记录；新增、修改、删除会实时调用服务商 API。"
-            >
-              <div class="form-grid">
-                <FormField label="DNS 账户">
-                  <AppSelect
-                    :model-value="dnsManage.accountId"
-                    @update:model-value="
-                      (value: string | number | null) => {
-                        dnsManage.accountId = String(value ?? '');
-                        onDnsManageAccountChange();
-                      }
-                    "
-                  >
-                    <option value="">请选择账户</option>
-                    <option
-                      v-for="account in state.dnsAccounts"
-                      :key="account.id"
-                      :value="account.id"
-                    >
-                      {{ account.name }}（{{ dnsProviderLabel(account.provider) }}）
-                    </option>
-                  </AppSelect>
-                </FormField>
-                <FormField label="域名">
-                  <AppSelect
-                    :model-value="dnsManage.domain"
-                    :disabled="!dnsManage.domains.length"
-                    @update:model-value="
-                      (value: string | number | null) => {
-                        dnsManage.domain = String(value ?? '');
-                        onDnsManageDomainChange();
-                      }
-                    "
-                  >
-                    <option value="">
-                      {{ dnsManage.loadingDomains ? '正在读取域名…' : '请选择域名' }}
-                    </option>
-                    <option
-                      v-for="domain in dnsManage.domains"
-                      :key="domain.name"
-                      :value="domain.name"
-                    >
-                      {{ domain.name }}
-                    </option>
-                  </AppSelect>
-                </FormField>
-              </div>
-              <div
-                v-if="dnsManage.accountId && !dnsManage.domains.length && !dnsManage.loadingDomains"
-                class="notice notice--info"
+            <div v-show="dnsTab === 'records'">
+              <SectionCard
+                description="选择账户后读取其名下域名与解析记录；新增、修改、删除会实时调用服务商 API。"
               >
-                该账户下没有读取到域名，请确认账户凭据具备域名列表权限。
-              </div>
-              <div class="dns-records__bar">
-                <span class="section-title">
+                <div class="form-grid">
+                  <FormField label="DNS 账户">
+                    <AppSelect
+                      :model-value="dnsManage.accountId"
+                      @update:model-value="
+                        (value: string | number | null) => {
+                          dnsManage.accountId = String(value ?? '');
+                          onDnsManageAccountChange();
+                        }
+                      "
+                    >
+                      <option value="">请选择账户</option>
+                      <option
+                        v-for="account in state.dnsAccounts"
+                        :key="account.id"
+                        :value="account.id"
+                      >
+                        {{ account.name }}（{{ dnsProviderLabel(account.provider) }}）
+                      </option>
+                    </AppSelect>
+                  </FormField>
+                  <FormField label="域名">
+                    <AppSelect
+                      :model-value="dnsManage.domain"
+                      :disabled="!dnsManage.domains.length"
+                      @update:model-value="
+                        (value: string | number | null) => {
+                          dnsManage.domain = String(value ?? '');
+                          onDnsManageDomainChange();
+                        }
+                      "
+                    >
+                      <option value="">
+                        {{ dnsManage.loadingDomains ? '正在读取域名…' : '请选择域名' }}
+                      </option>
+                      <option
+                        v-for="domain in dnsManage.domains"
+                        :key="domain.name"
+                        :value="domain.name"
+                      >
+                        {{ domain.name }}
+                      </option>
+                    </AppSelect>
+                  </FormField>
+                </div>
+                <div
+                  v-if="
+                    dnsManage.accountId && !dnsManage.domains.length && !dnsManage.loadingDomains
+                  "
+                  class="notice notice--info"
+                >
+                  该账户下没有读取到域名，请确认账户凭据具备域名列表权限。
+                </div>
+                <div class="dns-records__bar">
                   <h3>
                     解析记录 <span>{{ dnsManage.records.length }}</span>
                   </h3>
-                </span>
-                <button
-                  class="ui-btn ui-btn--primary ui-btn--sm"
-                  type="button"
-                  :disabled="busy || !dnsManage.accountId || !dnsManage.domain"
-                  @click="openDnsRecordModal()"
-                >
-                  ＋ 新增记录
-                </button>
-              </div>
-              <div class="table-wrap">
-                <table class="data-table">
-                  <thead>
-                    <tr>
-                      <th>记录名称</th>
-                      <th>类型</th>
-                      <th>记录值</th>
-                      <th>TTL</th>
-                      <th class="data-table__actions">操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="record in dnsManage.records" :key="record.id">
-                      <td>
-                        <code>{{ record.name }}</code>
-                      </td>
-                      <td><StatusBadge tone="info" :label="record.type" :dot="false" /></td>
-                      <td>
-                        <span class="dns-records__value">{{ record.value }}</span>
-                      </td>
-                      <td>{{ record.ttl }}</td>
-                      <td class="data-table__actions">
-                        <button
-                          class="ui-btn ui-btn--sm"
-                          type="button"
-                          :disabled="busy"
-                          @click="openDnsRecordModal(record)"
-                        >
-                          编辑
-                        </button>
-                        <button
-                          class="ui-btn ui-btn--sm ui-btn--danger-link"
-                          type="button"
-                          :disabled="busy"
-                          @click="deleteDnsRecord(record)"
-                        >
-                          删除
-                        </button>
-                      </td>
-                    </tr>
-                    <tr v-if="dnsManage.loadingRecords">
-                      <td colspan="5" class="data-table__empty">正在读取解析记录…</td>
-                    </tr>
-                    <tr
-                      v-else-if="
-                        dnsManage.accountId && dnsManage.domain && !dnsManage.records.length
-                      "
-                    >
-                      <td colspan="5" class="data-table__empty">
-                        该域名下暂无解析记录，可点击「新增记录」。
-                      </td>
-                    </tr>
-                    <tr v-else-if="!dnsManage.domain">
-                      <td colspan="5" class="data-table__empty">请先选择 DNS 账户与域名。</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </SectionCard>
+                  <button
+                    class="ui-btn ui-btn--primary ui-btn--sm"
+                    type="button"
+                    :disabled="busy || !dnsManage.accountId || !dnsManage.domain"
+                    @click="openDnsRecordModal()"
+                  >
+                    ＋ 新增记录
+                  </button>
+                </div>
+                <div v-if="!dnsManage.domain" class="dns-records__empty">
+                  选择账户与域名后，这里会显示解析记录。
+                </div>
+                <div v-else class="table-wrap">
+                  <table class="data-table">
+                    <thead>
+                      <tr>
+                        <th>记录名称</th>
+                        <th>类型</th>
+                        <th>记录值</th>
+                        <th>TTL</th>
+                        <th class="data-table__actions">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="record in dnsManage.records" :key="record.id">
+                        <td>
+                          <code>{{ record.name }}</code>
+                        </td>
+                        <td><StatusBadge tone="info" :label="record.type" :dot="false" /></td>
+                        <td>
+                          <span class="dns-records__value">{{ record.value }}</span>
+                        </td>
+                        <td>{{ record.ttl }}</td>
+                        <td class="data-table__actions">
+                          <button
+                            class="ui-btn ui-btn--sm"
+                            type="button"
+                            :disabled="busy"
+                            @click="openDnsRecordModal(record)"
+                          >
+                            编辑
+                          </button>
+                          <button
+                            class="ui-btn ui-btn--sm ui-btn--danger-link"
+                            type="button"
+                            :disabled="busy"
+                            @click="deleteDnsRecord(record)"
+                          >
+                            删除
+                          </button>
+                        </td>
+                      </tr>
+                      <tr v-if="dnsManage.loadingRecords">
+                        <td colspan="5" class="data-table__empty">正在读取解析记录…</td>
+                      </tr>
+                      <tr
+                        v-else-if="
+                          dnsManage.accountId && dnsManage.domain && !dnsManage.records.length
+                        "
+                      >
+                        <td colspan="5" class="data-table__empty">
+                          该域名下暂无解析记录，可点击「新增记录」。
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </SectionCard>
+            </div>
           </template>
 
           <!-- ============ 工具：设置 ============ -->
@@ -4542,18 +4669,29 @@ function resizeActiveTerminal() {
                 </FormField>
                 <div class="form-grid">
                   <FormField label="LiteSSL EAB KID" hint="留空表示沿用已保存值">
-                    <input v-model="settingsDraft.eabKid" autocomplete="off" />
+                    <input
+                      v-model="settingsDraft.eabKid"
+                      autocomplete="off"
+                      :placeholder="
+                        acmeMasked.eabKid ? `已保存：${acmeMasked.eabKid}（留空沿用）` : ''
+                      "
+                    />
                   </FormField>
                   <FormField label="LiteSSL EAB HMAC 密钥" hint="留空表示沿用已保存值">
                     <input
                       v-model="settingsDraft.eabHmac"
                       type="password"
                       autocomplete="new-password"
+                      :placeholder="
+                        acmeMasked.eabHmac ? `已保存：${acmeMasked.eabHmac}（留空沿用）` : ''
+                      "
                     />
                   </FormField>
                 </div>
                 <p v-if="state.settings.litesslEabConfigured" class="hint">
-                  已配置 LiteSSL EAB；保存设置时留空即沿用当前密钥。
+                  已配置 LiteSSL
+                  EAB；保存设置时留空即沿用当前密钥。重新填写并保存后，下次签发会强制注册新的 ACME
+                  账户（EAB 变更时必需）。
                 </p>
               </SectionCard>
 
@@ -4593,28 +4731,14 @@ function resizeActiveTerminal() {
                     <option value="system">跟随系统</option>
                   </AppSelect>
                 </FormField>
-                <div class="switch-row">
-                  <div class="switch-row__text">
-                    <strong>危险操作二次确认</strong
-                    ><small>删除、卸载、覆盖配置前弹出确认框，危险操作需输入确认词</small>
-                  </div>
-                  <label class="switch"
-                    ><input v-model="settingsDraft.confirmDangerous" type="checkbox" /><span
-                      class="switch__track"
-                    ></span
-                  ></label>
-                </div>
+                <label class="switch-row">
+                  <span class="switch-row__text">
+                    <strong>危险操作二次确认</strong>
+                    <small>删除、卸载、覆盖配置前弹出确认框</small>
+                  </span>
+                  <a-switch v-model:checked="settingsDraft.confirmDangerous" />
+                </label>
               </SectionCard>
-            </div>
-            <div class="actions">
-              <button
-                class="ui-btn ui-btn--primary"
-                type="button"
-                :disabled="busy"
-                @click="saveSettings"
-              >
-                保存全部设置
-              </button>
             </div>
           </template>
 
@@ -5134,19 +5258,53 @@ function resizeActiveTerminal() {
               </div>
             </div>
             <div v-else-if="ruleTab === 'ssl'" class="cert-panel">
-              <div class="notice notice--info">
-                {{
-                  ruleTlsPlan?.mode === 'server'
-                    ? '方案 A：证书部署在服务器 nginx，HTTP 规则仅作回源。移除证书会把服务器配置恢复为 HTTP。'
-                    : '方案 B：证书由本机 frpc 使用，申请或导入后会自动创建隐藏 HTTPS 伴随规则，HTTP 规则保持不变。'
-                }}
+              <div class="cert-panel__section">
+                <h3>当前方案</h3>
+                <div class="notice notice--info">
+                  {{
+                    ruleTlsPlan?.mode === 'server'
+                      ? '方案 A：证书部署在服务器 nginx，HTTP 与 HTTPS 两个 server 块共存；移除证书会把服务器配置恢复为 HTTP。'
+                      : '方案 B：证书由本机 frpc 使用，申请或导入后会自动创建隐藏 HTTPS 伴随规则，HTTP 规则保持不变。'
+                  }}
+                </div>
               </div>
-              <div v-if="ruleActiveCertificate" class="notice notice--success">
-                当前规则已启用 HTTPS（{{
-                  ruleActiveCertificate.plan === 'server' ? '服务器终止' : '本机终止'
-                }}）。
+              <div class="cert-panel__section">
+                <h3>证书状态与存放位置</h3>
+                <div v-if="ruleCertDetailLoading" class="notice notice--info">
+                  正在读取证书存放位置…
+                </div>
+                <div v-else-if="ruleActiveCertificate && ruleCertDetail" class="cert-location">
+                  <div class="cert-location__row">
+                    <small>状态</small>
+                    <strong>
+                      已启用 HTTPS（{{
+                        ruleActiveCertificate.plan === 'server' ? '服务器终止' : '本机终止'
+                      }}）
+                    </strong>
+                  </div>
+                  <div class="cert-location__row">
+                    <small>证书存放位置</small>
+                    <code>{{ ruleCertDetail.certPath || '未记录' }}</code>
+                  </div>
+                  <div class="cert-location__row">
+                    <small>私钥存放位置</small>
+                    <code>{{ ruleCertDetail.keyPath || '未记录' }}</code>
+                  </div>
+                  <div v-if="ruleCertDetail.configPath" class="cert-location__row">
+                    <small>站点配置</small>
+                    <code>{{ ruleCertDetail.configPath }}</code>
+                  </div>
+                </div>
+                <div v-else-if="ruleActiveCertificate" class="notice notice--info">
+                  证书已关联，但未读取到存放位置；可在「证书管理」中查看。
+                  <small v-if="ruleCertDetailError">{{ ruleCertDetailError }}</small>
+                </div>
+                <div v-else class="notice notice--info">
+                  该规则尚未启用 HTTPS，可先申请或导入证书。
+                </div>
               </div>
-              <template v-if="ruleTlsPlan?.mode !== 'server'">
+              <div v-if="ruleTlsPlan?.mode !== 'server'" class="cert-panel__section">
+                <h3>手动导入证书</h3>
                 <FormField label="证书 PEM（含证书链）" full>
                   <textarea
                     v-model="ruleDraft.certPem"
@@ -5173,20 +5331,23 @@ function resizeActiveTerminal() {
                     保存并启用证书
                   </button>
                 </div>
-              </template>
-              <div class="actions-row">
-                <button class="ui-btn" type="button" :disabled="busy" @click="openCertApply">
-                  {{ ruleActiveCertificate ? '重新申请证书' : '申请证书' }}
-                </button>
-                <button
-                  v-if="ruleActiveCertificate"
-                  class="ui-btn ui-btn--danger-link"
-                  type="button"
-                  :disabled="busy || ruleCertRemoving"
-                  @click="removeRuleCertificate"
-                >
-                  {{ ruleCertRemoving ? '移除中…' : '移除证书并回退 HTTP' }}
-                </button>
+              </div>
+              <div class="cert-panel__section">
+                <h3>证书操作</h3>
+                <div class="actions-row">
+                  <button class="ui-btn" type="button" :disabled="busy" @click="openCertApply">
+                    {{ ruleActiveCertificate ? '重新申请证书' : '申请证书' }}
+                  </button>
+                  <button
+                    v-if="ruleActiveCertificate"
+                    class="ui-btn ui-btn--danger-link"
+                    type="button"
+                    :disabled="busy || ruleCertRemoving"
+                    @click="removeRuleCertificate"
+                  >
+                    {{ ruleCertRemoving ? '移除中…' : '移除证书并回退 HTTP' }}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -5435,7 +5596,7 @@ function resizeActiveTerminal() {
             <input
               v-model="dnsAccountDraft[field.key]"
               :type="field.password ? 'password' : 'text'"
-              :placeholder="field.placeholder"
+              :placeholder="dnsFieldPlaceholder(field)"
               autocomplete="off"
             />
           </FormField>
@@ -5756,6 +5917,85 @@ function resizeActiveTerminal() {
           ><button class="ui-btn" type="button" @click="closeModal">关闭</button></template
         >
       </AppModal>
+
+      <!-- 证书详情抽屉：存放位置与证书/私钥内容按需从主进程读取 -->
+      <AppDrawer
+        :open="certDetailOpen"
+        title="证书详情"
+        :width="560"
+        :busy="certDetailLoading || certDeleting"
+        @close="closeCertDetail"
+      >
+        <div v-if="certDetailLoading" class="notice notice--info">正在读取证书存放位置与内容…</div>
+        <template v-else-if="certDetail">
+          <div class="cert-detail__head">
+            <strong>{{
+              state.serverCertificates.find((item) => item.id === certDetail?.id)?.name ??
+              certDetail.id
+            }}</strong>
+            <StatusBadge
+              tone="neutral"
+              :label="
+                certDetail.storage === 'server' ? '服务器终止（方案 A）' : '本机终止（方案 B）'
+              "
+              :dot="false"
+            />
+          </div>
+          <div class="kv-grid">
+            <div class="kv">
+              <small>存放位置</small>
+              <strong>{{
+                certDetail.storage === 'server' ? '服务器托管目录' : '本机证书库'
+              }}</strong>
+            </div>
+            <div class="kv">
+              <small>证书文件</small>
+              <strong class="cert-detail__path">{{ certDetail.certPath || '未记录' }}</strong>
+            </div>
+            <div class="kv">
+              <small>私钥文件</small>
+              <strong class="cert-detail__path">{{ certDetail.keyPath || '未记录' }}</strong>
+            </div>
+            <div v-if="certDetail.configPath" class="kv">
+              <small>站点配置</small>
+              <strong class="cert-detail__path">{{ certDetail.configPath }}</strong>
+            </div>
+          </div>
+          <FormField label="证书内容（含证书链）" full>
+            <pre class="code-block">{{ certDetail.certPem || '未读取到证书内容' }}</pre>
+          </FormField>
+          <FormField label="私钥内容" full hint="私钥敏感，请勿外泄">
+            <pre class="code-block">{{ certDetail.keyPem || '未读取到私钥内容' }}</pre>
+          </FormField>
+        </template>
+        <EmptyState v-else icon="◇" title="暂无详情" compact />
+        <template #footer>
+          <button
+            class="ui-btn ui-btn--danger-link"
+            type="button"
+            :disabled="!certDetail || certDeleting"
+            @click="deleteCertFromPage"
+          >
+            {{ certDeleting ? '删除中…' : '删除证书' }}
+          </button>
+          <button
+            class="ui-btn"
+            type="button"
+            :disabled="!certDetail || certDownloading"
+            @click="downloadCertMaterial('key')"
+          >
+            下载私钥
+          </button>
+          <button
+            class="ui-btn ui-btn--primary"
+            type="button"
+            :disabled="!certDetail || certDownloading"
+            @click="downloadCertMaterial('cert')"
+          >
+            下载证书
+          </button>
+        </template>
+      </AppDrawer>
     </div>
   </a-config-provider>
 </template>

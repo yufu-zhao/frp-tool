@@ -1,6 +1,12 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { createPrivateKey, createPublicKey, randomUUID, X509Certificate } from 'node:crypto';
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  randomUUID,
+  X509Certificate,
+} from 'node:crypto';
 import acme from 'acme-client';
 import { AppError, redact } from '../shared/errors';
 import type { CertificateIssueProgress, CertificateRecord, DnsAutomation } from '../shared/types';
@@ -88,6 +94,11 @@ function waitForRetry(delay: number, signal?: AbortSignal) {
   return abortable(new Promise<void>((resolve) => setTimeout(resolve, delay)), signal);
 }
 
+/** 用 EAB 凭据生成账户绑定指纹；凭据变化即代表 CA 侧需要重新注册账户。 */
+function eabHash(kid: string, hmacKey: string): string {
+  return createHash('sha256').update(kid.trim()).update('\0').update(hmacKey.trim()).digest('hex');
+}
+
 export function normalizeDomains(values: string[]): string[] {
   const result: string[] = [];
   for (const value of values) {
@@ -157,10 +168,17 @@ export interface AcmeChallengeHooks {
   dnsAutomation?: DnsAutomation;
 }
 
+interface AcmeErrorContext {
+  url?: string;
+  status?: number;
+  type?: string;
+}
+
 function installCancelableTransport(
   acmeClient: typeof acme,
   hooks: CertificateIssueHooks | undefined,
   currentStep: () => string,
+  errorContext?: AcmeErrorContext,
 ): () => void {
   const library = acmeClient as any;
   const axios = library.axios;
@@ -175,7 +193,17 @@ function installCancelableTransport(
     while (true) {
       throwIfCancelled(signal);
       try {
-        return await originalRequest.call(this, { ...config, signal });
+        const response = await originalRequest.call(this, { ...config, signal });
+        // acme-client 把 4xx 当普通响应处理，这里记录失败的 ACME 端点，便于区分
+        // 账户注册（EAB）失败与订单/验证失败，两者错误文案可能完全相同。
+        const data = (response as { data?: { type?: unknown } } | undefined)?.data;
+        const status = (response as { status?: number } | undefined)?.status;
+        if (errorContext && status && status >= 400 && typeof data?.type === 'string') {
+          errorContext.url = String(config.url ?? '');
+          errorContext.status = status;
+          errorContext.type = data.type;
+        }
+        return response;
       } catch (error) {
         throwIfCancelled(signal);
         const response = (error as { response?: { status?: number } }).response;
@@ -212,26 +240,40 @@ export async function issueAcmeMaterial(
 ): Promise<AcmeMaterial> {
   const domains = normalizeDomains(input.domains);
   if (!input.termsAgreed) throw new AppError('请先确认已阅读并同意所选证书机构的服务条款。');
-  if (input.challenge === 'dns-01' && input.eabKid && !input.eabHmac)
+  if (input.eabKid && !input.eabHmac)
     throw new AppError('填写 EAB KID 后还需要填写 EAB HMAC 密钥。');
   const signal = hooks?.signal;
   const progress = (value: CertificateIssueProgressUpdate) => hooks?.onProgress(value);
   let currentStep = '准备签发';
+  const acmeError: AcmeErrorContext = {};
   try {
     throwIfCancelled(signal);
     currentStep = '准备 ACME 账户';
     progress({ status: 'running', step: currentStep, message: '正在准备 ACME 账户密钥。' });
-    const accountKeyId = `acme:${input.provider}:accountKey`;
-    let accountKey = store.secret(accountKeyId);
-    if (!accountKey) {
-      accountKey = (await acmeClient.crypto.createPrivateEcdsaKey()).toString();
-      store.putSecret(accountKeyId, accountKey);
-      await store.persist();
-    }
     if (input.eabKid) store.putSecret(`acme:${input.provider}:eabKid`, input.eabKid);
     if (input.eabHmac) store.putSecret(`acme:${input.provider}:eabHmac`, input.eabHmac);
     const kid = input.eabKid || store.secret(`acme:${input.provider}:eabKid`);
     const hmacKey = input.eabHmac || store.secret(`acme:${input.provider}:eabHmac`);
+    if (input.provider === 'litessl' && !(kid && hmacKey))
+      throw new AppError('LiteSSL 要求 EAB，请先在设置中填写 EAB KID 与 HMAC。');
+    // ACME 账户必须与 EAB 绑定：EAB 变更后旧账户在 CA 侧仍未授权，必须换密钥重新注册，
+    // 否则 CA 会在下单/验证阶段报 "The client lacks sufficient authorization"。
+    const eabFingerprint = kid && hmacKey ? eabHash(kid, hmacKey) : '';
+    const accountKeyId = `acme:${input.provider}:accountKey`;
+    const accountEabId = `acme:${input.provider}:accountKeyEab`;
+    let accountKey = store.secret(accountKeyId);
+    if (accountKey && store.secret(accountEabId) !== eabFingerprint) accountKey = '';
+    if (!accountKey) {
+      accountKey = (await acmeClient.crypto.createPrivateEcdsaKey()).toString();
+      progress({
+        status: 'running',
+        step: currentStep,
+        message: 'EAB 已变更，正在注册新的 ACME 账户。',
+      });
+    }
+    store.putSecret(accountKeyId, accountKey);
+    store.putSecret(accountEabId, eabFingerprint);
+    await store.persist();
     const directoryUrl =
       input.provider === 'letsencrypt'
         ? acmeClient.directory.letsencrypt.production
@@ -253,7 +295,12 @@ export async function issueAcmeMaterial(
       accountKey,
       ...(kid && hmacKey ? { externalAccountBinding: { kid, hmacKey } } : {}),
     });
-    const cleanupTransport = installCancelableTransport(acmeClient, hooks, () => currentStep);
+    const cleanupTransport = installCancelableTransport(
+      acmeClient,
+      hooks,
+      () => currentStep,
+      acmeError,
+    );
     let dnsPrompt = Promise.resolve();
     const dnsRecords = new Map<string, DnsChallengeRecord>();
     const originalLogger = (acmeClient as any).setLogger;
@@ -392,12 +439,27 @@ export async function issueAcmeMaterial(
     return { certPem, keyPem: certificateKey.toString(), certificate };
   } catch (error) {
     if (signal?.aborted) throw new AppError('用户已取消证书签发。', 'CANCELLED');
-    throw new AppError(
-      redact(error instanceof Error ? error.message : String(error), store.allSecrets()).slice(
-        0,
-        1200,
-      ),
-    );
+    const detail = redact(
+      error instanceof Error ? error.message : String(error),
+      store.allSecrets(),
+    ).slice(0, 1200);
+    let endpoint = '';
+    try {
+      endpoint = acmeError.url ? new URL(acmeError.url).pathname : '';
+    } catch {
+      endpoint = '';
+    }
+    const context = [
+      endpoint && `ACME 端点 ${endpoint}`,
+      acmeError.type && `错误类型 ${acmeError.type}`,
+    ]
+      .filter(Boolean)
+      .join('，');
+    const hint =
+      input.provider === 'litessl' && endpoint.includes('new-account')
+        ? '；请确认 EAB KID/HMAC 与 LiteSSL 控制台一致，若已更换 EAB 程序会自动重建账户'
+        : '';
+    throw new AppError(`${detail}${context ? `（${context}）` : ''}${hint}`);
   }
 }
 
@@ -418,7 +480,8 @@ export class Certificates {
     this.directory = path.join(store.root, 'certificates');
   }
 
-  private pathFor(id: string) {
+  /** 本机证书库的证书与私钥落点，供证书详情展示。 */
+  pathFor(id: string) {
     const directory = path.join(this.directory, id);
     return {
       directory,
